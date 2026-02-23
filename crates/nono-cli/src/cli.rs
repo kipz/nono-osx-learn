@@ -454,6 +454,10 @@ pub struct LearnArgs {
     #[arg(long)]
     pub all: bool,
 
+    /// Skip the confirmation prompt
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
     /// Enable verbose output
     #[arg(long, short = 'v', action = clap::ArgAction::Count)]
     pub verbose: u8,

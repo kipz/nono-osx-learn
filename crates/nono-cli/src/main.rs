@@ -92,7 +92,7 @@ fn run_setup(args: SetupArgs) -> Result<()> {
 /// Learn mode: trace file accesses to discover required paths
 fn run_learn(args: LearnArgs, silent: bool) -> Result<()> {
     // Warn user that the command runs unrestricted
-    if !silent {
+    if !silent && !args.yes {
         eprintln!(
             "{}",
             "WARNING: nono learn runs the command WITHOUT any sandbox restrictions.".yellow()
