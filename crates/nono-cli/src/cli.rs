@@ -261,6 +261,17 @@ pub struct SandboxArgs {
     #[arg(long, value_name = "CMD")]
     pub block_command: Vec<String>,
 
+    // === macOS Keychain access ===
+    /// Allow access to the system keychain via SecurityServer (macOS only).
+    ///
+    /// Required for Electron apps (such as Claude Code) that use macOS safeStorage
+    /// to encrypt local settings. Without this flag, SecurityServer is blocked by
+    /// default to prevent unauthorized credential extraction.
+    ///
+    /// On non-macOS platforms this flag is accepted but has no effect.
+    #[arg(long)]
+    pub allow_keychain: bool,
+
     // === Credential options ===
     /// Load credentials from system keystore and inject as environment variables.
     /// The sandboxed process can read these credentials directly.

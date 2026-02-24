@@ -159,6 +159,20 @@ impl CapabilitySetExt for CapabilitySet {
             caps.add_blocked_command(cmd.clone());
         }
 
+        // macOS system keychain: allow SecurityServer and securityd Mach services.
+        // Required for Electron apps (e.g., Claude Code) that use macOS safeStorage to
+        // decrypt local settings. Placed here as platform rules so they appear after the
+        // SecurityServer deny in the seatbelt profile (last-match wins for equal specificity).
+        #[cfg(target_os = "macos")]
+        if args.allow_keychain {
+            caps.add_platform_rule(
+                "(allow mach-lookup (global-name \"com.apple.SecurityServer\"))",
+            )?;
+            caps.add_platform_rule(
+                "(allow mach-lookup (global-name \"com.apple.securityd\"))",
+            )?;
+        }
+
         // Validate deny/allow overlaps (hard-fail on Linux where Landlock cannot enforce denies)
         policy::validate_deny_overlaps(&resolved.deny_paths, &caps)?;
 
@@ -369,6 +383,20 @@ fn add_cli_overrides(caps: &mut CapabilitySet, args: &SandboxArgs) -> Result<()>
         caps.add_blocked_command(cmd.clone());
     }
 
+    // macOS system keychain: allow SecurityServer and securityd Mach services.
+    // Required for Electron apps (e.g., Claude Code) that use macOS safeStorage.
+    // Placed as platform rules so they appear after the SecurityServer deny in the
+    // seatbelt profile (last-match wins for equal specificity).
+    #[cfg(target_os = "macos")]
+    if args.allow_keychain {
+        caps.add_platform_rule(
+            "(allow mach-lookup (global-name \"com.apple.SecurityServer\"))",
+        )?;
+        caps.add_platform_rule(
+            "(allow mach-lookup (global-name \"com.apple.securityd\"))",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -395,6 +423,7 @@ mod tests {
             external_proxy: None,
             allow_command: vec![],
             block_command: vec![],
+            allow_keychain: false,
             env_credential: None,
             profile: None,
             allow_cwd: false,
@@ -425,6 +454,7 @@ mod tests {
             external_proxy: None,
             allow_command: vec![],
             block_command: vec![],
+            allow_keychain: false,
             env_credential: None,
             profile: None,
             allow_cwd: false,
@@ -450,6 +480,7 @@ mod tests {
             net_block: false,
             allow_command: vec!["rm".to_string()],
             block_command: vec!["custom".to_string()],
+            allow_keychain: false,
             network_profile: None,
             proxy_allow: vec![],
             proxy_credential: vec![],
@@ -487,6 +518,7 @@ mod tests {
             external_proxy: None,
             allow_command: vec![],
             block_command: vec![],
+            allow_keychain: false,
             env_credential: None,
             profile: None,
             allow_cwd: false,
@@ -524,6 +556,7 @@ mod tests {
             external_proxy: None,
             allow_command: vec![],
             block_command: vec![],
+            allow_keychain: false,
             env_credential: None,
             profile: None,
             allow_cwd: false,
