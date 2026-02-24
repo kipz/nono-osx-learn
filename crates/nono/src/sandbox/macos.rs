@@ -331,7 +331,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Without these denies, blanket mach-lookup can permit Keychain retrieval via
     // Mach IPC, bypassing file-level deny rules in profiles that do NOT opt in.
     profile.push_str("(allow mach-lookup)\n");
-    if !has_explicit_login_keychain_db_access(caps) {
+    if !has_explicit_login_keychain_db_access(caps) && !caps.allows_system_keychain() {
         profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
         profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))\n");
     }
@@ -835,6 +835,22 @@ mod tests {
 
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+    }
+
+    #[test]
+    fn test_generate_profile_skips_keychain_mach_deny_when_allow_system_keychain_set() {
+        let mut caps = CapabilitySet::new();
+        caps.set_allow_system_keychain(true);
+
+        let profile = generate_profile(&caps).unwrap();
+
+        // SecurityServer and securityd must NOT be denied when allow_system_keychain is set.
+        // This is the correct mechanism: suppress the deny rather than overriding it with an
+        // allow rule added later (which relies on uncertain last-match semantics).
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        // But (allow mach-lookup) is still present — so SecurityServer is covered by the broad allow.
+        assert!(profile.contains("(allow mach-lookup)"));
     }
 
     #[test]

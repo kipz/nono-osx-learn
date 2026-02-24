@@ -401,6 +401,13 @@ pub struct CapabilitySet {
     /// `sandbox_extension_consume()` tokens can expand the sandbox dynamically.
     /// On Linux, this flag is informational (seccomp-notify is installed separately).
     extensions_enabled: bool,
+    /// Allow the process to access the system keychain via SecurityServer and securityd
+    /// Mach services (macOS only).
+    ///
+    /// By default, SecurityServer and securityd are denied to prevent unauthorized
+    /// credential extraction via Mach IPC. Set this flag for applications that
+    /// legitimately need Keychain access (e.g., Electron apps using safeStorage).
+    allow_system_keychain: bool,
 }
 
 impl CapabilitySet {
@@ -567,6 +574,21 @@ impl CapabilitySet {
     /// Set sandbox extensions state
     pub fn set_extensions_enabled(&mut self, enabled: bool) {
         self.extensions_enabled = enabled;
+    }
+
+    /// Allow access to the system keychain via SecurityServer (macOS only).
+    ///
+    /// This overrides the default SecurityServer and securityd deny rules.
+    /// Required for Electron apps (e.g., Claude Code) that use macOS safeStorage
+    /// to decrypt local settings. Ignored on non-macOS platforms.
+    pub fn set_allow_system_keychain(&mut self, allow: bool) {
+        self.allow_system_keychain = allow;
+    }
+
+    /// Check if system keychain access is allowed
+    #[must_use]
+    pub fn allows_system_keychain(&self) -> bool {
+        self.allow_system_keychain
     }
 
     /// Add to allowed commands list

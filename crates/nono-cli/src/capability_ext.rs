@@ -161,16 +161,10 @@ impl CapabilitySetExt for CapabilitySet {
 
         // macOS system keychain: allow SecurityServer and securityd Mach services.
         // Required for Electron apps (e.g., Claude Code) that use macOS safeStorage to
-        // decrypt local settings. Placed here as platform rules so they appear after the
-        // SecurityServer deny in the seatbelt profile (last-match wins for equal specificity).
-        #[cfg(target_os = "macos")]
+        // decrypt local settings. Suppresses the SecurityServer deny rule in the seatbelt
+        // profile rather than attempting to override it with a later allow rule.
         if args.allow_keychain {
-            caps.add_platform_rule(
-                "(allow mach-lookup (global-name \"com.apple.SecurityServer\"))",
-            )?;
-            caps.add_platform_rule(
-                "(allow mach-lookup (global-name \"com.apple.securityd\"))",
-            )?;
+            caps.set_allow_system_keychain(true);
         }
 
         // Validate deny/allow overlaps (hard-fail on Linux where Landlock cannot enforce denies)
@@ -385,16 +379,10 @@ fn add_cli_overrides(caps: &mut CapabilitySet, args: &SandboxArgs) -> Result<()>
 
     // macOS system keychain: allow SecurityServer and securityd Mach services.
     // Required for Electron apps (e.g., Claude Code) that use macOS safeStorage.
-    // Placed as platform rules so they appear after the SecurityServer deny in the
-    // seatbelt profile (last-match wins for equal specificity).
-    #[cfg(target_os = "macos")]
+    // Suppresses the SecurityServer deny rule in the seatbelt profile rather than
+    // attempting to override it with a later allow rule.
     if args.allow_keychain {
-        caps.add_platform_rule(
-            "(allow mach-lookup (global-name \"com.apple.SecurityServer\"))",
-        )?;
-        caps.add_platform_rule(
-            "(allow mach-lookup (global-name \"com.apple.securityd\"))",
-        )?;
+        caps.set_allow_system_keychain(true);
     }
 
     Ok(())
