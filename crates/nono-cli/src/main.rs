@@ -1344,6 +1344,22 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         .map(|p| p.network.custom_credentials.clone())
         .unwrap_or_default();
 
+    // On Linux, pre-create the Claude Code config lock file before building
+    // capabilities. Claude Code's saveConfigWithLock creates ~/.claude.json.lock
+    // next to ~/.claude.json. Landlock cannot grant permission to create new
+    // files in ~/ without opening the entire directory, so we pre-create the
+    // lock file and grant access to it via the profile's allow_file list.
+    #[cfg(target_os = "linux")]
+    if args.profile.as_deref() == Some("claude-code") {
+        let home = config::validated_home()?;
+        let lock_path = std::path::Path::new(&home).join(".claude.json.lock");
+        if !lock_path.exists() {
+            if let Err(e) = std::fs::File::create(&lock_path) {
+                warn!("Failed to pre-create {}: {}", lock_path.display(), e);
+            }
+        }
+    }
+
     // Build capabilities from profile or arguments.
     // Unlink overrides are deferred so they can cover the CWD path added below.
     let (mut caps, needs_unlink_overrides) = if let Some(ref prof) = loaded_profile {
