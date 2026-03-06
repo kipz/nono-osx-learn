@@ -989,6 +989,9 @@ pub struct Profile {
     /// Treated like built-in heavy directories (for example `target`).
     #[serde(default)]
     pub skipdirs: Vec<String>,
+    /// Command mediation policy: intercept commands, inject credentials.
+    #[serde(default)]
+    pub mediation: crate::mediation::MediationConfig,
 }
 
 #[derive(Deserialize)]
@@ -1475,6 +1478,13 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         allow_launch_services: child.allow_launch_services.or(base.allow_launch_services),
         interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
+        // Child's mediation config takes precedence; base is ignored.
+        // (Merging two mediation configs would be complex and is not needed.)
+        mediation: if child.mediation.is_active() {
+            child.mediation
+        } else {
+            base.mediation
+        },
     }
 }
 
@@ -2646,6 +2656,7 @@ mod tests {
             allow_launch_services: Some(false),
             interactive: false,
             skipdirs: vec!["vendor".to_string()],
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 
@@ -2714,6 +2725,7 @@ mod tests {
             allow_launch_services: Some(true),
             interactive: false,
             skipdirs: vec!["dist".to_string()],
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 
