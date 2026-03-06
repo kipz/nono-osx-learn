@@ -896,6 +896,9 @@ pub struct Profile {
     /// Supervised mode preserves TTY by default, making this unnecessary.
     #[serde(default)]
     pub interactive: bool,
+    /// Command mediation policy: intercept commands, inject credentials.
+    #[serde(default)]
+    pub mediation: crate::mediation::MediationConfig,
 }
 
 /// Check whether a profile name is loaded from a user file rather than the built-in set.
@@ -1290,6 +1293,13 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         },
         allow_launch_services: child.allow_launch_services.or(base.allow_launch_services),
         interactive: base.interactive || child.interactive,
+        // Child's mediation config takes precedence; base is ignored.
+        // (Merging two mediation configs would be complex and is not needed.)
+        mediation: if child.mediation.is_active() {
+            child.mediation
+        } else {
+            base.mediation
+        },
     }
 }
 
@@ -2338,6 +2348,7 @@ mod tests {
             }),
             allow_launch_services: Some(false),
             interactive: false,
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 
@@ -2404,6 +2415,7 @@ mod tests {
             }),
             allow_launch_services: Some(true),
             interactive: false,
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 
