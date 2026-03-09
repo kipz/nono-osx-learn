@@ -403,6 +403,20 @@ nono run --profile claude-code -- claude
 
 **Special:** Auto-installs Claude Code hooks
 
+### codex
+
+```bash
+nono run --profile codex -- codex
+```
+
+**Filesystem:** `~/.codex` (read+write)
+
+**Groups:** `node_runtime`, `rust_runtime`, `python_runtime`, `nix_runtime`, `unlink_protection` (plus all `base_groups`)
+
+**Network:** Allowed
+
+**Interactive:** Enabled
+
 ### opencode
 
 ```bash
