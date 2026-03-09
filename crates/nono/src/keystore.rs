@@ -6,6 +6,7 @@
 //! `env://` scheme) and return them as zeroized strings.
 //!
 //! Credential references are dispatched by URI scheme:
+//! - `literal:VALUE` — returns the literal string after the prefix as-is
 //! - `env://VAR_NAME` — reads from the current process environment
 //! - `op://vault/item/field` — loaded via the 1Password CLI
 //! - `apple-password://server/account` — loaded via macOS `security`
@@ -47,6 +48,9 @@ const APPLE_PASSWORDS_URI_PREFIX: &str = "apple-passwords://";
 
 /// The `env://` URI scheme prefix, indicating environment variable backend.
 const ENV_URI_PREFIX: &str = "env://";
+
+/// The `literal:` URI scheme prefix, returning the remainder as a plain string.
+const LITERAL_URI_PREFIX: &str = "literal:";
 
 /// Environment variable names that must never be loaded via `env://`.
 ///
@@ -142,15 +146,16 @@ pub fn load_secrets(
 /// Load a single secret, dispatching to the appropriate backend.
 ///
 /// Dispatch order:
-/// 1. `env://VAR` — reads from the process environment
-/// 2. `op://vault/item/field` — delegates to the 1Password CLI
-/// 3. `apple-password://server/account` — delegates to macOS `security`
-/// 4. Everything else — loads from the system keyring
+/// 1. `literal:VALUE` — returns the string after the prefix as-is (no keystore lookup)
+/// 2. `env://VAR` — reads from the process environment
+/// 3. `op://vault/item/field` — delegates to the 1Password CLI
+/// 4. `apple-password://server/account` — delegates to macOS `security`
+/// 5. Everything else — loads from the system keyring
 ///
 /// # Arguments
 /// * `service` - Keyring service name (only used for keyring backend)
-/// * `credential_ref` - A keyring account name, `op://` URI, Apple Passwords URI,
-///   or `env://` URI
+/// * `credential_ref` - A `literal:` value, `env://` URI, `op://` URI, Apple Passwords URI,
+///   or keyring account name
 ///
 /// # Security
 /// The returned value is wrapped in `Zeroizing<String>`. For URI-based managers
@@ -160,7 +165,10 @@ pub fn load_secrets(
 /// internal buffers.
 #[must_use = "loaded secret should be used or explicitly dropped"]
 pub fn load_secret_by_ref(service: &str, credential_ref: &str) -> Result<Zeroizing<String>> {
-    if credential_ref.starts_with(ENV_URI_PREFIX) {
+    if credential_ref.starts_with(LITERAL_URI_PREFIX) {
+        let value = credential_ref.strip_prefix(LITERAL_URI_PREFIX).unwrap_or("");
+        Ok(Zeroizing::new(value.to_string()))
+    } else if credential_ref.starts_with(ENV_URI_PREFIX) {
         load_from_env(credential_ref)
     } else if credential_ref.starts_with(OP_URI_PREFIX) {
         load_from_op(credential_ref)
@@ -1870,5 +1878,40 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged.get("openai_api_key"), Some(&"FROM_MAP".to_string()));
+    }
+
+    // =========================================================================
+    // literal: URI tests
+    // =========================================================================
+
+    #[test]
+    fn test_load_secret_by_ref_literal_basic() {
+        let result = load_secret_by_ref("nono", "literal:hello");
+        assert!(result.is_ok(), "should succeed: {:?}", result.err());
+        assert_eq!(*result.unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_load_secret_by_ref_literal_empty_value() {
+        // literal: with empty suffix returns empty string
+        let result = load_secret_by_ref("nono", "literal:");
+        assert!(result.is_ok());
+        assert_eq!(*result.unwrap(), "");
+    }
+
+    #[test]
+    fn test_load_secret_by_ref_literal_with_spaces_and_special_chars() {
+        let result = load_secret_by_ref("nono", "literal:hello world/foo=bar");
+        assert!(result.is_ok());
+        assert_eq!(*result.unwrap(), "hello world/foo=bar");
+    }
+
+    #[test]
+    fn test_load_secret_by_ref_literal_does_not_hit_keyring() {
+        // A literal: value must never attempt a keyring lookup, even if the
+        // value looks like a keyring account name.
+        let result = load_secret_by_ref("nono", "literal:some-account-name");
+        assert!(result.is_ok(), "should not attempt keyring lookup");
+        assert_eq!(*result.unwrap(), "some-account-name");
     }
 }
