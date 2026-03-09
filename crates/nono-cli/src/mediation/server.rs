@@ -8,6 +8,7 @@
 //!   Request:  u32 big-endian length || JSON payload
 //!   Response: u32 big-endian length || JSON payload
 
+use super::broker::TokenBroker;
 use super::policy::{apply, ShimRequest, ShimResponse};
 use super::session::ResolvedCommand;
 use std::path::PathBuf;
@@ -21,7 +22,11 @@ use tracing::{debug, error, warn};
 /// Binds to `socket_path` and accepts connections indefinitely. Each connection
 /// is handled in its own `tokio::spawn` task. This function only returns if the
 /// listener fails to bind or accept.
-pub async fn run(socket_path: PathBuf, commands: Vec<ResolvedCommand>) -> std::io::Result<()> {
+pub async fn run(
+    socket_path: PathBuf,
+    commands: Vec<ResolvedCommand>,
+    broker: Arc<TokenBroker>,
+) -> std::io::Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(&socket_path);
 
@@ -34,8 +39,9 @@ pub async fn run(socket_path: PathBuf, commands: Vec<ResolvedCommand>) -> std::i
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let cmds = Arc::clone(&commands);
+                let broker = Arc::clone(&broker);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, &cmds).await {
+                    if let Err(e) = handle_connection(stream, &cmds, broker).await {
                         warn!("mediation: connection error: {}", e);
                     }
                 });
@@ -52,6 +58,7 @@ pub async fn run(socket_path: PathBuf, commands: Vec<ResolvedCommand>) -> std::i
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     commands: &[ResolvedCommand],
+    broker: Arc<TokenBroker>,
 ) -> std::io::Result<()> {
     // Read length-prefixed request
     let len = stream.read_u32().await? as usize;
@@ -77,7 +84,7 @@ async fn handle_connection(
         request.command, request.args
     );
 
-    let response = apply(request, commands).await;
+    let response = apply(request, commands, broker).await;
 
     write_response(&mut stream, &response).await
 }
@@ -87,8 +94,7 @@ async fn write_response(
     stream: &mut tokio::net::UnixStream,
     response: &ShimResponse,
 ) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(response)
-        .map_err(std::io::Error::other)?;
+    let bytes = serde_json::to_vec(response).map_err(std::io::Error::other)?;
 
     stream.write_u32(bytes.len() as u32).await?;
     stream.write_all(&bytes).await?;
