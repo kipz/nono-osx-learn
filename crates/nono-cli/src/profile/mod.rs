@@ -1730,9 +1730,10 @@ mod tests {
         let expanded = expand_vars("$HOME/.config", &workdir).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.config"));
 
-        // Restore original HOME
         if let Some(home) = original_home {
             env::set_var("HOME", home);
+        } else {
+            env::remove_var("HOME");
         }
     }
 
@@ -1827,11 +1828,11 @@ mod tests {
         let tmp = tempdir().expect("tmpdir");
         env::set_var("XDG_CONFIG_HOME", tmp.path());
         let resolved = resolve_user_config_dir().expect("resolve user config dir");
+        env::remove_var("XDG_CONFIG_HOME");
         assert_eq!(
             resolved,
             tmp.path().canonicalize().expect("canonicalize tmp")
         );
-        env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
@@ -1841,9 +1842,8 @@ mod tests {
         env::set_var("XDG_CONFIG_HOME", "relative/path");
 
         let resolved = resolve_user_config_dir().expect("resolve with fallback");
-        assert_eq!(resolved, expected_home.join(".config"));
-
         env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(resolved, expected_home.join(".config"));
     }
 
     #[test]
