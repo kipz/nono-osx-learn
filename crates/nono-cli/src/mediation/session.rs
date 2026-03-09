@@ -2,25 +2,30 @@
 //!
 //! `setup()` is called before the sandbox is applied. It:
 //! 1. Resolves each configured command name to an absolute path via `which`.
-//! 2. Loads all credential sources referenced by intercept/inject rules.
-//! 3. Creates `/tmp/nono-session-{pid}/shims/` and symlinks `nono-shim` for each command.
-//! 4. Starts the mediation server on a Unix socket.
-//! 5. Returns a `SessionHandle` that keeps the server alive and exposes the
+//! 2. Creates `/tmp/nono-session-{pid}/shims/` and symlinks `nono-shim` for each command.
+//! 3. Starts the mediation server on a Unix socket.
+//! 4. Returns a `SessionHandle` that keeps the server alive and exposes the
 //!    paths/env needed by the rest of the startup sequence.
 
-use super::{CommandEntry, MediationConfig};
-use nono::{keystore, NonoError, Result};
+use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig};
+use super::broker::TokenBroker;
+use nono::{NonoError, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{debug, info};
-use zeroize::Zeroizing;
 
-/// A resolved intercept rule with the credential already substituted into the
-/// output string (loaded once at session start, never re-loaded per request).
-#[derive(Clone)]
+/// The action stored in a resolved intercept rule.
+#[derive(Clone, Debug)]
+pub enum ResolvedAction {
+    Respond { stdout: String },
+    Capture { script: Option<String> },
+}
+
+/// A resolved intercept rule ready for the mediation server.
+#[derive(Clone, Debug)]
 pub struct ResolvedIntercept {
     pub args_prefix: Vec<String>,
-    pub stdout: String,
-    pub stderr: String,
+    pub action: ResolvedAction,
     pub exit_code: i32,
 }
 
@@ -31,14 +36,10 @@ pub struct ResolvedCommand {
     /// Absolute path to the real binary (to exec on passthrough).
     pub real_path: PathBuf,
     pub intercepts: Vec<ResolvedIntercept>,
-    /// Env vars to inject when passing through to the real binary.
-    pub inject_env: Vec<(String, Zeroizing<String>)>,
-}
-
-/// An env var to inject into the sandboxed child's environment.
-pub struct InjectedEnvVar {
-    pub var: String,
-    pub value: Zeroizing<String>,
+    /// Optional sandbox profile to apply when exec-ing the real binary.
+    // Not yet wired up to sandbox application.
+    #[allow(dead_code)]
+    pub sandbox: Option<CommandSandbox>,
 }
 
 /// Handle returned by `setup()`. Dropping this shuts down the runtime.
@@ -55,8 +56,6 @@ pub struct SessionHandle {
     pub blocked_binaries: Vec<PathBuf>,
     /// Env vars to strip from the child environment (from `mediation.env.block`).
     pub env_block: Vec<String>,
-    /// Credentials to inject into the child environment (from `mediation.env.inject`).
-    pub env_inject: Vec<InjectedEnvVar>,
     // Tokio runtime kept alive so the server task continues running in the parent.
     _runtime: tokio::runtime::Runtime,
 }
@@ -74,8 +73,8 @@ impl Drop for SessionHandle {
 /// Returns `None` when `config.is_active()` is false (nothing to do).
 ///
 /// # Errors
-/// Returns an error if a command cannot be resolved, a credential cannot be
-/// loaded, or the session directory / symlinks cannot be created.
+/// Returns an error if a command cannot be resolved, or the session directory /
+/// symlinks cannot be created.
 pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     if !config.is_active() {
         return Ok(None);
@@ -97,7 +96,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     })?;
 
     // -------------------------------------------------------------------------
-    // Resolve commands and load credentials
+    // Resolve commands
     // -------------------------------------------------------------------------
     let mut resolved_commands: Vec<ResolvedCommand> = Vec::new();
     let mut blocked_binaries: Vec<PathBuf> = Vec::new();
@@ -109,16 +108,9 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     }
 
     // -------------------------------------------------------------------------
-    // Load env.inject credentials
+    // Create token broker (session-scoped)
     // -------------------------------------------------------------------------
-    let mut env_inject: Vec<InjectedEnvVar> = Vec::new();
-    for inj in &config.env.inject {
-        let value = load_credential(&inj.source)?;
-        env_inject.push(InjectedEnvVar {
-            var: inj.var.clone(),
-            value,
-        });
-    }
+    let broker = Arc::new(TokenBroker::new());
 
     // -------------------------------------------------------------------------
     // Start the mediation server
@@ -134,8 +126,9 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
 
     let sock = socket_path.clone();
     let cmds = resolved_commands.clone();
+    let broker_clone = Arc::clone(&broker);
     runtime.spawn(async move {
-        if let Err(e) = super::server::run(sock, cmds).await {
+        if let Err(e) = super::server::run(sock, cmds, broker_clone).await {
             tracing::error!("mediation server error: {}", e);
         }
     });
@@ -153,13 +146,11 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
         session_dir,
         blocked_binaries,
         env_block: config.env.block.clone(),
-        env_inject,
         _runtime: runtime,
     }))
 }
 
-/// Resolve a command entry: find the real binary, create the shim symlink,
-/// and load all referenced credentials.
+/// Resolve a command entry: find the real binary, create the shim symlink.
 fn resolve_command(
     entry: &CommandEntry,
     shim_dir: &Path,
@@ -196,43 +187,39 @@ fn resolve_command(
         ))
     })?;
 
-    // Resolve intercept rules (loading credentials eagerly)
-    let mut intercepts = Vec::new();
-    for rule in &entry.intercept {
-        let stdout = if let Some(ref source) = rule.respond.credential_source {
-            let cred = load_credential(source)?;
-            rule.respond
-                .output_template
-                .replace("{credential}", cred.as_str())
-        } else {
-            rule.respond.output_template.clone()
-        };
-        intercepts.push(ResolvedIntercept {
-            args_prefix: rule.args_prefix.clone(),
-            stdout,
-            stderr: String::new(),
-            exit_code: rule.respond.exit_code,
-        });
-    }
-
-    // Load inject_env credentials
-    let mut inject_env: Vec<(String, Zeroizing<String>)> = Vec::new();
-    for inj in &entry.inject_env {
-        let value = load_credential(&inj.source)?;
-        inject_env.push((inj.var.clone(), value));
-    }
+    // Convert intercept rules
+    let intercepts = entry
+        .intercept
+        .iter()
+        .map(|rule| {
+            let (action, exit_code) = match &rule.action {
+                InterceptAction::Respond { stdout, exit_code } => (
+                    ResolvedAction::Respond {
+                        stdout: stdout.clone(),
+                    },
+                    *exit_code,
+                ),
+                InterceptAction::Capture { script } => (
+                    ResolvedAction::Capture {
+                        script: script.clone(),
+                    },
+                    0,
+                ),
+            };
+            ResolvedIntercept {
+                args_prefix: rule.args_prefix.clone(),
+                action,
+                exit_code,
+            }
+        })
+        .collect();
 
     Ok(ResolvedCommand {
         name: entry.name.clone(),
         real_path,
         intercepts,
-        inject_env,
+        sandbox: entry.sandbox.clone(),
     })
-}
-
-/// Load a credential from the keystore using the URI scheme.
-fn load_credential(source: &str) -> Result<Zeroizing<String>> {
-    keystore::load_secret_by_ref(keystore::DEFAULT_SERVICE, source)
 }
 
 /// Find the nono-shim binary.
@@ -271,7 +258,6 @@ fn session_dir_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mediation::MediationConfig;
 
     #[test]
     fn test_setup_returns_none_when_inactive() {

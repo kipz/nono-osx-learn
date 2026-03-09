@@ -1514,20 +1514,11 @@ fn execute_sandboxed(
         env_vars.push((k.as_str(), v.as_str()));
     }
 
-    // Add mediation env vars: socket path, injected credentials, and PATH override.
+    // Add mediation env vars: socket path and PATH override.
     // These strings are kept alive until `env_vars` is consumed by exec.
     let mediation_socket_path_str: String = mediation_session
         .as_ref()
         .map(|s| s.socket_path.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let mediation_env_inject_strs: Vec<(String, String)> = mediation_session
-        .as_ref()
-        .map(|s| {
-            s.env_inject
-                .iter()
-                .map(|inj| (inj.var.clone(), inj.value.as_str().to_string()))
-                .collect()
-        })
         .unwrap_or_default();
     // Prepend shim dir to PATH so shim symlinks shadow real binaries.
     let mediation_path_str: String = mediation_session
@@ -1545,9 +1536,6 @@ fn execute_sandboxed(
     if mediation_session.is_some() {
         env_vars.push(("NONO_MEDIATION_SOCKET", &mediation_socket_path_str));
         env_vars.push(("PATH", &mediation_path_str));
-        for (k, v) in &mediation_env_inject_strs {
-            env_vars.push((k.as_str(), v.as_str()));
-        }
     }
 
     // Determine threading context for fork safety.

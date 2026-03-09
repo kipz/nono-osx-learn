@@ -1,14 +1,19 @@
-//! Command mediation: policy-driven command interception and credential injection.
+//! Command mediation: policy-driven command interception and response injection.
 //!
 //! The mediation layer sits between the sandboxed AI agent and real tool binaries.
-//! Instead of running `ddtool auth github token` directly, the sandbox's PATH
-//! resolves to a shim that forwards the invocation over a Unix socket to this
-//! server running in the unsandboxed parent.
+//! Instead of running a command directly, the sandbox's PATH resolves to a shim
+//! that forwards the invocation over a Unix socket to this server running in the
+//! unsandboxed parent.
 //!
-//! All policy (which commands to intercept, what to return, which env vars to
-//! block/inject) lives in the profile's `mediation` section. The nono core has
-//! no tool-specific knowledge.
+//! This layer can intercept any command invocation and either return a configured
+//! static response or capture the output of the real binary and return a nonce
+//! (phantom token pattern). On passthrough, nonce-bearing env vars are promoted
+//! to their real values before exec-ing the real binary.
+//!
+//! All policy (which commands to intercept, what to do, which env vars to block)
+//! lives in the profile's `mediation` section.
 
+pub mod broker;
 pub mod policy;
 pub mod server;
 pub mod session;
@@ -18,7 +23,7 @@ use serde::Deserialize;
 /// Top-level mediation configuration from a profile's `mediation` section.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MediationConfig {
-    /// Commands to mediate (intercept or inject env into).
+    /// Commands to mediate (intercept or pass through).
     #[serde(default)]
     pub commands: Vec<CommandEntry>,
     /// Environment variable policy for the sandboxed child.
@@ -29,9 +34,7 @@ pub struct MediationConfig {
 impl MediationConfig {
     /// Returns true if there is any mediation configuration to apply.
     pub fn is_active(&self) -> bool {
-        !self.commands.is_empty()
-            || !self.env.block.is_empty()
-            || !self.env.inject.is_empty()
+        !self.commands.is_empty() || !self.env.block.is_empty()
     }
 }
 
@@ -43,54 +46,78 @@ pub struct CommandEntry {
     /// Arg-prefix intercept rules. Checked in order; first match wins.
     #[serde(default)]
     pub intercept: Vec<InterceptRule>,
-    /// Environment variables to inject when passing through to the real binary.
+    /// Optional sandbox profile applied when exec-ing the real binary.
     #[serde(default)]
-    pub inject_env: Vec<EnvInject>,
+    pub sandbox: Option<CommandSandbox>,
 }
 
-/// An intercept rule: if `args_prefix` matches the invocation's args, return
-/// the configured response without calling the real binary.
+/// An intercept rule: if `args_prefix` matches the invocation's positional args,
+/// perform the configured action without (or with) calling the real binary.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InterceptRule {
-    /// The leading args that must match (e.g. `["auth", "github", "token"]`).
+    /// The leading positional args that must match (flags are ignored during matching).
+    /// E.g. `["auth", "github", "token"]` matches `ddtool --debug auth github token`.
     pub args_prefix: Vec<String>,
-    /// What to respond with when this rule matches.
-    pub respond: RespondConfig,
+    /// What to do when this rule matches.
+    pub action: InterceptAction,
 }
 
-/// The response emitted when an intercept rule fires.
+/// The action to take when an intercept rule fires.
 #[derive(Debug, Clone, Deserialize)]
-pub struct RespondConfig {
-    /// Credential to load and substitute into `output_template`.
-    /// Uses the keystore URI scheme: `keychain:account`, `op://vault/item/field`,
-    /// or `env://VAR_NAME`. Optional — if absent, `output_template` is used as-is.
-    #[serde(default)]
-    pub credential_source: Option<String>,
-    /// Template for stdout. Use `{credential}` as the substitution placeholder.
-    pub output_template: String,
-    /// Exit code to return to the caller (default: 0).
-    #[serde(default)]
-    pub exit_code: i32,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InterceptAction {
+    /// Return a static response without calling the real binary.
+    Respond {
+        #[serde(default)]
+        stdout: String,
+        #[serde(default)]
+        exit_code: i32,
+    },
+    /// Capture a credential and return a nonce to the sandbox.
+    ///
+    /// If `script` is set, runs `sh -c "<script>"` and captures its stdout.
+    /// If `script` is absent, runs the real binary with the original args.
+    /// The captured stdout (trimmed) is stored in the broker; the nonce is returned.
+    Capture {
+        /// Optional shell script to run instead of the real binary.
+        /// Runs via `sh -c` in the unsandboxed parent. Stdout is the credential.
+        #[serde(default)]
+        script: Option<String>,
+    },
 }
 
-/// An environment variable to inject (either into a command's env or the
-/// sandbox's global env).
-#[derive(Debug, Clone, Deserialize)]
-pub struct EnvInject {
-    /// The environment variable name to set.
-    pub var: String,
-    /// Credential source URI: `keychain:account`, `op://...`, or `env://VAR`.
-    pub source: String,
+/// Sandbox profile applied when exec-ing the real binary for a passthrough command.
+///
+/// Default (when absent): no sandbox applied — existing behavior.
+/// Operators opt in per command.
+// Fields are parsed from config but application is not yet wired up.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CommandSandbox {
+    /// Network policy for the exec'd command. Default: allow all (no restriction).
+    #[serde(default)]
+    pub network: NetworkConfig,
+    /// Filesystem paths the command may read.
+    #[serde(default)]
+    pub fs_read: Vec<String>,
+    /// Filesystem paths the command may write.
+    #[serde(default)]
+    pub fs_write: Vec<String>,
+}
+
+/// Simple network config for per-command sandbox profiles.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NetworkConfig {
+    /// If true, block all outbound network. Default: false (allow all).
+    #[serde(default)]
+    pub block: bool,
 }
 
 /// Environment variable policy for the sandboxed child process.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct EnvPolicy {
     /// Env var names to strip from the child environment (credential leakage prevention).
-    /// Complements the hardcoded injection-vector blocklist in `env_sanitization.rs`.
     #[serde(default)]
     pub block: Vec<String>,
-    /// Credentials to load and inject as env vars in the child environment.
-    #[serde(default)]
-    pub inject: Vec<EnvInject>,
 }

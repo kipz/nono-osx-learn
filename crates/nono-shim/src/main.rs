@@ -14,6 +14,7 @@
 //! Zero tool-specific logic lives here — all policy is in the mediation server.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -23,6 +24,7 @@ struct ShimRequest {
     command: String,
     args: Vec<String>,
     stdin: String,
+    env: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -66,10 +68,13 @@ fn run() -> i32 {
     let _ = std::io::stdin().read_to_end(&mut stdin_bytes);
     let stdin = String::from_utf8_lossy(&stdin_bytes).into_owned();
 
+    let env: HashMap<String, String> = std::env::vars().collect();
+
     let request = ShimRequest {
         command: command_name,
         args,
         stdin,
+        env,
     };
 
     let request_bytes = match serde_json::to_vec(&request) {
