@@ -4,7 +4,7 @@
 
 use crate::cli::{
     TrustArgs, TrustCommands, TrustExportKeyArgs, TrustInitArgs, TrustKeygenArgs, TrustListArgs,
-    TrustSignArgs, TrustSignPolicyArgs, TrustVerifyArgs,
+    TrustSignArgs, TrustSignPolicyArgs, TrustSignSkillArgs, TrustVerifyArgs, TrustVerifySkillArgs,
 };
 use crate::trust_keystore;
 use aws_lc_rs::rand::SystemRandom;
@@ -39,6 +39,8 @@ pub fn run_trust(args: TrustArgs) -> Result<()> {
         TrustCommands::List(list_args) => run_list(list_args),
         TrustCommands::Keygen(keygen_args) => run_keygen(keygen_args),
         TrustCommands::ExportKey(export_args) => run_export_key(export_args),
+        TrustCommands::SignSkill(args) => run_sign_skill(args),
+        TrustCommands::VerifySkill(args) => run_verify_skill(args),
     }
 }
 
@@ -1016,6 +1018,88 @@ fn run_list(args: TrustListArgs) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// sign-skill
+// ---------------------------------------------------------------------------
+
+fn run_sign_skill(args: TrustSignSkillArgs) -> Result<()> {
+    let key_id = args.key.as_deref().unwrap_or("default");
+    let key_pair = load_signing_key(key_id)?;
+
+    let bundle_json = trust::sign_skill(&args.dir, &key_pair, key_id)?;
+    trust::write_skill_bundle(&args.dir, &bundle_json)?;
+
+    let bundle_path = args.dir.join(trust::SKILL_BUNDLE_FILENAME);
+    eprintln!(
+        "  {} {} -> {}",
+        "SIGNED".green(),
+        args.dir.display(),
+        bundle_path.display()
+    );
+    eprintln!();
+    eprintln!("{}", "Skill directory signed successfully.".green());
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// verify-skill
+// ---------------------------------------------------------------------------
+
+fn run_verify_skill(args: TrustVerifySkillArgs) -> Result<()> {
+    let policy = load_trust_policy(args.policy.as_deref())?;
+
+    let result = trust::verify_skill(&policy, &args.dir)?;
+
+    match &result.outcome {
+        trust::VerificationOutcome::Verified { publisher } => {
+            eprintln!(
+                "  {} {} v{} (publisher: {})",
+                "VERIFIED".green(),
+                result.name,
+                result.version,
+                publisher
+            );
+            if let Some(ref manifest) = result.manifest {
+                eprintln!("  Files: {}", manifest.files.len());
+                eprintln!("  Entry points: {}", manifest.entry_points.len());
+                eprintln!("  Hooks: {}", manifest.hooks.len());
+            }
+        }
+        outcome => {
+            let reason = match outcome {
+                trust::VerificationOutcome::Blocked { reason } => {
+                    format!("blocklisted: {reason}")
+                }
+                trust::VerificationOutcome::Unsigned => "unsigned (no bundle)".to_string(),
+                trust::VerificationOutcome::InvalidSignature { detail } => {
+                    format!("invalid: {detail}")
+                }
+                trust::VerificationOutcome::UntrustedPublisher { identity } => {
+                    format!("untrusted publisher: {identity:?}")
+                }
+                trust::VerificationOutcome::DigestMismatch { expected, actual } => {
+                    format!("digest mismatch: expected {expected}, got {actual}")
+                }
+                trust::VerificationOutcome::Verified { .. } => unreachable!(),
+            };
+            eprintln!(
+                "  {} {} v{}: {}",
+                "FAILED".red(),
+                result.name,
+                result.version,
+                reason
+            );
+            return Err(nono::NonoError::TrustVerification {
+                path: args.dir.display().to_string(),
+                reason,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Key loading from system keystore
 // ---------------------------------------------------------------------------
 
@@ -1454,10 +1538,17 @@ mod tests {
             xdg_dir.to_str().unwrap(),
         )]);
 
+        // Override HOME so dirs::config_dir() won't find a real user-level policy.
+        std::env::set_var("HOME", dir.path());
+
         let result = std::panic::catch_unwind(|| {
             std::env::set_current_dir(dir.path()).unwrap();
             let policy = load_trust_policy(None).unwrap();
-            assert!(policy.publishers.is_empty());
+            assert!(
+                policy.publishers.is_empty(),
+                "expected empty publishers when no policy file exists, got: {:?}",
+                policy.publishers,
+            );
         });
 
         std::env::set_current_dir(original).unwrap();
