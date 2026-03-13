@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.17.1] - 2026-03-13
+
+### Bug Fixes
+
+- Narrow broad linux /etc and /proc reads in system_read policy (#350) ([#350](https://github.com/always-further/nono/pull/350))
+
+
+### Features
+
+- *(sandbox/linux)* Add Landlock V6 signal scoping support (#344) ([#344](https://github.com/always-further/nono/pull/344))
+
+
+### Miscellaneous
+
+- Release v0.17.0
+
+- Release v0.17.0
+
 ## [0.17.0] - 2026-03-13
 
 ### Bug Fixes
