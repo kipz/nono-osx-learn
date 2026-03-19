@@ -54,6 +54,31 @@ struct AuditEvent {
     action_type: Option<String>,
 }
 
+/// Read piped stdin without blocking indefinitely.
+///
+/// Spawns a background thread that performs the blocking `read_to_end`, then
+/// waits for it with a timeout.  If no data arrives within 50ms we assume
+/// the pipe is idle (e.g. Node.js `spawn()` with default stdio) and proceed
+/// with empty stdin.  Real piped input (e.g. `echo data | cmd`) will be fully
+/// available well within that window.
+fn read_stdin_nonblocking() -> String {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    match rx.recv_timeout(Duration::from_millis(50)) {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
 fn main() {
     let code = run();
     std::process::exit(code);
@@ -114,14 +139,20 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Read stdin only when it is not a TTY (i.e. piped/redirected).
-    // If stdin is a terminal, read_to_end would block forever waiting for EOF.
+    // Read stdin only when data is being piped in.  A TTY means interactive
+    // use — no data to forward.  A pipe *might* carry data (e.g. `echo x |
+    // ddtool …`), but it might also be an open pipe from a parent process that
+    // never intends to write (e.g. Node.js `spawn()` with default stdio).
+    // Blocking on `read_to_end` in that case hangs the shim forever.
+    //
+    // Strategy: set a short read timeout on stdin.  If nothing arrives within
+    // 50 ms we treat stdin as empty and proceed.  Real piped input (even large
+    // payloads) will arrive well within that window because the writer has
+    // already buffered everything before exec-ing the shim.
     let stdin = if std::io::stdin().is_terminal() {
         String::new()
     } else {
-        let mut stdin_bytes = Vec::new();
-        let _ = std::io::stdin().read_to_end(&mut stdin_bytes);
-        String::from_utf8_lossy(&stdin_bytes).into_owned()
+        read_stdin_nonblocking()
     };
 
     let env: HashMap<String, String> = std::env::vars().collect();
