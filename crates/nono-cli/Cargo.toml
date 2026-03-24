@@ -63,6 +63,7 @@ subtle = "2"
 hex = "0.4"
 
 ureq = "3"
+indexmap = { version = "2", features = ["serde"] }
 
 zeroize.workspace = true
 sha2.workspace = true

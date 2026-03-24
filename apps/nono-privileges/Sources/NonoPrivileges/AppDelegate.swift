@@ -4,7 +4,7 @@ import SwiftUI
 /// Blocks NSPopover from observing preferredContentSize changes so it never repositions.
 /// The getter returns a locked size set explicitly before each show.
 class LockedSizeHostingController<Content: View>: NSHostingController<Content> {
-    var lockedSize = NSSize(width: 260, height: 200)
+    var lockedSize = NSSize(width: 280, height: 200)
 
     override var preferredContentSize: NSSize {
         get { lockedSize }
@@ -53,8 +53,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             sessionStore.refresh()
             // Measure the current content synchronously so the locked size is correct
             // before show() — NSPopover positions once and never repositions.
-            let measured = hc.sizeThatFits(in: NSSize(width: 260, height: CGFloat.infinity))
-            hc.lockedSize = measured.height > 10 ? measured : NSSize(width: 260, height: 200)
+            let measured = hc.sizeThatFits(in: NSSize(width: 280, height: CGFloat.infinity))
+            hc.lockedSize = measured.height > 10 ? measured : NSSize(width: 280, height: 200)
             popover.contentSize = hc.lockedSize
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
@@ -75,7 +75,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         sessionStore.refresh()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, let button = self.statusItem?.button else { return }
-            let anyActive = self.sessionStore.hasAnyAdminActive()
+            let anyActive = self.sessionStore.hasAnyActive()
             let symbolName = anyActive ? "key.horizontal.fill" : "key.horizontal"
             button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "nono YOLO mode")
             button.contentTintColor = anyActive ? .systemOrange : nil

@@ -405,12 +405,17 @@ pub fn execute_supervised(
                     // The npm `open` package spawns `open <url>` on macOS; by placing our
                     // shim earlier in PATH, we intercept the call.
                     if let Some(shim) = create_open_shim(&nono_exe) {
-                        // Prepend shim dir to PATH and also set BROWSER for any tool
-                        // that does respect it.
-                        let current_path = std::env::var("PATH").unwrap_or_default();
+                        // Prepend shim dir to PATH. Read the current PATH from env_c
+                        // (which may already include the mediation shim dir) rather than
+                        // from the parent process env, to avoid clobbering it.
+                        let current_path = env_c
+                            .iter()
+                            .find(|c| c.as_bytes().starts_with(b"PATH="))
+                            .and_then(|c| c.to_str().ok())
+                            .map(|s| s.trim_start_matches("PATH=").to_string())
+                            .unwrap_or_default();
                         let new_path = format!("PATH={}:{current_path}", shim.dir.path().display());
                         if let Ok(cstr) = CString::new(new_path) {
-                            // Remove existing PATH from env_c, then add our modified one
                             env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
                             env_c.push(cstr);
                         }

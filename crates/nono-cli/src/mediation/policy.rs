@@ -301,6 +301,17 @@ pub async fn admin_passthrough(
     (resp, "admin_passthrough")
 }
 
+/// Check if a group's allow rules permit the given command and args.
+///
+/// Returns true if any rule in the group matches. Matching uses the same
+/// `subcommand_matches` logic as intercept rules — flags are ignored.
+pub fn group_allows(group: &super::MediationGroup, command: &str, args: &[String]) -> bool {
+    group
+        .allow
+        .iter()
+        .any(|rule| rule.command == command && subcommand_matches(&rule.args_prefix, args))
+}
+
 /// Check if the invocation's positional args start with the given prefix.
 ///
 /// Flags (args starting with `-`) are ignored, allowing matches regardless of
@@ -1145,6 +1156,97 @@ mod tests {
     fn test_subcommand_matches_empty_prefix_matches_anything() {
         assert!(subcommand_matches(&[], &[]));
         assert!(subcommand_matches(&[], &["anything".to_string()]));
+    }
+
+    // --- group_allows tests ---
+
+    #[test]
+    fn test_group_allows_exact_match() {
+        use crate::mediation::{GroupAllowRule, MediationGroup};
+        let group = MediationGroup {
+            description: "test".to_string(),
+            requires_auth: false,
+            duration_secs: 0,
+            default: false,
+            allow: vec![GroupAllowRule {
+                command: "git".to_string(),
+                args_prefix: vec!["status".to_string()],
+            }],
+        };
+        assert!(group_allows(&group, "git", &["status".to_string()]));
+        assert!(!group_allows(&group, "git", &["push".to_string()]));
+        assert!(!group_allows(&group, "kubectl", &["status".to_string()]));
+    }
+
+    #[test]
+    fn test_group_allows_empty_args_prefix_matches_all_subcommands() {
+        use crate::mediation::{GroupAllowRule, MediationGroup};
+        let group = MediationGroup {
+            description: "test".to_string(),
+            requires_auth: false,
+            duration_secs: 0,
+            default: false,
+            allow: vec![GroupAllowRule {
+                command: "git".to_string(),
+                args_prefix: vec![],
+            }],
+        };
+        assert!(group_allows(&group, "git", &["status".to_string()]));
+        assert!(group_allows(&group, "git", &["push".to_string()]));
+        assert!(group_allows(&group, "git", &[]));
+    }
+
+    #[test]
+    fn test_group_allows_ignores_flags() {
+        use crate::mediation::{GroupAllowRule, MediationGroup};
+        let group = MediationGroup {
+            description: "test".to_string(),
+            requires_auth: false,
+            duration_secs: 0,
+            default: false,
+            allow: vec![GroupAllowRule {
+                command: "git".to_string(),
+                args_prefix: vec!["log".to_string()],
+            }],
+        };
+        assert!(group_allows(
+            &group,
+            "git",
+            &["--oneline".to_string(), "log".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_group_allows_multiple_rules() {
+        use crate::mediation::{GroupAllowRule, MediationGroup};
+        let group = MediationGroup {
+            description: "test".to_string(),
+            requires_auth: false,
+            duration_secs: 0,
+            default: false,
+            allow: vec![
+                GroupAllowRule {
+                    command: "git".to_string(),
+                    args_prefix: vec!["status".to_string()],
+                },
+                GroupAllowRule {
+                    command: "git".to_string(),
+                    args_prefix: vec!["log".to_string()],
+                },
+                GroupAllowRule {
+                    command: "kubectl".to_string(),
+                    args_prefix: vec!["get".to_string()],
+                },
+            ],
+        };
+        assert!(group_allows(&group, "git", &["status".to_string()]));
+        assert!(group_allows(&group, "git", &["log".to_string()]));
+        assert!(group_allows(
+            &group,
+            "kubectl",
+            &["get".to_string(), "pods".to_string()]
+        ));
+        assert!(!group_allows(&group, "kubectl", &["delete".to_string()]));
     }
 
     // --- Capture tests ---

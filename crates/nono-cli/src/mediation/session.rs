@@ -10,7 +10,7 @@
 use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
-use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig};
+use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig, MediationGroup};
 use nono::{NonoError, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -224,11 +224,28 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     // -------------------------------------------------------------------------
     let session_json_path = session_dir.join("session.json");
     let started_at = chrono::Utc::now().to_rfc3339();
+
+    // Serialize groups for session.json so the GUI app can discover them
+    let groups_json: serde_json::Value = config
+        .groups
+        .iter()
+        .map(|(name, g)| {
+            serde_json::json!({
+                "name": name,
+                "description": g.description,
+                "requires_auth": g.requires_auth,
+                "duration_secs": g.duration_secs,
+                "default": g.default,
+            })
+        })
+        .collect();
+
     let session_info = serde_json::json!({
         "pid": std::process::id(),
         "control_socket": control_socket_path.to_string_lossy(),
         "control_token": control_token,
         "started_at": started_at,
+        "groups": groups_json,
     });
     let session_json_bytes = serde_json::to_vec(&session_info).map_err(|e| {
         NonoError::SandboxInit(format!(
@@ -266,6 +283,9 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let approval_gate: Arc<dyn super::approval::ApprovalGate + Send + Sync> =
         Arc::new(NativeApprovalGate);
 
+    let groups_arc: Arc<indexmap::IndexMap<String, MediationGroup>> =
+        Arc::new(config.groups.clone());
+
     let sock = socket_path.clone();
     let cmds = resolved_commands.clone();
     let broker_clone = Arc::clone(&broker);
@@ -275,6 +295,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let gate_clone = Arc::clone(&approval_gate);
     let audit_sock = audit_socket_path.clone();
     let session_dir_clone = session_dir.clone();
+    let groups_clone = Arc::clone(&groups_arc);
     runtime.spawn(async move {
         if let Err(e) = super::server::run(
             sock,
@@ -286,6 +307,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
             gate_clone,
             audit_sock,
             session_dir_clone,
+            groups_clone,
         )
         .await
         {
@@ -300,13 +322,37 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let ctrl_token = control_token;
     let ctrl_admin = admin_state.clone();
     let ctrl_sdir = session_dir.clone();
+    let ctrl_groups = Arc::clone(&groups_arc);
     runtime.spawn(async move {
-        if let Err(e) =
-            super::control::run_control_server(ctrl_sock, ctrl_token, ctrl_admin, ctrl_sdir).await
+        if let Err(e) = super::control::run_control_server(
+            ctrl_sock,
+            ctrl_token,
+            ctrl_admin,
+            ctrl_sdir,
+            ctrl_groups,
+        )
+        .await
         {
             tracing::error!("control server error: {}", e);
         }
     });
+
+    // -------------------------------------------------------------------------
+    // Auto-enable default group (if any)
+    // -------------------------------------------------------------------------
+    if let Some((name, group)) = config.groups.iter().find(|(_, g)| g.default) {
+        let expires_at = if group.duration_secs > 0 {
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(group.duration_secs))
+        } else {
+            None
+        };
+        info!("Auto-enabling default group '{}'", name);
+        admin_state.set(super::admin::PrivilegeMode::Group {
+            name: name.clone(),
+            expires_at,
+            granted_by: "default".to_string(),
+        });
+    }
 
     info!(
         "Mediation session started: socket={}, shims={}",
@@ -456,7 +502,7 @@ fn session_dir_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mediation::admin::AdminModeStatus;
+    use crate::mediation::admin::PrivilegeMode;
 
     #[test]
     fn test_setup_returns_none_when_inactive() {
@@ -475,14 +521,14 @@ mod tests {
 
     #[test]
     fn test_admin_state_initial_disabled() {
-        // Verify a freshly constructed AdminState starts in Disabled mode.
+        // Verify a freshly constructed AdminState starts in None mode.
         let state = AdminState::new();
         let rx = state.subscribe();
         assert!(
             !rx.borrow().is_active(),
-            "admin mode should be disabled by default"
+            "privilege mode should be None by default"
         );
-        assert!(matches!(*rx.borrow(), AdminModeStatus::Disabled));
+        assert!(matches!(*rx.borrow(), PrivilegeMode::None));
     }
 
     #[test]

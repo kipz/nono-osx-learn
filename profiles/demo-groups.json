@@ -1,0 +1,78 @@
+{
+  "meta": {
+    "name": "demo-groups",
+    "version": "1.0.0",
+    "description": "Demo profile showcasing named permission groups",
+    "author": "nono-project"
+  },
+  "security": {
+    "groups": ["homebrew"]
+  },
+  "filesystem": {
+    "allow": ["$WORKDIR"],
+    "read_file": ["$HOME/.bashrc", "$HOME/.bash_profile", "$HOME/.profile"]
+  },
+  "network": { "block": false },
+  "workdir": { "access": "readwrite" },
+  "mediation": {
+    "commands": [
+      {
+        "name": "curl",
+        "intercept": [
+          {
+            "args_prefix": [],
+            "action": { "type": "respond", "stdout": "nono: curl is mediated. Use a permission group to allow specific operations.\n", "exit_code": 1 }
+          }
+        ]
+      },
+      {
+        "name": "git",
+        "intercept": [
+          {
+            "args_prefix": ["push"],
+            "action": { "type": "respond", "stdout": "nono: git push is blocked by default. Enable a permission group.\n", "exit_code": 1 }
+          },
+          {
+            "args_prefix": ["remote", "add"],
+            "action": { "type": "respond", "stdout": "nono: git remote add is blocked by default. Enable a permission group.\n", "exit_code": 1 }
+          }
+        ]
+      }
+    ],
+    "env": {
+      "block": []
+    },
+    "groups": {
+      "git-readonly": {
+        "description": "Git read-only (fetch, log, status, diff)",
+        "requires_auth": false,
+        "duration_secs": 0,
+        "default": true,
+        "allow": [
+          { "command": "git", "args_prefix": ["status"] },
+          { "command": "git", "args_prefix": ["log"] },
+          { "command": "git", "args_prefix": ["diff"] },
+          { "command": "git", "args_prefix": ["fetch"] },
+          { "command": "git", "args_prefix": ["branch"] }
+        ]
+      },
+      "git-write": {
+        "description": "Git write (push, remote add)",
+        "requires_auth": true,
+        "duration_secs": 300,
+        "allow": [
+          { "command": "git", "args_prefix": ["push"] },
+          { "command": "git", "args_prefix": ["remote", "add"] }
+        ]
+      },
+      "network-access": {
+        "description": "Allow curl requests",
+        "requires_auth": true,
+        "duration_secs": 120,
+        "allow": [
+          { "command": "curl" }
+        ]
+      }
+    }
+  }
+}

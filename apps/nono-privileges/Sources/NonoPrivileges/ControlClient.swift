@@ -1,10 +1,19 @@
 import Foundation
 
-/// Admin mode status returned from the control socket.
-struct AdminStatus {
-    let isActive: Bool
+/// Privilege mode status returned from the control socket.
+struct PrivilegeStatus {
+    /// Current mode: "disabled", "group", or "yolo"
+    let mode: String
+    /// Name of the active group (only when mode == "group")
+    let activeGroup: String?
     let expiresAtUnix: UInt64?
     let grantedBy: String?
+    /// Available groups from the server
+    let groups: [GroupInfo]
+
+    var isActive: Bool { mode != "disabled" }
+    var isYolo: Bool { mode == "yolo" }
+    var isGroup: Bool { mode == "group" }
 
     var secondsRemaining: Int? {
         guard let exp = expiresAtUnix else { return nil }
@@ -30,39 +39,79 @@ class ControlClient {
         self.session = session
     }
 
-    func status() throws -> AdminStatus {
+    func status() throws -> PrivilegeStatus {
         let resp = try sendRequest([
             "token": session.controlToken,
             "action": "status"
         ])
-        return parseAdminStatus(from: resp)
+        return parsePrivilegeStatus(from: resp)
     }
 
-    func enable(durationSecs: UInt64 = 600, grantedBy: String) throws -> AdminStatus {
+    /// Enable YOLO mode (full admin bypass).
+    func enable(durationSecs: UInt64 = 600, grantedBy: String) throws -> PrivilegeStatus {
         let resp = try sendRequest([
             "token": session.controlToken,
             "action": "enable",
             "duration_secs": durationSecs,
             "granted_by": grantedBy
         ])
-        return parseAdminStatus(from: resp)
+        return parsePrivilegeStatus(from: resp)
     }
 
-    func disable(grantedBy: String = "App") throws -> AdminStatus {
+    /// Enable a specific permission group.
+    func enable(group: String, durationSecs: UInt64 = 0, grantedBy: String) throws -> PrivilegeStatus {
+        let resp = try sendRequest([
+            "token": session.controlToken,
+            "action": "enable",
+            "group": group,
+            "duration_secs": durationSecs,
+            "granted_by": grantedBy
+        ])
+        return parsePrivilegeStatus(from: resp)
+    }
+
+    func disable(grantedBy: String = "App") throws -> PrivilegeStatus {
         let resp = try sendRequest([
             "token": session.controlToken,
             "action": "disable",
             "granted_by": grantedBy
         ])
-        return parseAdminStatus(from: resp)
+        return parsePrivilegeStatus(from: resp)
     }
 
-    private func parseAdminStatus(from resp: [String: Any]) -> AdminStatus {
+    private func parsePrivilegeStatus(from resp: [String: Any]) -> PrivilegeStatus {
         let statusStr = resp["status"] as? String ?? "disabled"
-        let isActive = statusStr == "active"
         let expiresAtUnix = resp["expires_at_unix"] as? UInt64
         let grantedBy = resp["granted_by"] as? String
-        return AdminStatus(isActive: isActive, expiresAtUnix: expiresAtUnix, grantedBy: grantedBy)
+        let activeGroup = resp["active_group"] as? String
+
+        // Parse groups from status response
+        var groups: [GroupInfo] = []
+        if let groupsArray = resp["groups"] as? [[String: Any]] {
+            for g in groupsArray {
+                guard let name = g["name"] as? String,
+                      let description = g["description"] as? String
+                else { continue }
+                let requiresAuth = g["requires_auth"] as? Bool ?? false
+                let durationSecs = g["duration_secs"] as? UInt64 ?? 0
+                let isDefault = g["default"] as? Bool ?? false
+                groups.append(GroupInfo(
+                    name: name,
+                    description: description,
+                    requiresAuth: requiresAuth,
+                    durationSecs: durationSecs,
+                    isDefault: isDefault
+                ))
+            }
+        }
+
+        return PrivilegeStatus(
+            mode: statusStr,
+            activeGroup: activeGroup,
+            expiresAtUnix: expiresAtUnix,
+            grantedBy: grantedBy,
+            groups: groups
+        )
     }
 
     private func sendRequest(_ request: [String: Any]) throws -> [String: Any] {

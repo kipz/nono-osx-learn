@@ -23,6 +23,37 @@ pub mod session;
 
 use serde::{Deserialize, Serialize};
 
+fn default_group_duration() -> u64 {
+    0
+}
+
+/// A named permission group that gates which commands/subcommands are allowed.
+///
+/// Groups are defined in the profile's `mediation.groups` map. When a group is
+/// activated (via the control socket), commands matching its `allow` rules are
+/// permitted without intercept. Groups can optionally require biometric auth
+/// and have a time-limited duration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MediationGroup {
+    pub description: String,
+    #[serde(default)]
+    pub requires_auth: bool,
+    #[serde(default = "default_group_duration")]
+    pub duration_secs: u64,
+    /// If true, this group is activated automatically when the session starts.
+    #[serde(default)]
+    pub default: bool,
+    pub allow: Vec<GroupAllowRule>,
+}
+
+/// A rule within a permission group specifying which command+subcommand is allowed.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GroupAllowRule {
+    pub command: String,
+    #[serde(default)]
+    pub args_prefix: Vec<String>,
+}
+
 /// Top-level mediation configuration from a profile's `mediation` section.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MediationConfig {
@@ -32,12 +63,15 @@ pub struct MediationConfig {
     /// Environment variable policy for the sandboxed child.
     #[serde(default)]
     pub env: EnvPolicy,
+    /// Named permission groups that can be activated at runtime.
+    #[serde(default)]
+    pub groups: indexmap::IndexMap<String, MediationGroup>,
 }
 
 impl MediationConfig {
     /// Returns true if there is any mediation configuration to apply.
     pub fn is_active(&self) -> bool {
-        !self.commands.is_empty() || !self.env.block.is_empty()
+        !self.commands.is_empty() || !self.env.block.is_empty() || !self.groups.is_empty()
     }
 }
 
@@ -223,5 +257,82 @@ mod tests {
     fn test_command_sandbox_default_has_empty_allow_commands() {
         let sb = CommandSandbox::default();
         assert!(sb.allow_commands.is_empty());
+    }
+
+    #[test]
+    fn test_mediation_group_deserializes() {
+        let json = r#"{
+            "description": "Read-only git operations",
+            "requires_auth": false,
+            "duration_secs": 300,
+            "allow": [
+                { "command": "git", "args_prefix": ["status"] },
+                { "command": "git", "args_prefix": ["log"] }
+            ]
+        }"#;
+        let group: MediationGroup = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(group.description, "Read-only git operations");
+        assert!(!group.requires_auth);
+        assert_eq!(group.duration_secs, 300);
+        assert_eq!(group.allow.len(), 2);
+        assert_eq!(group.allow[0].command, "git");
+        assert_eq!(group.allow[0].args_prefix, vec!["status"]);
+    }
+
+    #[test]
+    fn test_mediation_group_defaults() {
+        let json = r#"{
+            "description": "Minimal group",
+            "allow": [{ "command": "ls" }]
+        }"#;
+        let group: MediationGroup = serde_json::from_str(json).expect("deserialize");
+        assert!(!group.requires_auth);
+        assert_eq!(group.duration_secs, 0);
+    }
+
+    #[test]
+    fn test_mediation_config_groups_deserializes() {
+        let json = r#"{
+            "commands": [],
+            "groups": {
+                "git_read": {
+                    "description": "Git read operations",
+                    "allow": [{ "command": "git", "args_prefix": ["status"] }]
+                },
+                "deploy": {
+                    "description": "Deploy operations",
+                    "requires_auth": true,
+                    "duration_secs": 600,
+                    "allow": [{ "command": "kubectl", "args_prefix": ["apply"] }]
+                }
+            }
+        }"#;
+        let config: MediationConfig = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(config.groups.len(), 2);
+        assert!(config.groups.contains_key("git_read"));
+        assert!(config.groups.contains_key("deploy"));
+        assert!(config.groups["deploy"].requires_auth);
+    }
+
+    #[test]
+    fn test_mediation_config_is_active_with_groups_only() {
+        let json = r#"{
+            "groups": {
+                "test": {
+                    "description": "test",
+                    "allow": [{ "command": "echo" }]
+                }
+            }
+        }"#;
+        let config: MediationConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(config.is_active());
+    }
+
+    #[test]
+    fn test_group_allow_rule_empty_args_prefix() {
+        let json = r#"{ "command": "git" }"#;
+        let rule: GroupAllowRule = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(rule.command, "git");
+        assert!(rule.args_prefix.is_empty());
     }
 }

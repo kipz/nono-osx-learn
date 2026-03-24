@@ -1,5 +1,15 @@
 import Foundation
 
+/// A named permission group from the mediation config.
+struct GroupInfo: Identifiable {
+    var id: String { name }
+    let name: String
+    let description: String
+    let requiresAuth: Bool
+    let durationSecs: UInt64
+    let isDefault: Bool
+}
+
 /// Parsed content of a session.json file.
 struct SessionInfo: Identifiable {
     let id: UInt32
@@ -8,6 +18,7 @@ struct SessionInfo: Identifiable {
     let controlToken: String
     let startedAt: String
     let sessionDir: String
+    let groups: [GroupInfo]
 }
 
 /// Scans /private/tmp/nono-session-*/session.json and returns active sessions.
@@ -36,12 +47,34 @@ func discoverSessions() -> [SessionInfo] {
         guard kill(pid_t(pid), 0) == 0 else { return nil }
 
         let startedAt = obj["started_at"] as? String ?? ""
+
+        // Parse groups from session.json
+        var groups: [GroupInfo] = []
+        if let groupsArray = obj["groups"] as? [[String: Any]] {
+            for g in groupsArray {
+                guard let name = g["name"] as? String,
+                      let description = g["description"] as? String
+                else { continue }
+                let requiresAuth = g["requires_auth"] as? Bool ?? false
+                let durationSecs = g["duration_secs"] as? UInt64 ?? 0
+                let isDefault = g["default"] as? Bool ?? false
+                groups.append(GroupInfo(
+                    name: name,
+                    description: description,
+                    requiresAuth: requiresAuth,
+                    durationSecs: durationSecs,
+                    isDefault: isDefault
+                ))
+            }
+        }
+
         return SessionInfo(
             id: UInt32(pid),
             controlSocket: controlSocket,
             controlToken: controlToken,
             startedAt: startedAt,
-            sessionDir: entry.path
+            sessionDir: entry.path,
+            groups: groups
         )
     }.sorted { $0.pid < $1.pid }
 }

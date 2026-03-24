@@ -8,12 +8,12 @@
 //!   Request:  u32 big-endian length || JSON payload
 //!   Response: u32 big-endian length || JSON payload
 
-use super::admin::AdminModeStatus;
+use super::admin::PrivilegeMode;
 use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
-use super::policy::{admin_passthrough, apply, ShimRequest, ShimResponse};
+use super::policy::{admin_passthrough, apply, group_allows, ShimRequest, ShimResponse};
 use super::session::ResolvedCommand;
-use super::AuditEvent;
+use super::{AuditEvent, MediationGroup};
 use nix::libc;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -41,6 +41,7 @@ pub async fn run(
     approval: Arc<dyn ApprovalGate + Send + Sync>,
     audit_socket_path: PathBuf,
     session_dir: PathBuf,
+    groups: Arc<indexmap::IndexMap<String, MediationGroup>>,
 ) -> std::io::Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(&socket_path);
@@ -87,6 +88,7 @@ pub async fn run(
                 let sess_dir = Arc::clone(&session_dir);
                 let admin_rx = admin_state.subscribe();
                 let gate = Arc::clone(&approval);
+                let grps = Arc::clone(&groups);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
                         stream,
@@ -98,6 +100,7 @@ pub async fn run(
                         admin_rx,
                         gate,
                         &sess_dir,
+                        &grps,
                     )
                     .await
                     {
@@ -122,9 +125,10 @@ async fn handle_connection(
     session_token: Arc<str>,
     shim_dir: &std::path::Path,
     socket_path: &std::path::Path,
-    admin_receiver: tokio::sync::watch::Receiver<AdminModeStatus>,
+    admin_receiver: tokio::sync::watch::Receiver<PrivilegeMode>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
     session_dir: &Path,
+    groups: &indexmap::IndexMap<String, MediationGroup>,
 ) -> std::io::Result<()> {
     // Read length-prefixed request. Reject oversized payloads before allocating
     // to prevent a rogue same-user process from causing a large allocation.
@@ -166,24 +170,58 @@ async fn handle_connection(
         request.command, request.args
     );
 
-    // Check admin mode — bypass all policy if active
-    if admin_receiver.borrow().is_active() {
-        warn!(
-            "admin mode: passthrough command='{}' args={:?} session_pid={}",
-            request.command,
-            request.args,
-            std::process::id()
-        );
-        let (response, action_type) = admin_passthrough(&request, commands).await;
-        write_response(&mut stream, &response).await?;
-        log_mediated_audit(
-            session_dir,
-            &request.command,
-            &request.args,
-            &response,
-            action_type,
-        );
-        return Ok(());
+    // Check privilege mode — group or YOLO bypass
+    {
+        let mode = admin_receiver.borrow().clone();
+        match &mode {
+            PrivilegeMode::Yolo { .. } if mode.is_yolo() => {
+                warn!(
+                    "YOLO mode: passthrough command='{}' args={:?} session_pid={}",
+                    request.command,
+                    request.args,
+                    std::process::id()
+                );
+                let (response, action_type) = admin_passthrough(&request, commands).await;
+                write_response(&mut stream, &response).await?;
+                log_mediated_audit(
+                    session_dir,
+                    &request.command,
+                    &request.args,
+                    &response,
+                    action_type,
+                );
+                return Ok(());
+            }
+            PrivilegeMode::Group { name, .. } if mode.is_active() => {
+                if let Some(group_def) = groups.get(name) {
+                    if group_allows(group_def, &request.command, &request.args) {
+                        warn!(
+                            "group '{}': passthrough command='{}' args={:?} session_pid={}",
+                            name,
+                            request.command,
+                            request.args,
+                            std::process::id()
+                        );
+                        let (response, action_type) = admin_passthrough(&request, commands).await;
+                        write_response(&mut stream, &response).await?;
+                        log_mediated_audit(
+                            session_dir,
+                            &request.command,
+                            &request.args,
+                            &response,
+                            &format!("group_{}", action_type),
+                        );
+                        return Ok(());
+                    }
+                    // Command not allowed by group — fall through to normal policy
+                    debug!(
+                        "group '{}': command '{}' not allowed, applying normal policy",
+                        name, request.command
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     let command_name = request.command.clone();

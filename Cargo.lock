@@ -1579,6 +1579,7 @@ dependencies = [
  "dns-lookup",
  "hex",
  "ignore",
+ "indexmap",
  "jsonschema",
  "keyring",
  "landlock",
