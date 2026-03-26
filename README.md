@@ -26,10 +26,16 @@
 
 </div>
 
-> [!WARNING]
+> [!WARNING] 🚧
 > This is an early alpha release that has not undergone comprehensive security audits. While we have taken care to implement robust security measures, there may still be undiscovered issues. We do not recommend using this in production until we release a stable version of 1.0.
 
-> [!NOTE]
+> [!IMPORTANT] 🔧
+> Active development may cause disruptions — if something is broken, it's likely us, not you.
+> - **Supervisor:** Work is underway on a runtime lifecycle making the supervisor the default execution mode, introducing commands like `ps`, `attach`, `detach`, `inspect`, and `stop`. [#502](https://github.com/always-further/nono/discussions/502)
+> - **Packages & Skills:** A system for customized hooks, skills, and scripts for Coding Agents — with a community registry or any git repo as a source. [#459](https://github.com/always-further/nono/issues/459)
+> - **Policy:** Work continues to make everything fully composable and group-based. [#446](https://github.com/always-further/nono/issues/446)
+
+> [!NOTE] 📖
 > See our [latest release](https://github.com/always-further/nono/releases/latest) or [CHANGELOG.md](./CHANGELOG.md) for release notes.
 
 AI agents get filesystem access, run shell commands, and are wide open to prompt injections. The standard response is guardrails and policies. The problem is that policies can be bypassed — and guardrails can be talked out of.
