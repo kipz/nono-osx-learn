@@ -186,10 +186,7 @@ impl TokenCache {
                 guard.access_token.clone()
             }
             Err(e) => {
-                warn!(
-                    "OAuth2 token refresh failed, returning stale token: {}",
-                    e
-                );
+                warn!("OAuth2 token refresh failed, returning stale token: {}", e);
                 guard.access_token.clone()
             }
         }
@@ -244,11 +241,7 @@ async fn exchange_token(
     };
 
     // ── Build form body ──────────────────────────────────────────────────
-    let body = build_token_request_body(
-        &config.client_id,
-        &config.client_secret,
-        &config.scope,
-    );
+    let body = build_token_request_body(&config.client_id, &config.client_secret, &config.scope);
 
     // ── Build HTTP/1.1 request ───────────────────────────────────────────
     let request = Zeroizing::new(format!(
@@ -270,9 +263,25 @@ async fn exchange_token(
     let addr = format!("{}:{}", host, port);
 
     let response_bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
-        let tcp = TcpStream::connect(&addr).await.map_err(|e| {
-            ProxyError::OAuth2Exchange(format!("TCP connect to {}: {}", addr, e))
-        })?;
+        let tcp = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| ProxyError::OAuth2Exchange(format!("TCP connect to {}: {}", addr, e)))?;
+
+        async fn send_and_read<S: tokio::io::AsyncWrite + tokio::io::AsyncRead + Unpin>(
+            stream: &mut S,
+            request: &[u8],
+            host: &str,
+        ) -> Result<Vec<u8>> {
+            stream
+                .write_all(request)
+                .await
+                .map_err(|e| ProxyError::OAuth2Exchange(format!("write to {}: {}", host, e)))?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| ProxyError::OAuth2Exchange(format!("flush to {}: {}", host, e)))?;
+            read_http_response(stream).await
+        }
 
         if is_https {
             let server_name =
@@ -280,37 +289,18 @@ async fn exchange_token(
                     ProxyError::OAuth2Exchange(format!("invalid TLS server name: {}", host))
                 })?;
 
-            let mut tls = tls_connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| {
-                    ProxyError::OAuth2Exchange(format!("TLS handshake with {}: {}", host, e))
-                })?;
-
-            tls.write_all(request.as_bytes()).await.map_err(|e| {
-                ProxyError::OAuth2Exchange(format!("write to {}: {}", host, e))
-            })?;
-            tls.flush().await.map_err(|e| {
-                ProxyError::OAuth2Exchange(format!("flush to {}: {}", host, e))
+            let mut tls = tls_connector.connect(server_name, tcp).await.map_err(|e| {
+                ProxyError::OAuth2Exchange(format!("TLS handshake with {}: {}", host, e))
             })?;
 
-            read_http_response(&mut tls).await
+            send_and_read(&mut tls, request.as_bytes(), &host).await
         } else {
             let mut tcp = tcp;
-            tcp.write_all(request.as_bytes()).await.map_err(|e| {
-                ProxyError::OAuth2Exchange(format!("write to {}: {}", host, e))
-            })?;
-            tcp.flush().await.map_err(|e| {
-                ProxyError::OAuth2Exchange(format!("flush to {}: {}", host, e))
-            })?;
-
-            read_http_response(&mut tcp).await
+            send_and_read(&mut tcp, request.as_bytes(), &host).await
         }
     })
     .await
-    .map_err(|_| {
-        ProxyError::OAuth2Exchange(format!("token exchange with {} timed out", addr))
-    })??;
+    .map_err(|_| ProxyError::OAuth2Exchange(format!("token exchange with {} timed out", addr)))??;
 
     // ── Parse HTTP response ──────────────────────────────────────────────
     let response_str = String::from_utf8(response_bytes).map_err(|_| {
@@ -323,7 +313,9 @@ async fn exchange_token(
         .map(|i| i + 4)
         .or_else(|| response_str.find("\n\n").map(|i| i + 2))
         .ok_or_else(|| {
-            ProxyError::OAuth2Exchange("malformed HTTP response: no header/body separator".to_string())
+            ProxyError::OAuth2Exchange(
+                "malformed HTTP response: no header/body separator".to_string(),
+            )
         })?;
 
     // Check status code
@@ -342,15 +334,14 @@ async fn exchange_token(
 }
 
 /// Read a full HTTP response from a stream up to [`MAX_TOKEN_RESPONSE`] bytes.
-async fn read_http_response<S: tokio::io::AsyncRead + Unpin>(
-    stream: &mut S,
-) -> Result<Vec<u8>> {
+async fn read_http_response<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     loop {
-        let n = stream.read(&mut tmp).await.map_err(|e| {
-            ProxyError::OAuth2Exchange(format!("read response: {}", e))
-        })?;
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .map_err(|e| ProxyError::OAuth2Exchange(format!("read response: {}", e)))?;
         if n == 0 {
             break;
         }
@@ -369,10 +360,7 @@ async fn read_http_response<S: tokio::io::AsyncRead + Unpin>(
 fn parse_status_code(line: &str) -> u16 {
     // "HTTP/1.1 200 OK" -> "200"
     let mut parts = line.split_whitespace();
-    parts
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .unwrap_or(0)
+    parts.nth(1).and_then(|code| code.parse().ok()).unwrap_or(0)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -412,9 +400,7 @@ fn parse_token_response(json: &str) -> Result<(Zeroizing<String>, Duration)> {
         .get("access_token")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            ProxyError::OAuth2Exchange(
-                "token response missing 'access_token' field".to_string(),
-            )
+            ProxyError::OAuth2Exchange("token response missing 'access_token' field".to_string())
         })?;
 
     let expires_in_secs = value
@@ -441,7 +427,8 @@ mod tests {
 
     #[test]
     fn test_parse_token_response_success() {
-        let json = r#"{"access_token":"eyJhbGciOiJSUzI1NiJ9","token_type":"Bearer","expires_in":3600}"#;
+        let json =
+            r#"{"access_token":"eyJhbGciOiJSUzI1NiJ9","token_type":"Bearer","expires_in":3600}"#;
         let (token, expires) = parse_token_response(json).unwrap();
         assert_eq!(token.as_str(), "eyJhbGciOiJSUzI1NiJ9");
         assert_eq!(expires, Duration::from_secs(3600));

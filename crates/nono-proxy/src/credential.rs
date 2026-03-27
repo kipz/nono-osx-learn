@@ -446,7 +446,10 @@ mod tests {
             oauth2_routes,
         };
 
-        assert!(!store.is_empty(), "store with OAuth2 routes should not be empty");
+        assert!(
+            !store.is_empty(),
+            "store with OAuth2 routes should not be empty"
+        );
         assert_eq!(store.len(), 1);
         assert!(store.get_oauth2("my-api").is_some());
         assert!(store.get("my-api").is_none());
@@ -491,6 +494,7 @@ mod tests {
             path_replacement: None,
             query_param_name: None,
             env_var: Some("MY_API_KEY".to_string()),
+            endpoint_rules: vec![],
             oauth2: Some(OAuth2Config {
                 // Non-routable address: exchange will fail at TCP connect
                 token_url: "https://127.0.0.1:1/oauth/token".to_string(),
@@ -512,11 +516,17 @@ mod tests {
         std::env::remove_var("TEST_OAUTH2_CLIENT_SECRET");
 
         // load() should succeed (route skipped, not hard error)
-        assert!(store.is_ok(), "load should not fail on unreachable OAuth2 endpoint");
+        assert!(
+            store.is_ok(),
+            "load should not fail on unreachable OAuth2 endpoint"
+        );
         let store = store.unwrap();
 
         // The route should have been skipped (token exchange failed)
-        assert!(store.is_empty(), "unreachable OAuth2 endpoint should result in skipped route");
+        assert!(
+            store.is_empty(),
+            "unreachable OAuth2 endpoint should result in skipped route"
+        );
         assert!(store.get_oauth2("my-api").is_none());
     }
 

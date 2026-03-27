@@ -223,16 +223,7 @@ pub fn resolve_credentials(
                 })?;
             }
 
-            // Pass through OAuth2 config if present
-            let oauth2 = cred
-                .auth
-                .as_ref()
-                .map(|auth| nono_proxy::config::OAuth2Config {
-                    token_url: auth.token_url.clone(),
-                    client_id: auth.client_id.clone(),
-                    client_secret: auth.client_secret.clone(),
-                    scope: auth.scope.clone(),
-                });
+            let oauth2 = cred.auth.clone();
 
             routes.push(RouteConfig {
                 prefix: name.clone(),
@@ -964,6 +955,7 @@ mod tests {
                 path_replacement: None,
                 query_param_name: None,
                 env_var: None,
+                endpoint_rules: vec![],
             },
         );
 
@@ -1007,6 +999,7 @@ mod tests {
                 path_replacement: None,
                 query_param_name: None,
                 env_var: None,
+                endpoint_rules: vec![],
             },
         );
 

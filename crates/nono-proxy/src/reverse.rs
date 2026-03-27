@@ -208,7 +208,10 @@ pub async fn handle_reverse_proxy(
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
     let filtered_headers = filter_headers(remaining_header, strip_header);
     let content_length = extract_content_length(remaining_header);
-    let body = read_request_body(stream, content_length, buffered_body).await?;
+    let body = match read_request_body(stream, content_length, buffered_body).await? {
+        Some(body) => body,
+        None => return Ok(()),
+    };
 
     let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
     let mut tls_stream = match connect_upstream_tls(
@@ -340,7 +343,10 @@ async fn handle_oauth2_credential(
     let content_length = extract_content_length(remaining_header);
 
     // Read request body
-    let body = read_request_body(stream, content_length, buffered_body).await?;
+    let body = match read_request_body(stream, content_length, buffered_body).await? {
+        Some(body) => body,
+        None => return Ok(()),
+    };
 
     // Connect to upstream over TLS, honoring any per-route custom CA / mTLS.
     let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
@@ -406,11 +412,11 @@ async fn read_request_body(
     stream: &mut TcpStream,
     content_length: Option<usize>,
     buffered_body: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
     if let Some(len) = content_length {
         if len > MAX_REQUEST_BODY {
             send_error(stream, 413, "Payload Too Large").await?;
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let mut buf = Vec::with_capacity(len);
         let pre = buffered_body.len().min(len);
@@ -421,9 +427,9 @@ async fn read_request_body(
             stream.read_exact(&mut rest).await?;
             buf.extend_from_slice(&rest);
         }
-        Ok(buf)
+        Ok(Some(buf))
     } else {
-        Ok(Vec::new())
+        Ok(Some(Vec::new()))
     }
 }
 

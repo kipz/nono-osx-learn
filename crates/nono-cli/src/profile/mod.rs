@@ -3148,6 +3148,7 @@ mod tests {
             path_replacement: None,
             query_param_name: None,
             env_var: None,
+            endpoint_rules: vec![],
         }
     }
 
