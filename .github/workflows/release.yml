@@ -235,7 +235,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     # Only publish stable releases to crates.io
-    if: ${{ !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'rc') }}
+    if: ${{ !contains(inputs.tag || github.ref_name, 'alpha') && !contains(inputs.tag || github.ref_name, 'beta') && !contains(inputs.tag || github.ref_name, 'rc') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -272,7 +272,7 @@ jobs:
     name: Bump Homebrew Core Formula
     needs: release
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'rc') }}
+    if: ${{ !contains(inputs.tag || github.ref_name, 'alpha') && !contains(inputs.tag || github.ref_name, 'beta') && !contains(inputs.tag || github.ref_name, 'rc') }}
     steps:
       - name: Bump homebrew-core formula
         uses: mislav/bump-homebrew-formula-action@ccf2332299a883f6af50a1d2d41e5df7904dd769 # v4.1
