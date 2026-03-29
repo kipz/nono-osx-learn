@@ -647,6 +647,17 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
         prepared.capability_elevation = true;
     }
 
+    // On WSL2, seccomp user notification returns EBUSY (microsoft/WSL#9548).
+    // Disable features that depend on it and warn the user.
+    #[cfg(target_os = "linux")]
+    if nono::is_wsl2() && prepared.capability_elevation {
+        eprintln!(
+            "  [nono] WSL2 detected: capability elevation disabled \
+             (seccomp user notification unavailable, see microsoft/WSL#9548)"
+        );
+        prepared.capability_elevation = false;
+    }
+
     // Compute scan root for trust policy discovery and instruction file scanning.
     let scan_root = args
         .workdir
@@ -1555,10 +1566,19 @@ fn execute_sandboxed(
 
     // Determine whether the seccomp proxy-only fallback is needed.
     // This must be decided before fork so both parent and child agree.
+    // On WSL2, seccomp user notification is unavailable (EBUSY), so the
+    // proxy fallback cannot be used — warn and disable.
     #[cfg(target_os = "linux")]
     let seccomp_proxy_fallback = {
         let needs_proxy = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { .. });
-        if needs_proxy {
+        if needs_proxy && nono::is_wsl2() {
+            eprintln!(
+                "  [nono] WSL2 detected: proxy network filtering disabled \
+                 (seccomp user notification unavailable, see microsoft/WSL#9548). \
+                 Network will use block-all fallback."
+            );
+            false
+        } else if needs_proxy {
             match Sandbox::detect_abi() {
                 Ok(detected) => !detected.has_network(),
                 Err(_) => false,
