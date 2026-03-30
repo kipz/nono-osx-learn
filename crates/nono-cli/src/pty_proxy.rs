@@ -157,7 +157,7 @@ pub struct PtyProxy {
     detach_sequence: Vec<u8>,
     /// Number of bytes currently matched against `detach_sequence`.
     pending_detach_match_len: usize,
-    /// Buffered enhanced key report bytes for the final detach key.
+    /// Buffered enhanced key report bytes for the current detach key.
     pending_detach_escape: Vec<u8>,
     /// In-band detach requested from the attached client.
     detach_requested: bool,
@@ -674,12 +674,11 @@ impl PtyProxy {
 
     fn should_start_enhanced_detach_match(&self, byte: u8) -> bool {
         byte == b'\x1b'
-            && self.pending_detach_match_len + 1 == self.detach_sequence.len()
             && self
                 .detach_sequence
-                .last()
+                .get(self.pending_detach_match_len)
                 .copied()
-                .is_some_and(|key| key.is_ascii_graphic() || key == b' ')
+                .is_some_and(detach_key_supports_enhanced_match)
     }
 
     fn maybe_consume_enhanced_detach_byte(&mut self, byte: u8, forwarded: &mut Vec<u8>) -> bool {
@@ -688,7 +687,11 @@ impl PtyProxy {
         }
 
         self.pending_detach_escape.push(byte);
-        let Some(expected_key) = self.detach_sequence.last().copied() else {
+        let Some(expected_key) = self
+            .detach_sequence
+            .get(self.pending_detach_match_len)
+            .copied()
+        else {
             self.flush_pending_detach_escape(forwarded);
             return true;
         };
@@ -701,8 +704,11 @@ impl PtyProxy {
             }
             EnhancedKeyMatch::Matched => {
                 self.pending_detach_escape.clear();
-                self.pending_detach_match_len = 0;
-                self.detach_requested = true;
+                self.pending_detach_match_len += 1;
+                if self.pending_detach_match_len == self.detach_sequence.len() {
+                    self.pending_detach_match_len = 0;
+                    self.detach_requested = true;
+                }
             }
             EnhancedKeyMatch::Invalid => self.flush_pending_detach_escape(forwarded),
         }
@@ -724,6 +730,10 @@ enum EnhancedKeyMatch {
     Pending,
     Matched,
     Invalid,
+}
+
+fn detach_key_supports_enhanced_match(key: u8) -> bool {
+    key.is_ascii_graphic() || key == b' ' || control_key_candidates(key).is_some()
 }
 
 fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> EnhancedKeyMatch {
@@ -756,35 +766,90 @@ fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> EnhancedKeyMat
         {
             return EnhancedKeyMatch::Invalid;
         }
-        let Some(first_field) = body.split(|b| matches!(b, b';' | b':')).next() else {
+        let mut fields = body.split(|b| matches!(b, b';' | b':'));
+        let Some(first_field) = fields.next() else {
             return EnhancedKeyMatch::Invalid;
         };
         if first_field.is_empty() {
             return EnhancedKeyMatch::Invalid;
         }
-        let Ok(codepoint) = std::str::from_utf8(first_field)
-            .ok()
-            .and_then(|field| field.parse::<u32>().ok())
-            .ok_or(())
-        else {
+        let Some(codepoint) = parse_ascii_u32(first_field) else {
             return EnhancedKeyMatch::Invalid;
         };
-        return if codepoint == expected_key as u32 {
+        let modifiers = fields.find_map(parse_ascii_u32).unwrap_or(1);
+        return if enhanced_key_matches(expected_key, codepoint, modifiers) {
             EnhancedKeyMatch::Matched
         } else {
             EnhancedKeyMatch::Invalid
         };
     }
 
+    if last == b'~' {
+        let fields: Vec<&[u8]> = body.split(|b| *b == b';').collect();
+        if fields.len() == 3
+            && fields[0] == b"27"
+            && fields[1].iter().all(|b| b.is_ascii_digit())
+            && fields[2].iter().all(|b| b.is_ascii_digit())
+        {
+            let Some(modifiers) = parse_ascii_u32(fields[1]) else {
+                return EnhancedKeyMatch::Invalid;
+            };
+            let Some(codepoint) = parse_ascii_u32(fields[2]) else {
+                return EnhancedKeyMatch::Invalid;
+            };
+            return if enhanced_key_matches(expected_key, codepoint, modifiers) {
+                EnhancedKeyMatch::Matched
+            } else {
+                EnhancedKeyMatch::Invalid
+            };
+        }
+    }
+
     if (last.is_ascii_digit() || matches!(last, b';' | b':'))
         && body
             .iter()
-            .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':'))
+            .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':' | b'~'))
     {
         return EnhancedKeyMatch::Pending;
     }
 
     EnhancedKeyMatch::Invalid
+}
+
+fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
+    std::str::from_utf8(bytes).ok()?.parse::<u32>().ok()
+}
+
+fn enhanced_key_matches(expected_key: u8, codepoint: u32, modifiers: u32) -> bool {
+    if modifiers == 1 {
+        return codepoint == u32::from(expected_key)
+            && expected_key.is_ascii_graphic().then_some(()).is_some()
+            || (expected_key == b' ' && codepoint == u32::from(expected_key));
+    }
+
+    if modifiers == 5 {
+        return control_key_candidates(expected_key).is_some_and(|candidates| {
+            candidates
+                .into_iter()
+                .any(|candidate| codepoint == candidate)
+        });
+    }
+
+    false
+}
+
+fn control_key_candidates(expected_key: u8) -> Option<[u32; 2]> {
+    match expected_key {
+        0x01..=0x1a => Some([
+            u32::from(expected_key + 0x40),
+            u32::from(expected_key + 0x60),
+        ]),
+        0x1b..=0x1f => Some([
+            u32::from(expected_key + 0x40),
+            u32::from(expected_key + 0x40),
+        ]),
+        _ => None,
+    }
 }
 
 fn select_attach_replay_bytes(
@@ -1681,5 +1746,29 @@ mod tests {
         let forwarded = proxy.filter_client_input(b"\x1d\x1b[120;1u");
         assert_eq!(forwarded, b"\x1d\x1b[120;1u");
         assert!(!proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_detaches_when_control_prefix_arrives_as_enhanced_csi_u() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5ud");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_detaches_when_both_keys_arrive_as_enhanced_csi_u() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5u\x1b[100;1u");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_detaches_when_control_prefix_arrives_as_xterm_modify_other_keys() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[27;5;93~d");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_detach_request());
     }
 }
