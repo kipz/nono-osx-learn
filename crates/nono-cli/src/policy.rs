@@ -1765,6 +1765,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_validate_deny_overlaps_group_overlap_is_fatal() {
         use nono::FsCapability;
 
@@ -1779,6 +1780,7 @@ mod tests {
         // Group-sourced overlaps must be fatal on Linux — Landlock cannot
         // enforce deny-within-allow, so silently ignoring the conflict
         // gives the user a false sense of security.
+        // On macOS this is a no-op (Seatbelt handles deny-within-allow natively).
         let result = validate_deny_overlaps(&deny_paths, &caps);
         assert!(
             result.is_err(),
