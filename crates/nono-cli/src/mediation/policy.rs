@@ -63,6 +63,7 @@ static DANGEROUS_ENV_VAR_NAMES: &[&str] = &[
     "DYLD_INSERT_LIBRARIES",
     "DYLD_LIBRARY_PATH",
     "DYLD_FORCE_FLAT_NAMESPACE",
+    "NONO_SANDBOX_CONTEXT",
 ];
 
 /// Apply policy to a shim request and produce a response.
@@ -93,6 +94,40 @@ pub async fn apply(
             "unknown",
         );
     };
+
+    // If the request comes from within a per-command sandbox (via allow_commands),
+    // skip intercepts — credentials flow between trusted sub-processes, not to the agent.
+    // The sandbox context nonce is unforgeable (only the server can issue valid nonces).
+    if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT") {
+        if let Some(parent_name) = broker.resolve(ctx_nonce) {
+            if let Some(parent_cmd) = commands.iter().find(|c| c.name == &**parent_name) {
+                if let Some(ref sb) = parent_cmd.sandbox {
+                    if sb.allow_commands.contains(&request.command) {
+                        debug!(
+                            "mediation: skipping intercepts for '{}' (called from '{}' via allow_commands)",
+                            request.command, &**parent_name
+                        );
+                        // No per-command sandbox — same as the capture path.
+                        // The real binary needs full access to system resources
+                        // (e.g. Keychain, vault) to fetch credentials. Security
+                        // comes from the parent's sandbox, not the child's.
+                        let result = exec_passthrough(
+                            cmd,
+                            &request.args,
+                            &request.stdin,
+                            &request.env,
+                            &broker,
+                            None,
+                            ctx,
+                            commands,
+                        )
+                        .await;
+                        return (result, "passthrough");
+                    }
+                }
+            }
+        }
+    }
 
     // Check intercept rules in order
     for rule in &cmd.intercepts {
@@ -438,6 +473,14 @@ async fn exec_passthrough(
         let mut seen_dirs: HashSet<String> = HashSet::new();
         for allowed_name in allow_cmds {
             if let Some(allowed_cmd) = all_commands.iter().find(|c| c.name == *allowed_name) {
+                // Only add real binary dirs for commands without their own mediation.
+                // Commands with intercepts or sandbox keep their shim and route through
+                // the mediation server, so they don't need the real binary on PATH.
+                let has_mediation =
+                    !allowed_cmd.intercepts.is_empty() || allowed_cmd.sandbox.is_some();
+                if has_mediation {
+                    continue;
+                }
                 if let Some(parent) = allowed_cmd.real_path.parent() {
                     let dir_str = parent.to_string_lossy().to_string();
                     if seen_dirs.insert(dir_str.clone()) {
@@ -470,6 +513,17 @@ async fn exec_passthrough(
         ctx.session_token.to_string(),
     );
 
+    // Inject a sandbox context nonce so the mediation server can identify
+    // shim requests originating from within this per-command sandbox.
+    // This allows the server to skip intercepts for allow_commands calls
+    // (credentials flow between trusted sub-processes, not to the agent).
+    // The nonce is unforgeable — only the server can issue valid nonces.
+    let sandbox_context_nonce = broker.issue(Zeroizing::new(cmd.name.clone()));
+    env.insert(
+        "NONO_SANDBOX_CONTEXT".to_string(),
+        sandbox_context_nonce,
+    );
+
     // Promote nonce values in args
     let args: Vec<String> = args
         .iter()
@@ -486,6 +540,7 @@ async fn exec_passthrough(
         .collect();
 
     let real_path = cmd.real_path.clone();
+    let cmd_name = cmd.name.clone();
     let stdin_data = stdin_data.to_string();
     // Owned shim paths for use in spawn_blocking (which requires 'static captures).
     let shim_dir_buf = effective_shim_dir.clone();
@@ -602,21 +657,19 @@ async fn exec_passthrough(
             // Add command-specific configured paths (~ is expanded to $HOME).
             for path in &sb.fs_read {
                 let expanded = expand_home(path);
-                let p = std::path::Path::new(&expanded);
-                if p.is_file() {
-                    caps = caps.allow_file(&expanded, nono::AccessMode::Read)?;
-                } else if p.is_dir() {
-                    caps = caps.allow_path(&expanded, nono::AccessMode::Read)?;
-                }
+                caps = add_sandbox_dir(caps, &expanded, nono::AccessMode::Read, &cmd_name)?;
+            }
+            for path in &sb.fs_read_file {
+                let expanded = expand_home(path);
+                caps = add_sandbox_file(caps, &expanded, nono::AccessMode::Read, &cmd_name)?;
             }
             for path in &sb.fs_write {
                 let expanded = expand_home(path);
-                let p = std::path::Path::new(&expanded);
-                if p.is_file() {
-                    caps = caps.allow_file(&expanded, nono::AccessMode::Write)?;
-                } else if p.is_dir() {
-                    caps = caps.allow_path(&expanded, nono::AccessMode::Write)?;
-                }
+                caps = add_sandbox_dir(caps, &expanded, nono::AccessMode::Write, &cmd_name)?;
+            }
+            for path in &sb.fs_write_file {
+                let expanded = expand_home(path);
+                caps = add_sandbox_file(caps, &expanded, nono::AccessMode::Write, &cmd_name)?;
             }
             if sb.network.block {
                 caps = caps.block_network();
@@ -732,11 +785,25 @@ fn build_filtered_shim_dir(
         let name_str = name.to_string_lossy();
 
         if allow_set.contains(name_str.as_ref()) {
-            debug!(
-                "mediation: allowing direct exec for '{}' (excluded from filtered shim dir)",
-                name_str
-            );
-            continue;
+            // If the allowed command has its own mediation rules (intercepts or sandbox),
+            // keep the shim so it routes through the mediation server. Only exclude
+            // commands that have no mediation and should resolve to real binaries directly.
+            let has_mediation = all_commands
+                .iter()
+                .find(|c| c.name == name_str)
+                .map_or(false, |c| !c.intercepts.is_empty() || c.sandbox.is_some());
+            if has_mediation {
+                debug!(
+                    "mediation: keeping shim for '{}' in filtered dir (has own mediation rules)",
+                    name_str
+                );
+            } else {
+                debug!(
+                    "mediation: allowing direct exec for '{}' (excluded from filtered shim dir)",
+                    name_str
+                );
+                continue;
+            }
         }
 
         // Symlink the original shim (which itself points to nono-shim)
@@ -793,6 +860,56 @@ fn expand_home(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// Add a directory capability to the sandbox.
+/// Warns and skips on non-existent paths.
+fn add_sandbox_dir(
+    caps: nono::CapabilitySet,
+    path: &str,
+    access: nono::AccessMode,
+    command_name: &str,
+) -> Result<nono::CapabilitySet> {
+    match nono::FsCapability::new_dir(path, access) {
+        Ok(cap) => {
+            let mut caps = caps;
+            caps.add_fs(cap);
+            Ok(caps)
+        }
+        Err(NonoError::PathNotFound(_)) => {
+            warn!(
+                "mediation: command '{}' sandbox dir '{}' does not exist, skipping",
+                command_name, path
+            );
+            Ok(caps)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Add a file capability to the sandbox.
+/// Warns and skips on non-existent paths.
+fn add_sandbox_file(
+    caps: nono::CapabilitySet,
+    path: &str,
+    access: nono::AccessMode,
+    command_name: &str,
+) -> Result<nono::CapabilitySet> {
+    match nono::FsCapability::new_file(path, access) {
+        Ok(cap) => {
+            let mut caps = caps;
+            caps.add_fs(cap);
+            Ok(caps)
+        }
+        Err(NonoError::PathNotFound(_)) => {
+            warn!(
+                "mediation: command '{}' sandbox file '{}' does not exist, skipping",
+                command_name, path
+            );
+            Ok(caps)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Build the environment map for an exec'd child.
@@ -1444,7 +1561,9 @@ mod tests {
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig::default(),
                 fs_read: vec![],
+                fs_read_file: vec![],
                 fs_write: vec![],
+                fs_write_file: vec![],
                 allow_commands: vec!["ddtool".to_string()],
             }),
         };
@@ -1532,7 +1651,9 @@ mod tests {
                     allowed_hosts: vec!["github.com".to_string()],
                 },
                 fs_read: vec![],
+                fs_read_file: vec![],
                 fs_write: vec![],
+                fs_write_file: vec![],
                 allow_commands: vec![],
             }),
         };
@@ -1592,7 +1713,9 @@ mod tests {
                     allowed_hosts: vec!["github.com".to_string()],
                 },
                 fs_read: vec![],
+                fs_read_file: vec![],
                 fs_write: vec![],
+                fs_write_file: vec![],
                 allow_commands: vec![],
             }),
         };
