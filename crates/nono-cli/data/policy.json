@@ -431,7 +431,8 @@
       "platform": "macos",
       "allow": {
         "read": [
-          "$HOME/Library/Keychains/login.keychain-db"
+          "$HOME/Library/Keychains/login.keychain-db",
+          "$HOME/.local/share/claude"
         ]
       }
     },
