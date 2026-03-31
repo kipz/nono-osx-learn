@@ -17,6 +17,7 @@
 
 use crate::error::{NonoError, Result};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -527,13 +528,34 @@ fn load_from_file(uri: &str) -> Result<Zeroizing<String>> {
         .strip_prefix(FILE_URI_PREFIX)
         .ok_or_else(|| NonoError::ConfigParse(format!("invalid file:// URI: {}", uri)))?;
 
-    let content = std::fs::read_to_string(path_str).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
+    let trimmed = load_secret_file(Path::new(path_str)).map_err(|e| match e {
+        NonoError::SecretNotFound(_) => {
             NonoError::SecretNotFound(format!("credential file not found: {}", path_str))
+        }
+        NonoError::KeystoreAccess(_) => {
+            NonoError::KeystoreAccess(format!("failed to read credential file '{}'", path_str))
+        }
+        other => other,
+    })?;
+
+    tracing::debug!("Loaded secret from {}", redact_file_uri(uri));
+    Ok(trimmed)
+}
+
+/// Load a secret from a local file and wrap it in [`Zeroizing`].
+///
+/// Intended for callers that need a common file-backed secret path without
+/// duplicating plaintext handling. The returned string is trimmed; empty or
+/// whitespace-only files are rejected.
+pub fn load_secret_file(path: &Path) -> Result<Zeroizing<String>> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NonoError::SecretNotFound(format!("secret file not found: {}", path.display()))
         } else {
             NonoError::KeystoreAccess(format!(
-                "failed to read credential file '{}': {}",
-                path_str, e
+                "failed to read secret file '{}': {}",
+                path.display(),
+                e
             ))
         }
     })?;
@@ -541,13 +563,45 @@ fn load_from_file(uri: &str) -> Result<Zeroizing<String>> {
     let trimmed = content.trim().to_string();
     if trimmed.is_empty() {
         return Err(NonoError::SecretNotFound(format!(
-            "credential file '{}' is empty or contains only whitespace",
-            path_str
+            "secret file '{}' is empty or contains only whitespace",
+            path.display()
         )));
     }
 
-    tracing::debug!("Loaded secret from {}", redact_file_uri(uri));
     Ok(Zeroizing::new(trimmed))
+}
+
+/// Store a secret in a local file with owner-only permissions on Unix.
+///
+/// This is primarily used by trust-related file-backed keystore adapters and
+/// keeps the file handling consistent with runtime secret loading helpers.
+pub fn store_secret_file(path: &Path, secret: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "failed to create secret directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    std::fs::write(path, secret).map_err(|e| {
+        NonoError::KeystoreAccess(format!("failed to store secret at {}: {e}", path.display()))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "failed to secure secret file {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Load a single secret from the keystore.
