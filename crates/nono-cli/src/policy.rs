@@ -887,9 +887,7 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
                     "Landlock cannot enforce {}. This deny has no effect on Linux.",
                     conflict
                 );
-                if cap.source.is_user_intent() {
-                    fatal_conflicts.push(conflict);
-                }
+                fatal_conflicts.push(conflict);
             }
         }
     }
@@ -1767,7 +1765,8 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_deny_overlaps_group_overlap_warn_only() {
+    #[cfg(target_os = "linux")]
+    fn test_validate_deny_overlaps_group_overlap_is_fatal() {
         use nono::FsCapability;
 
         let mut caps = CapabilitySet::new();
@@ -1778,10 +1777,15 @@ mod tests {
 
         let deny_paths = vec![PathBuf::from("/tmp/secret")];
 
-        // Group/system overlaps are warning-only. Fatal errors are reserved for
-        // explicit user intent (CLI/profile), where deny-within-allow is likely accidental.
-        validate_deny_overlaps(&deny_paths, &caps)
-            .expect("group overlap should not hard-fail validation");
+        // Group-sourced overlaps must be fatal on Linux — Landlock cannot
+        // enforce deny-within-allow, so silently ignoring the conflict
+        // gives the user a false sense of security.
+        // On macOS this is a no-op (Seatbelt handles deny-within-allow natively).
+        let result = validate_deny_overlaps(&deny_paths, &caps);
+        assert!(
+            result.is_err(),
+            "group-sourced deny overlap must be a hard error on Linux"
+        );
     }
 
     #[test]
@@ -1793,9 +1797,9 @@ mod tests {
         // means the allow wins. Both cases silently disable the deny.
         //
         // We check every group because profiles can
-        // combine arbitrary groups, and validate_deny_overlaps is warn-only
-        // for group-sourced capabilities at runtime. This test is the real
-        // safety net for the embedded policy.
+        // combine arbitrary groups, and validate_deny_overlaps rejects
+        // overlaps at runtime. This test catches regressions in the
+        // embedded policy at compile time.
         //
         // We filter to Linux-applicable groups (platform: None or "linux")
         // and check directly from parsed policy so this catches regressions
