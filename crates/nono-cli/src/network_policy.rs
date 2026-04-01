@@ -237,7 +237,9 @@ pub fn resolve_credentials(
                 tls_ca: cred
                     .tls_ca
                     .as_deref()
-                    .map(|p| crate::policy::expand_path(p).map(|pb| pb.to_string_lossy().into_owned()))
+                    .map(|p| {
+                        crate::policy::expand_path(p).map(|pb| pb.to_string_lossy().into_owned())
+                    })
                     .transpose()?,
             });
         } else if let Some(cred) = policy.credentials.get(name) {
@@ -273,7 +275,6 @@ pub fn resolve_credentials(
 
     Ok(routes)
 }
-
 
 /// Build a complete `ProxyConfig` from a resolved network policy.
 ///
