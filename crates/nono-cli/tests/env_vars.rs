@@ -40,7 +40,7 @@ fn env_nono_allow_comma_separated() {
     let a_str = path_a.display().to_string();
     let b_str = path_b.display().to_string();
     assert!(
-        text.contains(a_str) && text.contains(b_str),
+        text.contains(a_str.as_str()) && text.contains(b_str.as_str()),
         "expected both paths in dry-run output, got:\n{text}"
     );
 }
