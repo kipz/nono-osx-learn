@@ -405,6 +405,12 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     profile.push_str("(allow system-fsctl)\n");
     profile.push_str("(allow system-info)\n");
 
+    // IOKit: allow user-client access. Required by JVM-based tools (e.g. Bazel)
+    // that call IORegisterForSystemPower() for power management notifications.
+    // Without this, the IOKit call silently returns MACH_PORT_NULL, causing
+    // hard crashes in programs that CHECK the result.
+    profile.push_str("(allow iokit-open)\n");
+
     // Allow reading the root directory entry itself (required for exec path resolution)
     profile.push_str("(allow file-read* (literal \"/\"))\n");
 
