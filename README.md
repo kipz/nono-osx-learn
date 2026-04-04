@@ -93,7 +93,7 @@ caps.allow_write("/tmp/workspace")?;
 Sandbox::apply(&caps)?;  // Irreversible -- kernel-enforced from here on
 ```
 
-Also available as [Python](https://github.com/always-further/nono-py) , [TypeScript](https://github.com/always-further/nono-ts)  [Go](https://github.com/always-further/nono-go)  bindings.
+Also available as [Python](https://github.com/always-further/nono-py) , [TypeScript](https://github.com/always-further/nono-ts), [Go](https://github.com/always-further/nono-go)  bindings.
 
 ## Key Features
 
