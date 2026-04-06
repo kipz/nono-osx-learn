@@ -1843,29 +1843,20 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let original_home = std::env::var("HOME").ok();
-        let original_tmpdir = std::env::var("TMPDIR").ok();
 
         let temp_root = tempfile::tempdir().expect("tmpdir");
         let home = temp_root.path().join("home");
         std::fs::create_dir_all(&home).expect("create home");
 
-        std::env::set_var("HOME", &home);
-        std::env::set_var("TMPDIR", temp_root.path());
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home.to_str().expect("home path")),
+            ("TMPDIR", temp_root.path().to_str().expect("tmpdir path")),
+        ]);
 
         let skip_tmp = should_skip_group_allow_path("system_write_linux", Path::new("/tmp"))
             .expect("check /tmp skip");
         let skip_tmpdir = should_skip_group_allow_path("system_write_linux", temp_root.path())
             .expect("check TMPDIR skip");
-
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_tmpdir {
-            Some(value) => std::env::set_var("TMPDIR", value),
-            None => std::env::remove_var("TMPDIR"),
-        }
 
         assert!(
             skip_tmp,
