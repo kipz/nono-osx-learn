@@ -222,12 +222,24 @@ impl CapabilitySetExt for CapabilitySet {
             }
         }
 
-        // Directories with read-only access
+        // Read-only filesystem entries (directory or file)
         for path_template in &fs.read {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_dir(&path, "Profile", &protected_roots)?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_dir(&path, AccessMode::Read, &label)? {
+
+            let reads_file = std::fs::metadata(&path)
+                .map(|metadata| !metadata.is_dir())
+                .unwrap_or(false);
+
+            let maybe_cap = if reads_file {
+                validate_requested_file(&path, "Profile", &protected_roots)?;
+                try_new_file(&path, AccessMode::Read, &label)?
+            } else {
+                validate_requested_dir(&path, "Profile", &protected_roots)?;
+                try_new_dir(&path, AccessMode::Read, &label)?
+            };
+
+            if let Some(mut cap) = maybe_cap {
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
             }
@@ -714,6 +726,40 @@ mod tests {
         assert!(
             caps.allowed_commands().contains(&"shred".to_string()),
             "profile allowed_commands should include 'shred'"
+        );
+    }
+
+    #[test]
+    fn test_from_profile_filesystem_read_accepts_file_paths() {
+        let dir = tempdir().expect("tmpdir");
+        let read_file = dir.path().join("config.txt");
+        std::fs::write(&read_file, "token=123").expect("write file");
+
+        let profile_path = dir.path().join("read-file-profile.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                "meta": {{ "name": "read-file-profile" }},
+                "filesystem": {{ "read": ["{}"] }}
+            }}"#,
+                read_file.display()
+            ),
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        let resolved_file = read_file.canonicalize().expect("canonicalize file");
+
+        assert!(
+            caps.fs_capabilities().iter().any(|cap| {
+                cap.is_file && cap.access == AccessMode::Read && cap.resolved == resolved_file
+            }),
+            "filesystem.read file entries should be granted as read-only file capabilities"
         );
     }
 
