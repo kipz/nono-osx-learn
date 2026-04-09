@@ -360,8 +360,22 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Mach IPC, bypassing file-level deny rules in profiles that do NOT opt in.
     profile.push_str("(allow mach-lookup)\n");
     if !has_explicit_keychain_db_access(caps) {
+        // Legacy keychain daemon names (macOS < 13)
         profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
         profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))\n");
+        // Modern keychain daemon (macOS 13 Ventura+). Legacy SecKeychain APIs
+        // route here on Ventura and later, bypassing the legacy service denies above.
+        // Without this deny, FFI/ctypes callers can read keychain entries despite
+        // the file-level deny on ~/Library/Keychains.
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))\n");
+        // Modern security daemon (macOS 10.10+). SecItem APIs ("Data Protection"
+        // keychain) route through secd. Blocking this prevents access to iCloud
+        // Keychain and modern keychain items that bypass the legacy daemon paths.
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.secd\"))\n");
+        // Security agent: shows keychain authorization dialogs. Without this deny, the
+        // agent can act as a proxy — presenting a user prompt and returning the credential
+        // on behalf of the sandboxed process even when the direct daemon paths are blocked.
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.security.agent\"))\n");
     }
     profile.push_str("(allow mach-per-user-lookup)\n");
     profile.push_str("(allow mach-task-name)\n");
@@ -944,6 +958,13 @@ mod tests {
 
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        // Modern keychain daemon (macOS 13 Ventura+)
+        assert!(
+            profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        // Modern security daemon (macOS 10.10+)
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]
@@ -963,6 +984,11 @@ mod tests {
 
         assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
         assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        assert!(
+            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]
@@ -983,6 +1009,11 @@ mod tests {
 
         assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
         assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        assert!(
+            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]
