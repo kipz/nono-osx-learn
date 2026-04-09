@@ -423,6 +423,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) override_deny_paths: Vec<PathBuf>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    #[allow(dead_code)]
+    pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -997,6 +999,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 open_url_allow_localhost: false,
                 override_deny_paths: Vec::new(),
                 allowed_env_vars: None,
+                mediation: crate::mediation::MediationConfig::default(),
             },
             args,
             silent,
@@ -1219,6 +1222,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         return Err(NonoError::NoCapabilities);
     }
 
+    let profile_mediation = loaded_profile
+        .as_ref()
+        .map(|p| p.mediation.clone())
+        .unwrap_or_default();
     let profile_secrets = loaded_profile
         .map(|profile| profile.env_credentials.mappings)
         .unwrap_or_default();
@@ -1246,6 +1253,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             open_url_allow_localhost,
             override_deny_paths,
             allowed_env_vars: profile_allowed_env_vars,
+            mediation: profile_mediation,
         },
         args,
         silent,

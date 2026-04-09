@@ -1175,6 +1175,9 @@ pub struct Profile {
     /// Supports variable expansion (e.g. `$NONO_PACKAGES`).
     #[serde(default)]
     pub command_args: Vec<String>,
+    /// Command mediation policy: intercept commands, inject credentials.
+    #[serde(default)]
+    pub mediation: crate::mediation::MediationConfig,
 }
 
 #[derive(Deserialize)]
@@ -1220,6 +1223,8 @@ struct ProfileDeserialize {
     packs: Vec<String>,
     #[serde(default)]
     command_args: Vec<String>,
+    #[serde(default)]
+    mediation: crate::mediation::MediationConfig,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -1244,6 +1249,7 @@ impl From<ProfileDeserialize> for Profile {
             skipdirs: raw.skipdirs,
             packs: raw.packs,
             command_args: raw.command_args,
+            mediation: raw.mediation,
         }
     }
 }
@@ -1792,6 +1798,13 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
         packs: dedup_append(&base.packs, &child.packs),
         command_args: dedup_append(&base.command_args, &child.command_args),
+        // Child's mediation config takes precedence; base is ignored.
+        // (Merging two mediation configs would be complex and is not needed.)
+        mediation: if child.mediation.is_active() {
+            child.mediation
+        } else {
+            base.mediation
+        },
     }
 }
 
@@ -3156,6 +3169,7 @@ mod tests {
             skipdirs: vec!["vendor".to_string()],
             packs: vec![],
             command_args: vec![],
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 
@@ -3229,6 +3243,7 @@ mod tests {
             skipdirs: vec!["dist".to_string()],
             packs: vec![],
             command_args: vec![],
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 

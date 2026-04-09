@@ -130,6 +130,8 @@ pub struct ProfileDef {
     pub packs: Vec<String>,
     #[serde(default)]
     pub command_args: Vec<String>,
+    #[serde(default)]
+    pub mediation: crate::mediation::MediationConfig,
 }
 
 impl ProfileDef {
@@ -166,6 +168,7 @@ impl ProfileDef {
             skipdirs: Vec::new(),
             packs: self.packs.clone(),
             command_args: self.command_args.clone(),
+            mediation: self.mediation.clone(),
         }
     }
 }

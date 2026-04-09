@@ -98,6 +98,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) trust: TrustLaunchOptions,
     pub(crate) proxy: ProxyLaunchOptions,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
 impl ExecutionFlags {
@@ -121,6 +122,7 @@ impl ExecutionFlags {
             },
             proxy: ProxyLaunchOptions::default(),
             allowed_env_vars: None,
+            mediation: crate::mediation::MediationConfig::default(),
         })
     }
 }
@@ -233,6 +235,7 @@ pub(crate) fn prepare_run_launch_plan(
             trust,
             proxy,
             allowed_env_vars: prepared.allowed_env_vars,
+            mediation: prepared.mediation,
         },
     })
 }
