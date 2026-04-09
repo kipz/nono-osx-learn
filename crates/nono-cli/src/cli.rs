@@ -1656,11 +1656,15 @@ pub struct TrustSignArgs {
     pub all: bool,
 
     /// Key ID to use from the system keystore (default: "default")
-    #[arg(long, value_name = "KEY_ID", conflicts_with = "keyless")]
+    #[arg(long, value_name = "KEY_ID", conflicts_with_all = ["keyless", "keyref"])]
     pub key: Option<String>,
 
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with_all = ["key", "keyless"])]
+    pub keyref: Option<String>,
+
     /// Use Sigstore keyless signing (Fulcio + Rekor via ambient OIDC)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "keyref")]
     pub keyless: bool,
 
     /// Produce a single .nono-trust.bundle containing all subjects instead of per-file bundles
@@ -1684,8 +1688,12 @@ pub struct TrustSignPolicyArgs {
     pub file: Option<PathBuf>,
 
     /// Key ID to use from the system keystore (default: "default")
-    #[arg(long, value_name = "KEY_ID")]
+    #[arg(long, value_name = "KEY_ID", conflicts_with = "keyref")]
     pub key: Option<String>,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "key")]
+    pub keyref: Option<String>,
 
     /// Sign the user-level trust policy at ~/.config/nono/trust-policy.json
     #[arg(long)]
@@ -1724,8 +1732,12 @@ pub struct TrustInitArgs {
     pub include: Vec<String>,
 
     /// Key ID to include as a publisher (default: "default")
-    #[arg(long, value_name = "KEY_ID")]
+    #[arg(long, value_name = "KEY_ID", conflicts_with = "keyref")]
     pub key: Option<String>,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "key")]
+    pub keyref: Option<String>,
 
     /// Create a user-level policy at ~/.config/nono/ instead of the current directory
     #[arg(long)]
@@ -1760,8 +1772,17 @@ pub struct TrustListArgs {
 #[command(disable_help_flag = true)]
 pub struct TrustKeygenArgs {
     /// Key identifier (stored in system keystore under this name)
-    #[arg(long, value_name = "NAME", default_value = "default")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "default",
+        conflicts_with = "keyref"
+    )]
     pub id: String,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "id")]
+    pub keyref: Option<String>,
 
     /// Overwrite existing key with the same ID
     #[arg(long)]
@@ -1776,8 +1797,17 @@ pub struct TrustKeygenArgs {
 #[command(disable_help_flag = true)]
 pub struct TrustExportKeyArgs {
     /// Key identifier to export (default: "default")
-    #[arg(long, value_name = "NAME", default_value = "default")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "default",
+        conflicts_with = "keyref"
+    )]
     pub id: String,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "id")]
+    pub keyref: Option<String>,
 
     /// Output as PEM instead of base64 DER
     #[arg(long)]

@@ -915,7 +915,7 @@ pub fn redact_apple_password_uri(uri: &str) -> String {
 /// Redact a file:// URI for safe logging.
 /// Keeps the directory structure but replaces the filename.
 /// `file:///run/secrets/api-token` → `file:///run/secrets/[REDACTED]`
-fn redact_file_uri(uri: &str) -> String {
+pub fn redact_file_uri(uri: &str) -> String {
     if let Some(path) = uri.strip_prefix(FILE_URI_PREFIX) {
         if let Some(last_slash) = path.rfind('/') {
             return format!("{}{}[REDACTED]", FILE_URI_PREFIX, &path[..=last_slash]);
