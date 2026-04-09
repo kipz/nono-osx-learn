@@ -950,6 +950,7 @@ nono trust init                            # Scan root directory only
 nono trust init -r                         # Scan recursively
 nono trust init -r --exclude-dirs tmp logs # Exclude extra directories
 nono trust init --key my-key --force       # Specific key, overwrite existing
+nono trust init --keyref file:///path/to/key.pem  # File-backed key
 ```
 
 | Option | Description |
@@ -957,6 +958,7 @@ nono trust init --key my-key --force       # Specific key, overwrite existing
 | `-r`, `--recursive` | Scan subdirectories recursively |
 | `--exclude-dirs <DIR...>` | Additional directories to exclude (on top of `.gitignore` and built-in list) |
 | `--key <KEY_ID>` | Key ID to include as publisher (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--key` |
 | `--force` | Overwrite existing `trust-policy.json` |
 
 <Note>
@@ -971,12 +973,14 @@ Sign files, producing bundles for verification.
 nono trust sign <FILES...>                 # Sign specific files
 nono trust sign --all                      # Sign all instruction files in CWD
 nono trust sign SKILLS.md --key my-key     # Use a specific key
+nono trust sign SKILLS.md --keyref file:///path/to/key.pem  # File-backed key
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--all` | Sign all instruction files matching trust policy patterns |
 | `--key <KEY_ID>` | Key ID from system keystore (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--key` and `--keyless` |
 | `--keyless` | Use Sigstore keyless signing (CI environments only) |
 | `--policy <FILE>` | Trust policy file (default: auto-discover) |
 
@@ -993,12 +997,14 @@ nono trust sign-policy                     # Sign trust-policy.json in CWD
 nono trust sign-policy --user              # Sign user-level trust policy (~/.config/nono/)
 nono trust sign-policy path/to/policy.json # Sign specific file
 nono trust sign-policy --key my-key        # Use a specific key
+nono trust sign-policy --keyref file:///path/to/key.pem  # File-backed key
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--user` | Sign the user-level trust policy at `~/.config/nono/trust-policy.json`. The user-level policy anchors trust — without it, project-level policies are not authoritative |
 | `--key <KEY_ID>` | Key ID from system keystore (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--key` |
 
 ### `nono trust verify`
 
@@ -1021,12 +1027,19 @@ nono trust list --json                     # JSON output
 
 ### `nono trust keygen`
 
-Generate an ECDSA P-256 signing key pair and store it in the system keystore.
+Generate an ECDSA P-256 signing key pair.
 
 ```bash
-nono trust keygen                          # Default key ID ("default")
-nono trust keygen --id my-signing-key      # Named key
+nono trust keygen                          # Default key ID ("default") in system keystore
+nono trust keygen --id my-signing-key      # Named key in system keystore
+nono trust keygen --keyref file:///path/to/key.pem  # File-backed key
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--id <NAME>` | Key identifier in system keystore (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--id` |
+| `--force` | Overwrite existing key |
 
 ### `nono trust export-key`
 
@@ -1035,8 +1048,15 @@ Export the public key for use in trust policy `public_key` fields.
 ```bash
 nono trust export-key                      # Export default key (base64 DER)
 nono trust export-key --id my-key          # Export named key
+nono trust export-key --keyref file:///path/to/key.pem  # Export from file-backed key
 nono trust export-key --pem                # Output as PEM format
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--id <NAME>` | Key identifier in system keystore (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--id` |
+| `--pem` | Output as PEM instead of base64 DER |
 
 ## `nono setup` Options
 
