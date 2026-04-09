@@ -273,9 +273,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             }
         }
 
-        let caps = CapabilitySet::try_from(&manifest)?;
+        let mut caps = CapabilitySet::try_from(&manifest)?;
         let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
         protected_paths::validate_caps_against_protected_roots(&caps, protected_roots.as_paths())?;
+        protected_paths::emit_protected_root_deny_rules(protected_roots.as_paths(), &mut caps)?;
 
         let (rollback_exclude_patterns, rollback_exclude_globs) =
             if let Some(ref rb) = manifest.rollback {
@@ -446,6 +447,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     policy::validate_deny_overlaps(&deny_paths, &caps)?;
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
     protected_paths::validate_caps_against_protected_roots(&caps, protected_roots.as_paths())?;
+    protected_paths::emit_protected_root_deny_rules(protected_roots.as_paths(), &mut caps)?;
 
     if needs_unlink_overrides {
         policy::apply_unlink_overrides(&mut caps);
