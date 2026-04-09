@@ -58,10 +58,10 @@ pub fn resolve_program(program: &str) -> Result<PathBuf> {
 /// Main thread (1) + up to 3 keyring threads for D-Bus/Security.framework.
 const MAX_KEYRING_THREADS: usize = 4;
 /// Maximum threads allowed when crypto library thread pool is active.
-/// Main thread (1) + tokio proxy workers (2) + aws-lc-rs ECDSA pool (4).
-/// When --network-profile is used with trust scanning, both the proxy runtime
-/// and crypto verification threads may be active simultaneously.
-const MAX_CRYPTO_THREADS: usize = 7;
+/// Main thread (1) + tokio proxy workers (2) + tokio mediation workers (2) +
+/// aws-lc-rs ECDSA pool (4). When --network-profile, mediation, and trust
+/// scanning are all active simultaneously the ceiling is 9 threads.
+const MAX_CRYPTO_THREADS: usize = 12;
 /// Hard cap on retained denial records to prevent memory exhaustion.
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
@@ -270,6 +270,9 @@ pub struct ExecConfig<'a> {
     /// sends the notify fd; parent expects to receive it.
     #[cfg(target_os = "linux")]
     pub seccomp_proxy_fallback: bool,
+    /// Additional env var names to block from the child (from mediation.env.block).
+    /// Complements the hardcoded injection-vector list in env_sanitization.rs.
+    pub extra_blocked_env: &'a [String],
 }
 
 #[derive(Clone, Copy)]
@@ -343,8 +346,11 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.env_clear();
     cmd.current_dir(config.current_dir);
 
+    let extra_blocked: Vec<&str> = std::iter::once("NONO_CAP_FILE")
+        .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
+        .collect();
     for (key, value) in std::env::vars() {
-        if !should_skip_env_var(&key, &config.env_vars, &["NONO_CAP_FILE"]) {
+        if !should_skip_env_var(&key, &config.env_vars, &extra_blocked) {
             cmd.env(&key, &value);
         }
     }
@@ -398,6 +404,7 @@ pub fn execute_supervised(
     config: &ExecConfig<'_>,
     supervisor: Option<&SupervisorConfig<'_>>,
     trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
+    skill_interceptor: Option<crate::skill_intercept::SkillInterceptor>,
     on_fork: Option<&mut dyn FnMut(u32)>,
     pty_pair: Option<crate::pty_proxy::PtyPair>,
     pty_session_id: Option<&str>,
@@ -454,13 +461,14 @@ pub fn execute_supervised(
     let mut browser_shim: Option<BrowserShim> = None;
 
     // Copy current environment, filtering dangerous and overridden vars
+    let extra_blocked_supervised: Vec<&str> = ["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"]
+        .iter()
+        .copied()
+        .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
+        .collect();
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            let should_skip = should_skip_env_var(
-                k,
-                &config.env_vars,
-                &["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"],
-            );
+            let should_skip = should_skip_env_var(k, &config.env_vars, &extra_blocked_supervised);
             if !should_skip {
                 if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
                     env_c.push(cstr);
@@ -520,16 +528,10 @@ pub fn execute_supervised(
                     // shim earlier in PATH, we intercept the call.
                     if let Some(fd) = child_sock_fd {
                         if let Some(shim) = create_open_shim(&nono_exe, fd) {
-                            // Prepend shim dir to PATH and also set BROWSER for any tool
-                            // that does respect it.
-                            let current_path = std::env::var("PATH").unwrap_or_default();
-                            let new_path =
-                                format!("PATH={}:{current_path}", shim.dir.path().display());
-                            if let Ok(cstr) = CString::new(new_path) {
-                                // Remove existing PATH from env_c, then add our modified one
-                                env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
-                                env_c.push(cstr);
-                            }
+                            // Prepend shim dir to PATH (preserving any session shim dir
+                            // already added by env_vars) and also set BROWSER for any
+                            // tool that does respect it.
+                            apply_open_shim_path(&mut env_c, shim.dir.path());
                             let browser_cmd = format!("BROWSER={}", shim.launcher.display());
                             if let Ok(cstr) = CString::new(browser_cmd) {
                                 env_c.push(cstr);
@@ -1091,6 +1093,7 @@ pub fn execute_supervised(
                             proxy_notify_fd.as_ref(),
                             &initial_caps,
                             trust_interceptor,
+                            skill_interceptor,
                             pty_proxy.as_mut(),
                         )?
                     }
@@ -1102,6 +1105,7 @@ pub fn execute_supervised(
                             sup_cfg,
                             config.startup_timeout,
                             trust_interceptor,
+                            skill_interceptor,
                             pty_proxy.as_mut(),
                         )?
                     }
@@ -1651,6 +1655,7 @@ fn run_supervisor_loop(
     config: &SupervisorConfig<'_>,
     startup_timeout: Option<StartupTimeoutConfig<'_>>,
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
+    mut skill_interceptor: Option<crate::skill_intercept::SkillInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
     let sock_fd = sock.as_raw_fd();
@@ -1708,6 +1713,7 @@ fn run_supervisor_loop(
                             &mut denials,
                             &mut seen_request_ids,
                             trust_interceptor.as_mut(),
+                            skill_interceptor.as_mut(),
                         ) {
                             warn!("Error handling supervisor message: {}", e);
                         }
@@ -1830,6 +1836,7 @@ fn run_supervisor_loop(
     proxy_seccomp_fd: Option<&OwnedFd>,
     initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
+    mut skill_interceptor: Option<crate::skill_intercept::SkillInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
     let sock_fd = sock.as_raw_fd();
@@ -1914,6 +1921,7 @@ fn run_supervisor_loop(
                                 &mut denials,
                                 &mut seen_request_ids,
                                 trust_interceptor.as_mut(),
+                                skill_interceptor.as_mut(),
                             ) {
                                 warn!("Error handling supervisor message: {}", e);
                             }
@@ -1942,6 +1950,7 @@ fn run_supervisor_loop(
                                 &mut rate_limiter,
                                 &mut denials,
                                 trust_interceptor.as_mut(),
+                                skill_interceptor.as_mut(),
                             ) {
                                 debug!("Error handling seccomp notification: {}", e);
                             }
@@ -2057,6 +2066,7 @@ fn run_supervisor_loop(
 /// 3. If granted, open the path and send the fd via `SCM_RIGHTS`
 /// 4. Send the decision response
 /// 5. Record denials for diagnostic footer
+#[allow(clippy::too_many_arguments)]
 fn handle_supervisor_message(
     sock: &mut SupervisorSocket,
     msg: SupervisorMessage,
@@ -2065,6 +2075,7 @@ fn handle_supervisor_message(
     denials: &mut Vec<DenialRecord>,
     seen_request_ids: &mut HashSet<String>,
     mut trust_interceptor: Option<&mut crate::trust_intercept::TrustInterceptor>,
+    mut skill_interceptor: Option<&mut crate::skill_intercept::SkillInterceptor>,
 ) -> Result<()> {
     match msg {
         SupervisorMessage::Request(request) => {
@@ -2188,6 +2199,42 @@ fn handle_supervisor_message(
                         );
                         ApprovalDecision::Denied {
                             reason: format!("Instruction file failed trust verification: {reason}"),
+                        }
+                    }
+                }
+            } else if let Some(skill_result) = skill_interceptor
+                .as_mut()
+                .and_then(|si| si.check_path(&request.path))
+            {
+                // 2b. Skill verification for plugin directory files
+                match skill_result {
+                    Ok(verified) => {
+                        debug!(
+                            "Supervisor: skill file {} verified ({} v{}, publisher: {})",
+                            request.path.display(),
+                            verified.name,
+                            verified.version,
+                            verified.publisher,
+                        );
+                        // Verified skill file — auto-grant read access
+                        ApprovalDecision::Granted
+                    }
+                    Err(reason) => {
+                        debug!(
+                            "Supervisor: skill file {} denied: {}",
+                            request.path.display(),
+                            reason
+                        );
+                        record_denial(
+                            denials,
+                            DenialRecord {
+                                path: request.path.clone(),
+                                access: request.access,
+                                reason: DenialReason::PolicyBlocked,
+                            },
+                        );
+                        ApprovalDecision::Denied {
+                            reason: format!("Skill verification failed: {reason}"),
                         }
                     }
                 }
@@ -2429,6 +2476,29 @@ fn clear_close_on_exec(fd: i32) -> Result<()> {
 pub(super) fn record_denial(denials: &mut Vec<DenialRecord>, record: DenialRecord) {
     if denials.len() < MAX_DENIAL_RECORDS {
         denials.push(record);
+    }
+}
+
+/// Prepend `open_shim_dir` to the `PATH` entry already present in `env_c`.
+///
+/// Reads the current PATH from `env_c` (which already has the mediation session
+/// shim dir prepended by main.rs via env_vars) rather than from
+/// `std::env::var("PATH")`. Using the process env would discard the session
+/// shim dir, causing `bash -c 'gh ...'` to resolve `gh` directly instead of
+/// going through its mediation shim.
+#[cfg(target_os = "macos")]
+fn apply_open_shim_path(env_c: &mut Vec<std::ffi::CString>, open_shim_dir: &std::path::Path) {
+    let current_path = env_c
+        .iter()
+        .find(|c| c.as_bytes().starts_with(b"PATH="))
+        .and_then(|c| c.to_str().ok())
+        .and_then(|s| s.strip_prefix("PATH="))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let new_path = format!("PATH={}:{current_path}", open_shim_dir.display());
+    if let Ok(cstr) = std::ffi::CString::new(new_path) {
+        env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
+        env_c.push(cstr);
     }
 }
 
@@ -3214,6 +3284,7 @@ mod tests {
                     None, // no proxy seccomp
                     &[],  // no initial caps
                     None, // no trust interceptor
+                    None, // no skill interceptor
                     None, // no PTY relay — this is what we're testing
                 );
 
@@ -3221,6 +3292,7 @@ mod tests {
                 let result = run_supervisor_loop(
                     child, &mut sock, &sup_cfg, None, // no startup timeout
                     None, // no trust interceptor
+                    None, // no skill interceptor
                     None, // no PTY relay
                 );
 
@@ -3631,5 +3703,51 @@ mod tests {
         assert!(dir.exists(), "shim dir should exist before drop");
         drop(shim);
         assert!(!dir.exists(), "shim dir should be removed on drop");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_open_shim_path_preserves_session_shim_dir() {
+        use std::ffi::CString;
+
+        let fake_session_shim = "/tmp/nono-session-9999/shims";
+        let open_shim_dir = tempfile::TempDir::new().expect("create temp dir");
+        let open_shim_dir_str = open_shim_dir
+            .path()
+            .to_str()
+            .expect("temp dir path is valid UTF-8")
+            .to_string();
+
+        // Simulate env_c after env_vars have been applied — session shim dir is
+        // already prepended to PATH (as main.rs does via mediation_path_str).
+        let mut env_c: Vec<CString> =
+            vec![
+                CString::new(format!("PATH={}:/usr/bin:/bin", fake_session_shim))
+                    .expect("valid CString"),
+            ];
+
+        apply_open_shim_path(&mut env_c, open_shim_dir.path());
+
+        let path_entry = env_c
+            .iter()
+            .find(|c| c.as_bytes().starts_with(b"PATH="))
+            .expect("PATH should be present in env_c");
+        let path_str = path_entry.to_str().expect("PATH is valid UTF-8");
+
+        assert!(
+            path_str.contains(fake_session_shim),
+            "session shim dir must be preserved in PATH, got: {}",
+            path_str
+        );
+        assert!(
+            path_str.contains(&open_shim_dir_str),
+            "open shim dir must be in PATH, got: {}",
+            path_str
+        );
+        assert!(
+            path_str.starts_with(&format!("PATH={}", open_shim_dir_str)),
+            "open shim dir must come first in PATH, got: {}",
+            path_str
+        );
     }
 }

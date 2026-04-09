@@ -125,6 +125,8 @@ pub struct ProfileDef {
     pub allow_gpu: Option<bool>,
     #[serde(default)]
     pub interactive: bool,
+    #[serde(default)]
+    pub mediation: crate::mediation::MediationConfig,
 }
 
 impl ProfileDef {
@@ -157,6 +159,7 @@ impl ProfileDef {
             allow_gpu: self.allow_gpu,
             interactive: self.interactive,
             skipdirs: Vec::new(),
+            mediation: self.mediation.clone(),
         }
     }
 }

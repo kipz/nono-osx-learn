@@ -97,6 +97,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) rollback: RollbackLaunchOptions,
     pub(crate) trust: TrustLaunchOptions,
     pub(crate) proxy: ProxyLaunchOptions,
+    pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
 impl ExecutionFlags {
@@ -119,6 +120,7 @@ impl ExecutionFlags {
                 ..TrustLaunchOptions::default()
             },
             proxy: ProxyLaunchOptions::default(),
+            mediation: crate::mediation::MediationConfig::default(),
         })
     }
 }
@@ -230,6 +232,7 @@ pub(crate) fn prepare_run_launch_plan(
             },
             trust,
             proxy,
+            mediation: prepared.mediation,
         },
     })
 }

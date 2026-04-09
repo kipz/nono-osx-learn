@@ -17,6 +17,8 @@ mod instruction_deny;
 mod launch_runtime;
 mod learn;
 mod learn_runtime;
+#[allow(dead_code)]
+mod mediation;
 mod network_policy;
 mod open_url_runtime;
 mod output;
@@ -40,6 +42,8 @@ mod sandbox_state;
 mod session;
 mod session_commands;
 mod setup;
+#[allow(dead_code)]
+mod skill_intercept;
 mod startup_runtime;
 mod supervised_runtime;
 mod terminal_approval;
@@ -208,6 +212,7 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -250,6 +255,7 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

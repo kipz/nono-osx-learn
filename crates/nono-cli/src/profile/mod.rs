@@ -991,6 +991,9 @@ pub struct Profile {
     /// Treated like built-in heavy directories (for example `target`).
     #[serde(default)]
     pub skipdirs: Vec<String>,
+    /// Command mediation policy: intercept commands, inject credentials.
+    #[serde(default)]
+    pub mediation: crate::mediation::MediationConfig,
 }
 
 #[derive(Deserialize)]
@@ -1029,6 +1032,8 @@ struct ProfileDeserialize {
     interactive: bool,
     #[serde(default)]
     skipdirs: Vec<String>,
+    #[serde(default)]
+    mediation: crate::mediation::MediationConfig,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -1049,6 +1054,7 @@ impl From<ProfileDeserialize> for Profile {
             allow_gpu: raw.allow_gpu,
             interactive: raw.interactive,
             skipdirs: raw.skipdirs,
+            mediation: raw.mediation,
         }
     }
 }
@@ -1481,6 +1487,13 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         allow_gpu: child.allow_gpu.or(base.allow_gpu),
         interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
+        // Child's mediation config takes precedence; base is ignored.
+        // (Merging two mediation configs would be complex and is not needed.)
+        mediation: if child.mediation.is_active() {
+            child.mediation
+        } else {
+            base.mediation
+        },
     }
 }
 
@@ -2653,6 +2666,7 @@ mod tests {
             allow_gpu: None,
             interactive: false,
             skipdirs: vec!["vendor".to_string()],
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 
@@ -2722,6 +2736,7 @@ mod tests {
             allow_gpu: None,
             interactive: false,
             skipdirs: vec!["dist".to_string()],
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 
