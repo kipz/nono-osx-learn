@@ -27,6 +27,8 @@ mod launch_runtime;
 mod learn;
 mod learn_runtime;
 mod legacy_cleanup;
+#[allow(dead_code)]
+mod mediation;
 mod migration;
 mod network_policy;
 mod open_url_runtime;
@@ -275,6 +277,7 @@ mod tests {
             ignored_denial_paths: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -320,6 +323,7 @@ mod tests {
             ignored_denial_paths: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

@@ -104,6 +104,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) redaction_policy: nono::ScrubPolicy,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
 impl ExecutionFlags {
@@ -130,6 +131,7 @@ impl ExecutionFlags {
             redaction_policy: nono::ScrubPolicy::secure_default(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            mediation: crate::mediation::MediationConfig::default(),
         })
     }
 }
@@ -261,6 +263,7 @@ pub(crate) fn prepare_run_launch_plan(
             redaction_policy,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
+            mediation: prepared.mediation,
         },
     })
 }

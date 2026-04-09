@@ -1481,6 +1481,9 @@ pub struct Profile {
     /// first-class capability.
     #[serde(default)]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    /// Command mediation policy: intercept commands, inject credentials.
+    #[serde(default)]
+    pub mediation: crate::mediation::MediationConfig,
 }
 
 #[derive(Deserialize)]
@@ -1536,6 +1539,8 @@ struct ProfileDeserialize {
     command_args: Vec<String>,
     #[serde(default)]
     unsafe_macos_seatbelt_rules: Vec<String>,
+    #[serde(default)]
+    mediation: crate::mediation::MediationConfig,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -1567,6 +1572,7 @@ impl From<ProfileDeserialize> for Profile {
             packs: raw.packs,
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
+            mediation: raw.mediation,
         };
 
         // Drain legacy keys into canonical sections (no-op unless the legacy
@@ -2468,6 +2474,13 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             &base.unsafe_macos_seatbelt_rules,
             &child.unsafe_macos_seatbelt_rules,
         ),
+        // Child's mediation config takes precedence; base is ignored.
+        // (Merging two mediation configs would be complex and is not needed.)
+        mediation: if child.mediation.is_active() {
+            child.mediation
+        } else {
+            base.mediation
+        },
     }
 }
 
@@ -4288,6 +4301,7 @@ mod tests {
             packs: vec![],
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 
@@ -4365,6 +4379,7 @@ mod tests {
             packs: vec![],
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 
