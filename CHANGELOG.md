@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.31.0] - 2026-04-10
+
+### Bug Fixes
+
+- Tighten GPU IOKit rules
+
+- Remove allow_gpu from default profiles
+
+- Address review feedback for --allow-gpu
+
+- Add docs for --allow-gpu flag and improve test coverage
+
+- *(macos)* Deny keychain Mach IPC services on modern macOS
+
+- *(macos)* Allow atomic-write temp files for writable capabilities
+
+
+### Features
+
+- Add --allow-gpu flag for GPU access on Apple Silicon Macs
+
+- *(trust)* Add file:// backend for trust signing keys
+
 ## [0.30.1] - 2026-04-09
 
 ### Bug Fixes
