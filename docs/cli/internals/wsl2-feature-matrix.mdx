@@ -95,6 +95,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | `--no-diagnostics` | Full | |
 | Threading context management | Full | |
 | `PR_SET_DUMPABLE(0)` on parent | Full | |
+| `--allow-gpu` | Full | WSL2 uses `/dev/dxg` (DirectX passthrough) instead of `/dev/dri`/`/dev/nvidia*`. CUDA and ollama inference verified. |
 
 ## Rollback & Snapshots
 
@@ -211,7 +212,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | Filesystem (15) | 14 | 0 | 1 |
 | Network (5) | 2 | 0 | 3 |
 | Credential Proxy (10) | 4 | 0 | 6 |
-| Execution (12) | 9 | 0 | 3 |
+| Execution (13) | 10 | 0 | 3 |
 | Rollback (10) | 10 | 0 | 0 |
 | Audit (5) | 5 | 0 | 0 |
 | Command Blocking (3) | 3 | 0 | 0 |
@@ -221,7 +222,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | Learn Mode (5) | 5 | 0 | 0 |
 | Output (6) | 6 | 0 | 0 |
 | Environment (4) | 4 | 0 | 0 |
-| **Total (117)** | **99 (85%)** | **0 (0%)** | **18 (15%)** |
+| **Total (118)** | **100 (85%)** | **0 (0%)** | **18 (15%)** |
 
 ### Root causes of all WSL2-specific limitations
 
@@ -233,7 +234,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | seccomp notify EBUSY | capability_elevation, interactive mode, PTY relay, runtime expansion (4) | microsoft/WSL#9548 — WSL2 userspace issue, persists regardless of kernel version |
 | Proxy port enforcement (pre-V4) | Credential proxy features (6 blocked by default) | Rolling kernel (V4+ enables native enforcement) or `wsl2_proxy_policy: "insecure_proxy"` opt-in |
 
-**With rolling kernel (6.19+, Landlock V6):** All Landlock-dependent limitations are resolved — **112/117 features (96%) fully available.** Only 5 features remain unavailable, all due to seccomp notify EBUSY (`--capability-elevation` and dependent features). See [WSL2 Support](/cli/internals/wsl2#rolling-release-kernel-community) for install instructions.
+**With rolling kernel (6.19+, Landlock V6):** All Landlock-dependent limitations are resolved — **113/118 features (96%) fully available.** Only 5 features remain unavailable, all due to seccomp notify EBUSY (`--capability-elevation` and dependent features). See [WSL2 Support](/cli/internals/wsl2#rolling-release-kernel-community) for install instructions.
 
 ### Distro dependencies (not WSL2-specific)
 

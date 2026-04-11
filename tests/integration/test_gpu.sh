@@ -278,6 +278,44 @@ for dir in /usr/share/vulkan /etc/vulkan /sys/class/drm; do
 done
 
 # =============================================================================
+# WSL2 GPU Tests (/dev/dxg passthrough)
+# =============================================================================
+
+if has_dxg_device; then
+    echo ""
+    echo "--- WSL2 GPU Tests (/dev/dxg) ---"
+
+    # /dev/dxg read/write should be denied without --allow-gpu
+    # (metadata via ls may succeed — Landlock allows stat on denied paths)
+    expect_failure "/dev/dxg read denied without --allow-gpu" \
+        "$NONO_BIN" run --silent --allow-cwd --allow "$TMPDIR" -- \
+        cat /dev/dxg
+
+    # /dev/dxg should be accessible with --allow-gpu
+    expect_success "/dev/dxg accessible with --allow-gpu" \
+        "$NONO_BIN" run --silent --allow-cwd --allow "$TMPDIR" --allow-gpu -- \
+        ls -la /dev/dxg
+
+    # /usr/lib/wsl/lib should be readable with --allow-gpu
+    if [[ -d /usr/lib/wsl/lib ]]; then
+        expect_success "/usr/lib/wsl/lib readable with --allow-gpu" \
+            "$NONO_BIN" run --silent --allow-cwd --allow "$TMPDIR" --allow-gpu -- \
+            ls /usr/lib/wsl/lib
+    else
+        skip_test "/usr/lib/wsl/lib readable" "directory does not exist"
+    fi
+
+    # nvidia-smi should work inside sandbox with --allow-gpu
+    if command_exists nvidia-smi; then
+        expect_success "nvidia-smi works inside sandbox with --allow-gpu" \
+            "$NONO_BIN" run --silent --allow-cwd --allow "$TMPDIR" --allow-gpu -- \
+            nvidia-smi
+    else
+        skip_test "nvidia-smi inside sandbox" "nvidia-smi not installed"
+    fi
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 

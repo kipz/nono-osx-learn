@@ -5,7 +5,7 @@ description: Running nono inside Windows Subsystem for Linux 2 (WSL2) — what w
 
 nono works on WSL2 with most features available. This page documents the compatibility details, known limitations, and workarounds.
 
-For the complete feature-by-feature breakdown (117 features), see the [WSL2 Feature Matrix](/cli/internals/wsl2-feature-matrix).
+For the complete feature-by-feature breakdown (118 features), see the [WSL2 Feature Matrix](/cli/internals/wsl2-feature-matrix).
 
 **At a glance: 85% full on Microsoft kernel, 96% with [rolling kernel](/cli/internals/wsl2#rolling-release-kernel-community).**
 
@@ -28,6 +28,7 @@ WSL2 runs a real Linux kernel with Landlock LSM enabled. Core filesystem sandbox
 | Credential proxy (`--credential`) | Blocked (default) | Fails secure; requires `wsl2_proxy_policy: "insecure_proxy"` in profile |
 | Supervised mode (`nono run`) | Available | Basic fork+sandbox+exec works |
 | Direct mode (`nono wrap`) | Available | No fork, no supervisor |
+| GPU access (`--allow-gpu`) | Available | Via `/dev/dxg` DirectX passthrough (CUDA, ollama verified) |
 | Capability elevation (`--capability-elevation`) | Unavailable | seccomp notify returns `EBUSY` |
 | Snapshots and rollback (`--rollback`) | Available | Pure userspace |
 | Session management (`ps`, `attach`, `detach`, `stop`, `logs`, `inspect`, `prune`) | Available | Pure userspace / PTY relay |

@@ -426,10 +426,13 @@ pub(crate) fn maybe_enable_gpu(
     // These are required when MIG mode is enabled. Enumerate individual devices
     // rather than granting the entire directory.
     if let Ok(cap_entries) = std::fs::read_dir("/dev/nvidia-caps") {
+        let mut caps_found = 0;
         for entry in cap_entries.filter_map(|e| e.ok()) {
             let cap = FsCapability::new_file(entry.path(), AccessMode::ReadWrite)?;
             caps.add_fs(cap);
+            caps_found += 1;
         }
+        gpu_device_count = gpu_device_count.saturating_add(caps_found);
     }
 
     // AMD KFD (Kernel Fusion Driver) for ROCm/HIP compute.

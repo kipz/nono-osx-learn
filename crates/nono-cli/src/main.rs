@@ -96,9 +96,9 @@ mod tests {
         trust_interception_active,
     };
     use crate::proxy_runtime::{resolve_effective_proxy_settings, EffectiveProxySettings};
-    use crate::sandbox_prepare::maybe_enable_macos_gpu;
     #[cfg(target_os = "linux")]
     use crate::sandbox_prepare::maybe_enable_gpu;
+    use crate::sandbox_prepare::maybe_enable_macos_gpu;
     #[cfg(target_os = "macos")]
     use crate::sandbox_prepare::maybe_enable_macos_launch_services;
     use crate::sandbox_prepare::PreparedSandbox;
