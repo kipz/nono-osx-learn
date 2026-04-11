@@ -458,9 +458,11 @@ impl PtyProxy {
                     debug!("PTY proxy: failed to replay scrollback to attached client");
                 }
 
-                if !set_nonblocking(stream.as_raw_fd()) {
-                    debug!("PTY proxy: failed to set attached client socket nonblocking");
-                    let _ = stream.write_all(&[ATTACH_ACK_DENIED]);
+                if let Err(e) = stream.set_nonblocking(true) {
+                    debug!(
+                        "PTY proxy: failed to set attached client socket nonblocking: {}",
+                        e
+                    );
                     return false;
                 }
 
