@@ -48,14 +48,14 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           # Update nono workspace dependency
-          sed -i "s/^nono = \"[0-9.]*\"/nono = \"${VERSION}\"/" Cargo.toml
+          sed -i "s/^nono[[:space:]]*=[[:space:]]*\"[^\"]*\"/nono = \"${VERSION}\"/" Cargo.toml
 
       - name: Update Cargo.lock
         if: steps.check.outputs.skip != 'true'
         run: |
           rustup default stable
-          cargo check --quiet 2>/dev/null || true
-          cargo update -p nono --precise "${{ steps.version.outputs.version }}" 2>/dev/null || true
+          cargo check --quiet
+          cargo update -p nono --precise "${{ steps.version.outputs.version }}"
 
       - name: Create Pull Request
         if: steps.check.outputs.skip != 'true'
