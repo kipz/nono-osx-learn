@@ -1,7 +1,7 @@
 use crate::capability_ext::{self, CapabilitySetExt};
 use crate::cli::SandboxArgs;
 use crate::command_blocking_deprecation;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use crate::config;
 use crate::credential_runtime::load_env_credentials;
 use crate::profile;
@@ -12,7 +12,7 @@ use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -636,7 +636,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         command_blocking_deprecation::print_warnings(&profile_warnings, silent);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if args.profile.as_deref() == Some("claude-code") {
         let home = config::validated_home()?;
         let home_path = std::path::Path::new(&home);
@@ -661,6 +661,46 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 
         precreate(&home_path.join(".claude.json.lock"), false);
         precreate(&home_path.join(".cache/claude-cli-nodejs"), true);
+
+        // Claude Code writes ~/.claude.json atomically via temp files named
+        // ~/.claude.json.tmp.<pid>.<timestamp>.  Landlock/Seatbelt cannot
+        // grant permission for these dynamically-named files in ~/, so token
+        // refreshes silently fail and the user is logged out.
+        //
+        // Fix: redirect ~/.claude.json to ~/.claude/claude.json via a
+        // symlink.  Claude Code resolves symlinks before computing the temp
+        // file path, so temp files land in ~/.claude/ (already readwrite)
+        // instead of ~/ (not writable inside the sandbox).
+        let claude_json = home_path.join(".claude.json");
+        let claude_dir = home_path.join(".claude");
+        let redirect_target = claude_dir.join("claude.json");
+
+        if let Err(e) = std::fs::create_dir_all(&claude_dir) {
+            warn!("Failed to create ~/.claude: {}", e);
+        } else if !claude_json.is_symlink() {
+            if claude_json.exists() {
+                // Regular file present — move it into ~/.claude/ then symlink.
+                if let Err(e) = std::fs::rename(&claude_json, &redirect_target) {
+                    warn!(
+                        "Failed to move ~/.claude.json to ~/.claude/claude.json: {}",
+                        e
+                    );
+                } else if let Err(e) =
+                    std::os::unix::fs::symlink(".claude/claude.json", &claude_json)
+                {
+                    warn!("Failed to create ~/.claude.json symlink: {}", e);
+                }
+            } else {
+                // File doesn't exist yet — pre-create the target so the
+                // sandbox can attach a path rule to it, then symlink.
+                precreate(&redirect_target, false);
+                if let Err(e) = std::os::unix::fs::symlink(".claude/claude.json", &claude_json) {
+                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                        warn!("Failed to create ~/.claude.json symlink: {}", e);
+                    }
+                }
+            }
+        }
     }
 
     let (mut caps, needs_unlink_overrides) = if let Some(ref profile) = loaded_profile {
