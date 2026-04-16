@@ -96,6 +96,39 @@ nono run --profile claude-code -- claude
 Custom profiles with the same name override the built-in. Remove or rename the file to revert to the built-in profile.
 </Note>
 
+## Multiple Claude Profiles (`CLAUDE_CONFIG_DIR`)
+
+If you use multiple Claude Code configurations via the `CLAUDE_CONFIG_DIR` environment variable, you need to grant the sandbox access to the custom config directory and its sibling `.lock` directory. Claude Code creates `$CLAUDE_CONFIG_DIR.lock/` during OAuth token refresh coordination:
+
+```bash
+export CLAUDE_CONFIG_DIR=~/.claude-work
+
+nono run --profile claude-code \
+  --allow ~/.claude-work \
+  --allow ~/.claude-work.lock \
+  -- claude
+```
+
+Alternatively, create a custom profile that includes the paths:
+
+```json
+{
+  "meta": { "name": "claude-work" },
+  "extends": "claude-code",
+  "filesystem": {
+    "allow": ["$HOME/.claude-work", "$HOME/.claude-work.lock"]
+  }
+}
+```
+
+<Note>
+Do not set `CLAUDE_CONFIG_DIR` to its default value (`~/.claude`) explicitly — Claude Code treats "explicitly set" differently from "unset", which changes keychain service names and config file lookup paths. Only set it when you genuinely need a non-default location.
+</Note>
+
+<Note>
+For the default `~/.claude` config directory, no extra flags or directories are needed — the built-in profile already grants access to both `~/.claude` and `~/.claude.lock`.
+</Note>
+
 ## Security Tips
 
 ### Use Secrets Management

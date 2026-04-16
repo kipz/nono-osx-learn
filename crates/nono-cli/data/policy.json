@@ -666,11 +666,10 @@
         "capability_elevation": false
       },
       "filesystem": {
-        "allow": ["$HOME/.claude", "$HOME/.cache/claude"],
+        "allow": ["$HOME/.claude", "$HOME/.cache/claude", "$HOME/.claude.lock"],
         "allow_file": [
           "$HOME/.claude.json",
-          "$HOME/.claude.json.lock",
-          "$HOME/.claude.lock"
+          "$HOME/.claude.json.lock"
         ]
       },
       "network": { "block": false },

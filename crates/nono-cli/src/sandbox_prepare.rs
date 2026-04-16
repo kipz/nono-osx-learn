@@ -23,6 +23,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 
+/// Returns `true` if `profile_name` is `"claude-code"` or transitively extends it.
+fn is_claude_code_profile(profile_name: &str) -> bool {
+    fn check(name: &str, visited: &mut Vec<String>) -> bool {
+        if name == "claude-code" {
+            return true;
+        }
+        if visited.iter().any(|v| v == name) {
+            return false; // cycle — bail out
+        }
+        visited.push(name.to_string());
+        let bases = match profile::load_profile_extends(name) {
+            Some(bases) => bases,
+            None => return false,
+        };
+        bases.iter().any(|base| check(base, visited))
+    }
+    check(profile_name, &mut Vec::new())
+}
+
 fn collect_missing_cli_requested_paths(args: &SandboxArgs) -> Vec<String> {
     let mut missing = Vec::new();
 
@@ -302,7 +321,7 @@ pub(crate) fn should_auto_enable_claude_launch_services(
     cmd_args: &[std::ffi::OsString],
 ) -> bool {
     if args.allow_launch_services
-        || args.profile.as_deref() != Some("claude-code")
+        || !args.profile.as_deref().is_some_and(is_claude_code_profile)
         || !command_is_claude(program)
         || claude_session_has_non_browser_auth(cmd_args)
     {
@@ -1012,7 +1031,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     }
 
     #[cfg(unix)]
-    if args.profile.as_deref() == Some("claude-code") {
+    if args.profile.as_deref().is_some_and(is_claude_code_profile) {
         let home = config::validated_home()?;
         let home_path = std::path::Path::new(&home);
 
