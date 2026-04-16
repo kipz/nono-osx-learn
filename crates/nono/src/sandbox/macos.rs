@@ -551,19 +551,25 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             // symlinks, matching the mDNSResponder dual-path pattern above.
             for cap in caps.fs_capabilities() {
                 let (filter, resolved_str) = if cap.is_file {
-                    ("path", cap.resolved.to_str().ok_or_else(|| {
-                        NonoError::SandboxInit(format!(
-                            "path contains non-UTF-8 bytes: {}",
-                            cap.resolved.display()
-                        ))
-                    })?)
+                    (
+                        "path",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
                 } else {
-                    ("subpath", cap.resolved.to_str().ok_or_else(|| {
-                        NonoError::SandboxInit(format!(
-                            "path contains non-UTF-8 bytes: {}",
-                            cap.resolved.display()
-                        ))
-                    })?)
+                    (
+                        "subpath",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
                 };
                 let escaped = escape_path(resolved_str)?;
                 profile.push_str(&format!(
@@ -606,19 +612,25 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             // Same Unix socket logic as Blocked mode above. See: #687
             for cap in caps.fs_capabilities() {
                 let (filter, resolved_str) = if cap.is_file {
-                    ("path", cap.resolved.to_str().ok_or_else(|| {
-                        NonoError::SandboxInit(format!(
-                            "path contains non-UTF-8 bytes: {}",
-                            cap.resolved.display()
-                        ))
-                    })?)
+                    (
+                        "path",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
                 } else {
-                    ("subpath", cap.resolved.to_str().ok_or_else(|| {
-                        NonoError::SandboxInit(format!(
-                            "path contains non-UTF-8 bytes: {}",
-                            cap.resolved.display()
-                        ))
-                    })?)
+                    (
+                        "subpath",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
                 };
                 let escaped = escape_path(resolved_str)?;
                 profile.push_str(&format!(
@@ -1312,7 +1324,10 @@ mod tests {
 
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(profile.contains("(allow network-outbound)\n"), "AllowAll must still emit blanket rule");
+        assert!(
+            profile.contains("(allow network-outbound)\n"),
+            "AllowAll must still emit blanket rule"
+        );
         assert!(
             !profile.contains("(allow network-outbound (path \"/private/tmp/test.sock\"))"),
             "AllowAll must not emit per-path socket rules"
