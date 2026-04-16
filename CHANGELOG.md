@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.37.0] - 2026-04-16
+
+### Bug Fixes
+
+- *(claude-code)* Enable token refresh via .claude.json symlink
+
+- *(profiles)* Prevent infinite recursion in profile extends check
+
+- *(sandbox)* Support claude-code profile extensions and simplify config
+
+
+### Features
+
+- *(claude-code)* Pre-create claude config lock directory
+
+
+### Refactoring
+
+- *(proxy-tls)* Remove rustls-pemfile and use pki_types for pem parsing
+
 ## [0.36.0] - 2026-04-15
 
 ### Bug Fixes
