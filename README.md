@@ -44,6 +44,8 @@ Other options in the [Installation Guide](https://docs.nono.sh/cli/getting_start
 
 ## Latest News
 
+**nono registry** - we will be bringing online a skill and policy registry to allow uses to contribute agent skills (SKILLS.md, hooks, scripts etc), and policy - this will allow us to more easily scale to supporting all of the different agents, installers and linux dists. Security will be baked in from the start. [Read more here](https://github.com/always-further/nono/issues/630)
+
 **Detach and reattach to sandboxed agents** -- Run agents in the background with `nono run --detach`, reconnect with `nono attach`. Includes `nono ps`, `nono stop`, and `nono inspect`. ([#526](https://github.com/always-further/nono/pull/526))
 
 **WSL2 support** -- Auto-detection with ~84% feature coverage out of the box. Run `nono setup --check-only` to see what's available. ([#522](https://github.com/always-further/nono/pull/522))

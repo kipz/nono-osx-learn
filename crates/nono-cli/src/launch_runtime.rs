@@ -2,7 +2,7 @@ use crate::cli::RunArgs;
 use crate::config;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
-    prepare_sandbox, print_allow_launch_services_warning, PreparedSandbox,
+    prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning, PreparedSandbox,
 };
 use crate::{exec_strategy, instruction_deny, profile, trust_scan};
 use colored::Colorize;
@@ -144,6 +144,9 @@ pub(crate) fn prepare_run_launch_plan(
 
     if prepared.allow_launch_services_active {
         print_allow_launch_services_warning(silent);
+    }
+    if prepared.allow_gpu_active {
+        print_allow_gpu_warning(silent);
     }
 
     if run_args.capability_elevation {

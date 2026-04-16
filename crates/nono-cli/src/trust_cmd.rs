@@ -6,7 +6,7 @@ use crate::cli::{
     TrustArgs, TrustCommands, TrustExportKeyArgs, TrustInitArgs, TrustKeygenArgs, TrustListArgs,
     TrustSignArgs, TrustSignPolicyArgs, TrustSignSkillArgs, TrustVerifyArgs, TrustVerifySkillArgs,
 };
-use crate::trust_keystore;
+use crate::trust_keystore::{self, TrustKeyRef};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use colored::Colorize;
@@ -86,8 +86,9 @@ fn run_init(args: TrustInitArgs) -> Result<()> {
     }
 
     // Try to include the public key if a signing key exists
-    let key_id = args.key.as_deref().unwrap_or("default");
-    let publisher = match load_public_key_bytes(key_id) {
+    let key_ref = TrustKeyRef::resolve_key(args.keyref.as_deref(), args.key.as_deref())?;
+    let key_id = key_ref.key_id()?;
+    let publisher = match load_public_key_bytes_for_ref(&key_ref) {
         Ok(pub_bytes) => {
             let b64 = base64_encode(&pub_bytes);
             Some(serde_json::json!({
@@ -97,14 +98,22 @@ fn run_init(args: TrustInitArgs) -> Result<()> {
             }))
         }
         Err(_) => {
+            let backend = trust_keystore::backend_description_for_ref(&key_ref, TRUST_SERVICE);
             eprintln!(
-                "  {} signing key '{}' not found in keystore, skipping publisher entry.",
+                "  {} signing key '{}' not found in {}, skipping publisher entry.",
                 "Note:".cyan(),
-                key_id
+                key_id,
+                backend
             );
+            let keyref_hint = match &key_ref {
+                TrustKeyRef::File(_) => format!(" --keyref {key_id}"),
+                TrustKeyRef::Keystore(_) => String::new(),
+            };
             eprintln!(
                 "  {}",
-                "Run 'nono trust keygen' to generate a key, then re-run 'nono trust init'.".cyan()
+                format!(
+                    "Run 'nono trust keygen{keyref_hint}' to generate a key, then re-run 'nono trust init{keyref_hint}'."
+                ).cyan()
             );
             None
         }
@@ -141,17 +150,28 @@ fn run_init(args: TrustInitArgs) -> Result<()> {
         }
     }
 
+    let keyref_flag = match &key_ref {
+        TrustKeyRef::File(_) => format!(" --keyref {key_id}"),
+        TrustKeyRef::Keystore(_) => String::new(),
+    };
+
     if publishers.is_empty() {
         eprintln!("\n  {}", "Next steps:".bold());
-        eprintln!("  1. nono trust keygen");
-        eprintln!("  2. nono trust init --force");
-        eprintln!("  3. nono trust sign-policy {}", policy_path.display());
-        eprintln!("  4. nono trust sign --all");
+        eprintln!("  1. nono trust keygen{keyref_flag}");
+        eprintln!("  2. nono trust init{keyref_flag} --force");
+        eprintln!(
+            "  3. nono trust sign-policy{keyref_flag} {}",
+            policy_path.display()
+        );
+        eprintln!("  4. nono trust sign{keyref_flag} --all");
     } else {
         eprintln!("\n  {}", "Next steps:".bold());
-        eprintln!("  1. nono trust sign-policy {}", policy_path.display());
+        eprintln!(
+            "  1. nono trust sign-policy{keyref_flag} {}",
+            policy_path.display()
+        );
         if !is_user {
-            eprintln!("  2. nono trust sign --all");
+            eprintln!("  2. nono trust sign{keyref_flag} --all");
         }
     }
 
@@ -163,12 +183,15 @@ fn run_init(args: TrustInitArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_keygen(args: TrustKeygenArgs) -> Result<()> {
-    let key_id = &args.id;
+    let key_ref = TrustKeyRef::resolve_id(args.keyref.as_deref(), &args.id)?;
+    let key_label = key_ref.key_id()?;
 
     // Check if key already exists
-    if !args.force && trust_keystore::contains_secret(TRUST_SERVICE, key_id)? {
+    if !args.force && trust_keystore::contains_secret_for_ref(&key_ref, TRUST_SERVICE, &key_label)?
+    {
         return Err(nono::NonoError::KeystoreAccess(format!(
-            "key '{key_id}' already exists in keystore (use --force to overwrite)"
+            "key '{key_label}' already exists in {} (use --force to overwrite)",
+            trust_keystore::backend_description_for_ref(&key_ref, TRUST_SERVICE)
         )));
     }
 
@@ -189,20 +212,19 @@ fn run_keygen(args: TrustKeygenArgs) -> Result<()> {
 
     // Store PKCS#8 as base64 in the configured trust keystore.
     let pkcs8_b64 = Zeroizing::new(base64_encode(pkcs8_doc.as_ref()));
-    trust_keystore::store_secret(TRUST_SERVICE, key_id, pkcs8_b64.as_str())?;
+    trust_keystore::store_secret_for_ref(&key_ref, TRUST_SERVICE, &key_label, pkcs8_b64.as_str())?;
 
     // Store public key separately so verification never needs the private key
     let pub_key_b64 = base64_encode(pub_key.as_bytes());
-    trust_keystore::store_secret(TRUST_PUB_SERVICE, key_id, &pub_key_b64)?;
-    store_public_key_cache(key_id, &pub_key_b64)?;
+    store_public_key_for_ref(&key_ref, &key_label, &pub_key_b64)?;
 
     eprintln!("{}", "Signing key generated successfully.".green());
-    eprintln!("  Key ID:      {key_id}");
+    eprintln!("  Key ID:      {key_label}");
     eprintln!("  Fingerprint: {hex_id}");
     eprintln!("  Algorithm:   ECDSA P-256 (SHA-256)");
     eprintln!(
         "  Stored in:   {}",
-        trust_keystore::backend_description(TRUST_SERVICE)
+        trust_keystore::backend_description_for_ref(&key_ref, TRUST_SERVICE)
     );
     eprintln!();
     eprintln!("Public key (base64 DER, for trust-policy.json):");
@@ -219,8 +241,8 @@ fn run_keygen(args: TrustKeygenArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_export_key(args: TrustExportKeyArgs) -> Result<()> {
-    let key_id = &args.id;
-    let pub_key_bytes = load_public_key_bytes(key_id)?;
+    let key_ref = TrustKeyRef::resolve_id(args.keyref.as_deref(), &args.id)?;
+    let pub_key_bytes = load_public_key_bytes_for_ref(&key_ref)?;
 
     if args.pem {
         let pub_key = trust::DerPublicKey::from(pub_key_bytes);
@@ -241,10 +263,11 @@ fn run_sign(args: TrustSignArgs) -> Result<()> {
         return run_sign_keyless(args);
     }
 
-    let key_id = args.key.as_deref().unwrap_or("default");
+    let key_ref = TrustKeyRef::resolve_key(args.keyref.as_deref(), args.key.as_deref())?;
+    let key_id = key_ref.key_id()?;
 
-    // Load the signing key from keystore
-    let key_pair = load_signing_key(key_id)?;
+    // Load the signing key
+    let key_pair = load_signing_key_for_ref(&key_ref)?;
 
     // Resolve files to sign
     let files = resolve_files(&args.files, args.all, args.policy.as_deref())?;
@@ -255,14 +278,14 @@ fn run_sign(args: TrustSignArgs) -> Result<()> {
     }
 
     if args.multi_subject {
-        return run_sign_multi_keyed(&files, &key_pair, key_id);
+        return run_sign_multi_keyed(&files, &key_pair, &key_id);
     }
 
     let mut success_count = 0u32;
     let mut fail_count = 0u32;
 
     for file_path in &files {
-        match trust::sign_instruction_file(file_path, &key_pair, key_id) {
+        match trust::sign_instruction_file(file_path, &key_pair, &key_id) {
             Ok(bundle_json) => {
                 trust::write_bundle(file_path, &bundle_json)?;
                 let bundle_path = trust::bundle_path_for(file_path);
@@ -578,10 +601,11 @@ fn discover_oidc_token(rt: &tokio::runtime::Runtime) -> Result<sigstore_sign::oi
 // ---------------------------------------------------------------------------
 
 fn run_sign_policy(args: TrustSignPolicyArgs) -> Result<()> {
-    let key_id = args.key.as_deref().unwrap_or("default");
+    let key_ref = TrustKeyRef::resolve_key(args.keyref.as_deref(), args.key.as_deref())?;
+    let key_id = key_ref.key_id()?;
 
-    // Load the signing key from keystore
-    let key_pair = load_signing_key(key_id)?;
+    // Load the signing key
+    let key_pair = load_signing_key_for_ref(&key_ref)?;
 
     // Resolve the policy file path
     let policy_path = match args.file {
@@ -616,7 +640,7 @@ fn run_sign_policy(args: TrustSignPolicyArgs) -> Result<()> {
     // Validate the policy file is well-formed before signing.
     trust::load_policy_from_file(&policy_path)?;
 
-    let bundle_json = trust::sign_policy_file(&policy_path, &key_pair, key_id)?;
+    let bundle_json = trust::sign_policy_file(&policy_path, &key_pair, &key_id)?;
     trust::write_bundle(&policy_path, &bundle_json)?;
     let bundle_path = trust::bundle_path_for(&policy_path);
 
@@ -1103,11 +1127,41 @@ fn run_verify_skill(args: TrustVerifySkillArgs) -> Result<()> {
 // Key loading from system keystore
 // ---------------------------------------------------------------------------
 
-/// Load only the public key bytes for a given key ID from the keystore.
+/// Load only the public key bytes for a given key ID.
+///
+/// Resolution order:
+/// 1. If `key_id` is an absolute path (from a `file://` keygen), load `<path>.pub` directly.
+/// 2. Otherwise, check the on-disk cache.
+/// 3. Fall back to the system keystore (`nono-trust-pub` service).
 ///
 /// Uses the `nono-trust-pub` service to avoid loading private key material
 /// into memory for verification-only operations.
 pub(crate) fn load_public_key_bytes(key_id: &str) -> Result<Vec<u8>> {
+    // file:// keys embed a `file:///path` URI as key_id in the bundle.
+    // Dispatch on the URI scheme for clean, explicit detection — no guessing
+    // from path shape. Validate the URI before using it as a filesystem path.
+    if nono::is_file_uri(key_id) {
+        nono::validate_file_uri(key_id).map_err(|_| {
+            nono::NonoError::KeystoreAccess(format!(
+                "key_id '{key_id}' in bundle is not a valid file URI"
+            ))
+        })?;
+        let path_str = key_id.strip_prefix("file://").ok_or_else(|| {
+            nono::NonoError::KeystoreAccess(format!("invalid file URI: {key_id}"))
+        })?;
+        let pub_path = pub_key_path_for_file(std::path::Path::new(path_str));
+        let b64 = nono::load_secret_file(&pub_path).map_err(|e| match e {
+            nono::NonoError::SecretNotFound(_) => nono::NonoError::SecretNotFound(format!(
+                "public key not found at {} (run 'nono trust keygen' to regenerate)",
+                pub_path.display()
+            )),
+            other => other,
+        })?;
+        debug!("loaded public key from {}", nono::redact_file_uri(key_id));
+        return base64_decode(b64.as_str())
+            .map_err(|e| nono::NonoError::KeystoreAccess(format!("corrupt public key data: {e}")));
+    }
+
     if let Some(b64) = load_public_key_cache(key_id)? {
         return base64_decode(&b64)
             .map_err(|e| nono::NonoError::KeystoreAccess(format!("corrupt public key data: {e}")));
@@ -1144,6 +1198,107 @@ pub(crate) fn load_signing_key(key_id: &str) -> Result<trust::KeyPair> {
     })?);
 
     reconstruct_key_pair(&pkcs8_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Key loading with TrustKeyRef dispatch
+// ---------------------------------------------------------------------------
+
+/// Load public key bytes for a given key reference.
+fn load_public_key_bytes_for_ref(key_ref: &TrustKeyRef) -> Result<Vec<u8>> {
+    match key_ref {
+        TrustKeyRef::Keystore(name) => load_public_key_bytes(name),
+        TrustKeyRef::File(path) => {
+            let pub_path = pub_key_path_for_file(path);
+            let file_uri = format!("file://{}", pub_path.display());
+            let b64 = nono::load_secret_file(&pub_path).map_err(|e| match e {
+                nono::NonoError::SecretNotFound(_) => nono::NonoError::SecretNotFound(format!(
+                    "public key not found at {} (run 'nono trust keygen' to regenerate)",
+                    pub_path.display()
+                )),
+                other => other,
+            })?;
+            debug!(
+                "loaded public key from {}",
+                nono::redact_file_uri(&file_uri)
+            );
+            base64_decode(b64.as_str()).map_err(|e| {
+                nono::NonoError::KeystoreAccess(format!("corrupt public key data: {e}"))
+            })
+        }
+    }
+}
+
+/// Load signing key for a given key reference.
+fn load_signing_key_for_ref(key_ref: &TrustKeyRef) -> Result<trust::KeyPair> {
+    match key_ref {
+        TrustKeyRef::Keystore(name) => load_signing_key(name),
+        TrustKeyRef::File(path) => {
+            let file_uri = format!("file://{}", path.display());
+            let pkcs8_b64 = nono::load_secret_file(path).map_err(|e| match e {
+                nono::NonoError::SecretNotFound(_) => nono::NonoError::SecretNotFound(format!(
+                    "signing key not found at {} (run 'nono trust keygen' first)",
+                    path.display()
+                )),
+                other => other,
+            })?;
+            debug!(
+                "loaded signing key from {}",
+                nono::redact_file_uri(&file_uri)
+            );
+            let pkcs8_bytes = Zeroizing::new(base64_decode(pkcs8_b64.as_str()).map_err(|e| {
+                nono::NonoError::KeystoreAccess(format!(
+                    "corrupt key data in {}: {e}",
+                    path.display()
+                ))
+            })?);
+            reconstruct_key_pair(&pkcs8_bytes)
+        }
+    }
+}
+
+/// Store the public key for a key reference.
+///
+/// For keystore refs, stores in `TRUST_PUB_SERVICE` and the disk cache.
+/// For file refs, stores at `<path>.pub`.
+fn store_public_key_for_ref(
+    key_ref: &TrustKeyRef,
+    key_label: &str,
+    pub_key_b64: &str,
+) -> Result<()> {
+    match key_ref {
+        TrustKeyRef::Keystore(name) => {
+            trust_keystore::store_secret_for_ref(key_ref, TRUST_PUB_SERVICE, name, pub_key_b64)?;
+            store_public_key_cache(name, pub_key_b64)?;
+            Ok(())
+        }
+        TrustKeyRef::File(path) => {
+            let pub_path = pub_key_path_for_file(path);
+            nono::store_secret_file(&pub_path, pub_key_b64).map_err(|e| match e {
+                nono::NonoError::KeystoreAccess(_) => nono::NonoError::KeystoreAccess(format!(
+                    "failed to store public key at {}",
+                    pub_path.display()
+                )),
+                other => other,
+            })?;
+            debug!(
+                "stored public key at {}",
+                nono::redact_file_uri(&format!("file://{}", pub_path.display()))
+            );
+            // Suppress unused variable warning for key_label in file path
+            let _ = key_label;
+            Ok(())
+        }
+    }
+}
+
+/// Derive the public key file path from a private key file path.
+///
+/// `file:///path/to/key.pem` → `/path/to/key.pem.pub`
+fn pub_key_path_for_file(private_key_path: &Path) -> PathBuf {
+    let mut pub_path = private_key_path.as_os_str().to_owned();
+    pub_path.push(".pub");
+    PathBuf::from(pub_path)
 }
 
 pub(crate) fn reconstruct_key_pair(pkcs8_bytes: &[u8]) -> Result<trust::KeyPair> {
@@ -1352,45 +1507,21 @@ fn public_key_cache_path(key_id: &str) -> Result<PathBuf> {
 
 fn load_public_key_cache(key_id: &str) -> Result<Option<String>> {
     let path = public_key_cache_path(key_id)?;
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => Ok(Some(contents.trim().to_string())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(nono::NonoError::KeystoreAccess(format!(
-            "failed to read cached public key '{}': {}",
-            path.display(),
-            e
-        ))),
+    if !path.exists() {
+        return Ok(None);
+    }
+    // Reuse load_secret_file for consistent whitespace handling (trims one trailing newline).
+    match nono::load_secret_file(&path) {
+        Ok(secret) => Ok(Some(secret.to_string())),
+        Err(nono::NonoError::SecretNotFound(_)) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
 fn store_public_key_cache(key_id: &str, public_key_b64: &str) -> Result<()> {
     let path = public_key_cache_path(key_id)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| nono::NonoError::ConfigWrite {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-    }
-
-    std::fs::write(&path, format!("{public_key_b64}\n")).map_err(|e| {
-        nono::NonoError::ConfigWrite {
-            path: path.clone(),
-            source: e,
-        }
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            nono::NonoError::ConfigWrite {
-                path: path.clone(),
-                source: e,
-            }
-        })?;
-    }
-
-    Ok(())
+    // Reuse store_secret_file for atomic 0600 permissions (never momentarily world-readable).
+    nono::store_secret_file(&path, public_key_b64)
 }
 
 fn hex_component(value: &[u8]) -> String {

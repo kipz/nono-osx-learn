@@ -833,6 +833,10 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
 
+    /// Allow GPU access on Apple Silicon Macs through IOKit
+    #[arg(long, help_heading = "OPTIONS")]
+    pub allow_gpu: bool,
+
     /// Capability manifest file (JSON). A fully-resolved sandbox specification —
     /// mutually exclusive with all other sandbox configuration flags.
     #[arg(
@@ -845,7 +849,7 @@ pub struct SandboxArgs {
             "block_net", "allow_net", "network_profile", "allow_proxy",
             "allow_bind", "allow_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
-            "allow_command", "block_command", "allow_launch_services",
+            "allow_command", "block_command", "allow_launch_services", "allow_gpu",
         ],
         help_heading = "OPTIONS"
     )]
@@ -990,6 +994,10 @@ pub struct WrapSandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
 
+    /// Allow GPU access on Apple Silicon Macs through IOKit
+    #[arg(long, help_heading = "OPTIONS")]
+    pub allow_gpu: bool,
+
     /// Capability manifest file (JSON). A fully-resolved sandbox specification —
     /// mutually exclusive with all other sandbox configuration flags.
     #[arg(
@@ -1001,7 +1009,7 @@ pub struct WrapSandboxArgs {
             "profile", "override_deny", "allow_cwd",
             "block_net", "allow_bind", "allow_port",
             "env_credential", "env_credential_map",
-            "allow_command", "block_command", "allow_launch_services",
+            "allow_command", "block_command", "allow_launch_services", "allow_gpu",
         ],
         help_heading = "OPTIONS"
     )]
@@ -1045,6 +1053,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             block_command: args.block_command,
             profile: args.profile,
             allow_launch_services: args.allow_launch_services,
+            allow_gpu: args.allow_gpu,
             config: args.config,
             verbose: args.verbose,
             dry_run: args.dry_run,
@@ -1660,11 +1669,15 @@ pub struct TrustSignArgs {
     pub all: bool,
 
     /// Key ID to use from the system keystore (default: "default")
-    #[arg(long, value_name = "KEY_ID", conflicts_with = "keyless")]
+    #[arg(long, value_name = "KEY_ID", conflicts_with_all = ["keyless", "keyref"])]
     pub key: Option<String>,
 
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with_all = ["key", "keyless"])]
+    pub keyref: Option<String>,
+
     /// Use Sigstore keyless signing (Fulcio + Rekor via ambient OIDC)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "keyref")]
     pub keyless: bool,
 
     /// Produce a single .nono-trust.bundle containing all subjects instead of per-file bundles
@@ -1688,8 +1701,12 @@ pub struct TrustSignPolicyArgs {
     pub file: Option<PathBuf>,
 
     /// Key ID to use from the system keystore (default: "default")
-    #[arg(long, value_name = "KEY_ID")]
+    #[arg(long, value_name = "KEY_ID", conflicts_with = "keyref")]
     pub key: Option<String>,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "key")]
+    pub keyref: Option<String>,
 
     /// Sign the user-level trust policy at ~/.config/nono/trust-policy.json
     #[arg(long)]
@@ -1728,8 +1745,12 @@ pub struct TrustInitArgs {
     pub include: Vec<String>,
 
     /// Key ID to include as a publisher (default: "default")
-    #[arg(long, value_name = "KEY_ID")]
+    #[arg(long, value_name = "KEY_ID", conflicts_with = "keyref")]
     pub key: Option<String>,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "key")]
+    pub keyref: Option<String>,
 
     /// Create a user-level policy at ~/.config/nono/ instead of the current directory
     #[arg(long)]
@@ -1764,8 +1785,17 @@ pub struct TrustListArgs {
 #[command(disable_help_flag = true)]
 pub struct TrustKeygenArgs {
     /// Key identifier (stored in system keystore under this name)
-    #[arg(long, value_name = "NAME", default_value = "default")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "default",
+        conflicts_with = "keyref"
+    )]
     pub id: String,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "id")]
+    pub keyref: Option<String>,
 
     /// Overwrite existing key with the same ID
     #[arg(long)]
@@ -1780,8 +1810,17 @@ pub struct TrustKeygenArgs {
 #[command(disable_help_flag = true)]
 pub struct TrustExportKeyArgs {
     /// Key identifier to export (default: "default")
-    #[arg(long, value_name = "NAME", default_value = "default")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "default",
+        conflicts_with = "keyref"
+    )]
     pub id: String,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "id")]
+    pub keyref: Option<String>,
 
     /// Output as PEM instead of base64 DER
     #[arg(long)]

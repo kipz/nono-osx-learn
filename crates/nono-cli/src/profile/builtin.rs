@@ -35,6 +35,10 @@ mod tests {
             .filesystem
             .allow
             .contains(&"$HOME/.cache/claude".to_string()));
+        assert!(profile
+            .filesystem
+            .allow_file
+            .contains(&"$HOME/.claude.lock".to_string()));
     }
 
     #[test]
@@ -71,8 +75,16 @@ mod tests {
             .contains(&"$HOME/.local/share/claude".to_string()));
         assert!(!profile
             .filesystem
-            .read_file
+            .allow_file
             .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
+        assert!(!profile
+            .filesystem
+            .allow_file
+            .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
+        assert!(profile
+            .filesystem
+            .allow_file
+            .contains(&"$HOME/.claude.lock".to_string()));
     }
 
     #[test]

@@ -7,7 +7,8 @@ use crate::launch_runtime::{
 };
 use crate::output;
 use crate::sandbox_prepare::{
-    prepare_sandbox, print_allow_launch_services_warning, validate_external_proxy_bypass,
+    prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
+    validate_external_proxy_bypass,
 };
 use crate::theme;
 use nono::{NonoError, Result};
@@ -69,6 +70,9 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
 
     if prepared.allow_launch_services_active {
         print_allow_launch_services_warning(silent);
+    }
+    if prepared.allow_gpu_active {
+        print_allow_gpu_warning(silent);
     }
 
     if !silent {
@@ -141,6 +145,9 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
 
     if prepared.allow_launch_services_active {
         print_allow_launch_services_warning(silent);
+    }
+    if prepared.allow_gpu_active {
+        print_allow_gpu_warning(silent);
     }
 
     execute_sandboxed(LaunchPlan {

@@ -99,6 +99,7 @@ mod tests {
         trust_interception_active,
     };
     use crate::proxy_runtime::{resolve_effective_proxy_settings, EffectiveProxySettings};
+    use crate::sandbox_prepare::maybe_enable_macos_gpu;
     #[cfg(target_os = "macos")]
     use crate::sandbox_prepare::maybe_enable_macos_launch_services;
     use crate::sandbox_prepare::PreparedSandbox;
@@ -207,6 +208,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             allow_launch_services_active: false,
+            allow_gpu_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
@@ -249,6 +251,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             allow_launch_services_active: false,
+            allow_gpu_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
@@ -452,6 +455,67 @@ mod tests {
         assert!(
             err.to_string().contains("configure open_urls"),
             "error should mention open_urls"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_maybe_enable_macos_gpu_adds_rules_when_enabled() {
+        let mut caps = CapabilitySet::new();
+
+        let enabled = maybe_enable_macos_gpu(&mut caps, true, true).expect("gpu gate should apply");
+
+        assert!(enabled);
+        assert!(
+            caps.platform_rules()
+                .iter()
+                .any(|r| r.contains("AGXDeviceUserClient")),
+            "AGXDeviceUserClient platform rule should be present"
+        );
+        assert!(
+            caps.platform_rules()
+                .iter()
+                .any(|r| r.contains("IOSurfaceRootUserClient")),
+            "IOSurfaceRootUserClient platform rule should be present"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_maybe_enable_macos_gpu_rejects_without_profile_opt_in() {
+        let mut caps = CapabilitySet::new();
+
+        let err = maybe_enable_macos_gpu(&mut caps, true, false)
+            .expect_err("missing profile opt-in should fail");
+
+        assert!(
+            err.to_string().contains("allow_gpu"),
+            "error should mention allow_gpu"
+        );
+    }
+
+    #[test]
+    fn test_maybe_enable_macos_gpu_noop_without_flag() {
+        let mut caps = CapabilitySet::new();
+
+        let enabled =
+            maybe_enable_macos_gpu(&mut caps, false, true).expect("should succeed without flag");
+
+        assert!(!enabled);
+        assert!(caps.platform_rules().is_empty());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_maybe_enable_macos_gpu_rejects_on_non_macos() {
+        let mut caps = CapabilitySet::new();
+
+        let err =
+            maybe_enable_macos_gpu(&mut caps, true, true).expect_err("should fail on non-macOS");
+
+        assert!(
+            err.to_string().contains("only supported on macOS"),
+            "error should mention macOS support"
         );
     }
 }

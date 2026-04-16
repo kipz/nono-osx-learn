@@ -29,12 +29,141 @@ fn try_new_dir(path: &Path, access: AccessMode, label: &str) -> Result<Option<Fs
 fn try_new_file(path: &Path, access: AccessMode, label: &str) -> Result<Option<FsCapability>> {
     match FsCapability::new_file(path, access) {
         Ok(cap) => Ok(Some(cap)),
-        Err(NonoError::PathNotFound(_)) => {
-            warn!("{}: {}", label, path.display());
-            Ok(None)
-        }
+        Err(NonoError::PathNotFound(_)) => handle_missing_file_capability(path, access, label),
         Err(e) => Err(e),
     }
+}
+
+/// Create a profile capability for an exact path that is usually expected to be a file.
+///
+/// Some clients use lock directories at paths that historically held lock files
+/// (for example `~/.claude.lock`). On macOS we can preserve exact-path semantics
+/// for that directory by emitting a literal path rule instead of widening to a
+/// recursive directory grant. On other platforms, fail closed.
+fn try_new_profile_exact_path(
+    path: &Path,
+    access: AccessMode,
+    label: &str,
+    protected_roots: &ProtectedRoots,
+    allow_parent_of_protected: bool,
+) -> Result<Option<FsCapability>> {
+    validate_requested_file(path, "Profile", protected_roots, allow_parent_of_protected)?;
+    match try_new_file(path, access, label) {
+        Err(NonoError::ExpectedFile(_)) => {
+            handle_exact_directory_path(path, access, protected_roots, allow_parent_of_protected)
+        }
+        result => result,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handle_exact_directory_path(
+    path: &Path,
+    access: AccessMode,
+    protected_roots: &ProtectedRoots,
+    allow_parent_of_protected: bool,
+) -> Result<Option<FsCapability>> {
+    validate_requested_dir(path, "Profile", protected_roots, allow_parent_of_protected)?;
+    let resolved = path.canonicalize().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            NonoError::PathNotFound(path.to_path_buf())
+        } else {
+            NonoError::PathCanonicalization {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+
+    debug!(
+        "Profile exact-file path resolved as directory; granting exact macOS literal path access: {}",
+        path.display()
+    );
+
+    Ok(Some(FsCapability {
+        original: path.to_path_buf(),
+        resolved,
+        access,
+        // On macOS, `is_file = true` makes Seatbelt emit a literal path rule
+        // rather than a recursive subpath rule. The target may still be a
+        // directory; the important property is exact-path matching.
+        is_file: true,
+        source: CapabilitySource::Profile,
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn handle_exact_directory_path(
+    path: &Path,
+    _access: AccessMode,
+    _protected_roots: &ProtectedRoots,
+    _allow_parent_of_protected: bool,
+) -> Result<Option<FsCapability>> {
+    Err(NonoError::ExpectedFile(path.to_path_buf()))
+}
+
+#[cfg(target_os = "macos")]
+fn handle_missing_file_capability(
+    path: &Path,
+    access: AccessMode,
+    _label: &str,
+) -> Result<Option<FsCapability>> {
+    let cap = new_future_file_capability(path, access)?;
+    debug!(
+        "Granting future exact file capability on macOS for missing path: {}",
+        path.display()
+    );
+    Ok(Some(cap))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn handle_missing_file_capability(
+    path: &Path,
+    _access: AccessMode,
+    label: &str,
+) -> Result<Option<FsCapability>> {
+    warn!("{}: {}", label, path.display());
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn new_future_file_capability(path: &Path, access: AccessMode) -> Result<FsCapability> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(NonoError::Io)?.join(path)
+    };
+
+    Ok(FsCapability {
+        original: path.to_path_buf(),
+        resolved: resolve_missing_leaf_path(&absolute)?,
+        access,
+        is_file: true,
+        source: CapabilitySource::User,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_missing_leaf_path(path: &Path) -> Result<PathBuf> {
+    for ancestor in path.ancestors() {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                if let Ok(relative) = path.strip_prefix(ancestor) {
+                    canonical.push(relative);
+                }
+                return Ok(canonical);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(NonoError::PathCanonicalization {
+                    path: path.to_path_buf(),
+                    source: err,
+                });
+            }
+        }
+    }
+
+    Err(NonoError::PathNotFound(path.to_path_buf()))
 }
 
 /// Add a platform rule to allow atomic-write temp files for a writable file.
@@ -48,28 +177,25 @@ fn add_atomic_write_rule(caps: &mut CapabilitySet, cap: &FsCapability) -> Result
     if !matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite) {
         return Ok(());
     }
-    let resolved = cap
-        .resolved
-        .to_str()
-        .ok_or_else(|| NonoError::SandboxInit("non-UTF-8 path".to_string()))?;
-    // Escape regex metacharacters in the path (mainly dots and slashes are safe,
-    // but be defensive about unusual file names).
-    let escaped = regex_escape_path(resolved);
-    let rule = format!(
-        "(allow file-write* (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9]+$\"))",
-        escaped
-    );
-    caps.add_platform_rule(&rule)?;
-    // If the original path differs (symlink), emit a rule for it too.
+
+    fn add_rule_for_path(caps: &mut CapabilitySet, path: &Path) -> Result<()> {
+        let path_str = path.to_str().ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "non-UTF-8 path for atomic write rule: {}",
+                path.display()
+            ))
+        })?;
+        let escaped = regex_escape_path(path_str);
+        let rule = format!(
+            "(allow file-write* (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9]+$\"))",
+            escaped
+        );
+        caps.add_platform_rule(&rule)
+    }
+
+    add_rule_for_path(caps, &cap.resolved)?;
     if cap.original != cap.resolved {
-        if let Some(orig) = cap.original.to_str() {
-            let escaped_orig = regex_escape_path(orig);
-            let rule_orig = format!(
-                "(allow file-write* (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9]+$\"))",
-                escaped_orig
-            );
-            caps.add_platform_rule(&rule_orig)?;
-        }
+        add_rule_for_path(caps, &cap.original)?;
     }
     Ok(())
 }
@@ -81,6 +207,7 @@ fn add_atomic_write_rule(_caps: &mut CapabilitySet, _cap: &FsCapability) -> Resu
 
 /// Escape a filesystem path for use in a Seatbelt regex.
 /// Only metacharacters that could appear in typical paths need escaping.
+#[cfg(target_os = "macos")]
 fn regex_escape_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
     for c in path.chars() {
@@ -102,10 +229,11 @@ fn apply_profile_dir_allows(
     protected_roots: &ProtectedRoots,
     caps: &mut CapabilitySet,
     label_prefix: &str,
+    allow_parent_of_protected: bool,
 ) -> Result<()> {
     for path_template in path_templates {
         let path = expand_vars(path_template, workdir)?;
-        validate_requested_dir(&path, "Profile", protected_roots)?;
+        validate_requested_dir(&path, "Profile", protected_roots, allow_parent_of_protected)?;
         let label = format!(
             "{label_prefix} '{}' does not exist, skipping",
             path_template
@@ -122,12 +250,14 @@ fn validate_requested_dir(
     path: &Path,
     source: &str,
     protected_roots: &ProtectedRoots,
+    allow_parent_of_protected: bool,
 ) -> Result<()> {
     protected_paths::validate_requested_path_against_protected_roots(
         path,
         false,
         source,
         protected_roots.as_paths(),
+        allow_parent_of_protected,
     )
 }
 
@@ -135,12 +265,14 @@ fn validate_requested_file(
     path: &Path,
     source: &str,
     protected_roots: &ProtectedRoots,
+    allow_parent_of_protected: bool,
 ) -> Result<()> {
     protected_paths::validate_requested_path_against_protected_roots(
         path,
         true,
         source,
         protected_roots.as_paths(),
+        allow_parent_of_protected,
     )
 }
 
@@ -148,6 +280,11 @@ pub(crate) fn default_profile_groups() -> Result<Vec<String>> {
     let profile = crate::policy::get_policy_profile("default")?
         .ok_or_else(|| NonoError::ProfileNotFound("default".to_string()))?;
     Ok(profile.security.groups)
+}
+
+#[must_use]
+pub(crate) fn retains_missing_exact_file_grants() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// Extension trait for CapabilitySet to add CLI-specific construction methods.
@@ -181,7 +318,7 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Directory permissions (canonicalize handles existence check atomically)
         for path in &args.allow {
-            validate_requested_dir(path, "CLI", &protected_roots)?;
+            validate_requested_dir(path, "CLI", &protected_roots, false)?;
             if let Some(cap) =
                 try_new_dir(path, AccessMode::ReadWrite, "Skipping non-existent path")?
             {
@@ -190,14 +327,14 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path in &args.read {
-            validate_requested_dir(path, "CLI", &protected_roots)?;
+            validate_requested_dir(path, "CLI", &protected_roots, false)?;
             if let Some(cap) = try_new_dir(path, AccessMode::Read, "Skipping non-existent path")? {
                 caps.add_fs(cap);
             }
         }
 
         for path in &args.write {
-            validate_requested_dir(path, "CLI", &protected_roots)?;
+            validate_requested_dir(path, "CLI", &protected_roots, false)?;
             if let Some(cap) = try_new_dir(path, AccessMode::Write, "Skipping non-existent path")? {
                 caps.add_fs(cap);
             }
@@ -205,7 +342,7 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Single file permissions
         for path in &args.allow_file {
-            validate_requested_file(path, "CLI", &protected_roots)?;
+            validate_requested_file(path, "CLI", &protected_roots, false)?;
             if let Some(cap) =
                 try_new_file(path, AccessMode::ReadWrite, "Skipping non-existent file")?
             {
@@ -214,14 +351,14 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path in &args.read_file {
-            validate_requested_file(path, "CLI", &protected_roots)?;
+            validate_requested_file(path, "CLI", &protected_roots, false)?;
             if let Some(cap) = try_new_file(path, AccessMode::Read, "Skipping non-existent file")? {
                 caps.add_fs(cap);
             }
         }
 
         for path in &args.write_file {
-            validate_requested_file(path, "CLI", &protected_roots)?;
+            validate_requested_file(path, "CLI", &protected_roots, false)?;
             if let Some(cap) = try_new_file(path, AccessMode::Write, "Skipping non-existent file")?
             {
                 caps.add_fs(cap);
@@ -256,6 +393,7 @@ impl CapabilitySetExt for CapabilitySet {
     ) -> Result<(CapabilitySet, bool)> {
         let mut caps = CapabilitySet::new();
         let protected_roots = ProtectedRoots::from_defaults()?;
+        let allow_parent_of_protected = profile.allow_parent_of_protected.unwrap_or(false);
 
         // Resolve policy groups from the already-finalized profile.
         let loaded_policy = policy::load_embedded_policy()?;
@@ -272,7 +410,12 @@ impl CapabilitySetExt for CapabilitySet {
         // Directories with read+write access
         for path_template in &fs.allow {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_dir(&path, "Profile", &protected_roots)?;
+            validate_requested_dir(
+                &path,
+                "Profile",
+                &protected_roots,
+                allow_parent_of_protected,
+            )?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_dir(&path, AccessMode::ReadWrite, &label)? {
                 cap.source = CapabilitySource::Profile;
@@ -290,10 +433,20 @@ impl CapabilitySetExt for CapabilitySet {
                 .unwrap_or(false);
 
             let maybe_cap = if reads_file {
-                validate_requested_file(&path, "Profile", &protected_roots)?;
+                validate_requested_file(
+                    &path,
+                    "Profile",
+                    &protected_roots,
+                    allow_parent_of_protected,
+                )?;
                 try_new_file(&path, AccessMode::Read, &label)?
             } else {
-                validate_requested_dir(&path, "Profile", &protected_roots)?;
+                validate_requested_dir(
+                    &path,
+                    "Profile",
+                    &protected_roots,
+                    allow_parent_of_protected,
+                )?;
                 try_new_dir(&path, AccessMode::Read, &label)?
             };
 
@@ -306,7 +459,12 @@ impl CapabilitySetExt for CapabilitySet {
         // Directories with write-only access
         for path_template in &fs.write {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_dir(&path, "Profile", &protected_roots)?;
+            validate_requested_dir(
+                &path,
+                "Profile",
+                &protected_roots,
+                allow_parent_of_protected,
+            )?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_dir(&path, AccessMode::Write, &label)? {
                 cap.source = CapabilitySource::Profile;
@@ -317,9 +475,14 @@ impl CapabilitySetExt for CapabilitySet {
         // Single files with read+write access
         for path_template in &fs.allow_file {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_file(&path, "Profile", &protected_roots)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_file(&path, AccessMode::ReadWrite, &label)? {
+            if let Some(mut cap) = try_new_profile_exact_path(
+                &path,
+                AccessMode::ReadWrite,
+                &label,
+                &protected_roots,
+                allow_parent_of_protected,
+            )? {
                 // Also allow atomic-write temp files (e.g. .claude.json.tmp.PID.TS).
                 // Many tools write to a temp file then rename for crash safety.
                 add_atomic_write_rule(&mut caps, &cap)?;
@@ -331,9 +494,14 @@ impl CapabilitySetExt for CapabilitySet {
         // Single files with read-only access
         for path_template in &fs.read_file {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_file(&path, "Profile", &protected_roots)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_file(&path, AccessMode::Read, &label)? {
+            if let Some(mut cap) = try_new_profile_exact_path(
+                &path,
+                AccessMode::Read,
+                &label,
+                &protected_roots,
+                allow_parent_of_protected,
+            )? {
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
             }
@@ -342,9 +510,14 @@ impl CapabilitySetExt for CapabilitySet {
         // Single files with write-only access
         for path_template in &fs.write_file {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_file(&path, "Profile", &protected_roots)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_file(&path, AccessMode::Write, &label)? {
+            if let Some(mut cap) = try_new_profile_exact_path(
+                &path,
+                AccessMode::Write,
+                &label,
+                &protected_roots,
+                allow_parent_of_protected,
+            )? {
                 add_atomic_write_rule(&mut caps, &cap)?;
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
@@ -359,6 +532,7 @@ impl CapabilitySetExt for CapabilitySet {
             &protected_roots,
             &mut caps,
             "Profile policy path",
+            allow_parent_of_protected,
         )?;
         apply_profile_dir_allows(
             &profile.policy.add_allow_read,
@@ -367,6 +541,7 @@ impl CapabilitySetExt for CapabilitySet {
             &protected_roots,
             &mut caps,
             "Profile policy path",
+            allow_parent_of_protected,
         )?;
         apply_profile_dir_allows(
             &profile.policy.add_allow_write,
@@ -375,6 +550,7 @@ impl CapabilitySetExt for CapabilitySet {
             &protected_roots,
             &mut caps,
             "Profile policy path",
+            allow_parent_of_protected,
         )?;
 
         for path_template in &profile.policy.add_deny_access {
@@ -500,8 +676,8 @@ fn finalize_caps(
     policy::validate_deny_overlaps(&resolved.deny_paths, caps)?;
 
     // Keep broad keychain deny groups active, but allow explicit
-    // login.keychain-db read grants (profile/CLI) on macOS.
-    policy::apply_macos_login_keychain_exception(caps);
+    // keychain DB read grants (profile/CLI) on macOS.
+    policy::apply_macos_keychain_db_exception(caps);
 
     // Deduplicate capabilities
     caps.deduplicate();
@@ -557,21 +733,21 @@ fn add_cli_overrides(caps: &mut CapabilitySet, args: &SandboxArgs) -> Result<()>
 
     // Additional directories from CLI
     for path in &args.allow {
-        validate_requested_dir(path, "CLI", &protected_roots)?;
+        validate_requested_dir(path, "CLI", &protected_roots, false)?;
         if let Some(cap) = try_new_dir(path, AccessMode::ReadWrite, "Skipping non-existent path")? {
             caps.add_fs(cap);
         }
     }
 
     for path in &args.read {
-        validate_requested_dir(path, "CLI", &protected_roots)?;
+        validate_requested_dir(path, "CLI", &protected_roots, false)?;
         if let Some(cap) = try_new_dir(path, AccessMode::Read, "Skipping non-existent path")? {
             caps.add_fs(cap);
         }
     }
 
     for path in &args.write {
-        validate_requested_dir(path, "CLI", &protected_roots)?;
+        validate_requested_dir(path, "CLI", &protected_roots, false)?;
         if let Some(cap) = try_new_dir(path, AccessMode::Write, "Skipping non-existent path")? {
             caps.add_fs(cap);
         }
@@ -579,7 +755,7 @@ fn add_cli_overrides(caps: &mut CapabilitySet, args: &SandboxArgs) -> Result<()>
 
     // Additional files from CLI
     for path in &args.allow_file {
-        validate_requested_file(path, "CLI", &protected_roots)?;
+        validate_requested_file(path, "CLI", &protected_roots, false)?;
         if let Some(cap) = try_new_file(path, AccessMode::ReadWrite, "Skipping non-existent file")?
         {
             caps.add_fs(cap);
@@ -587,14 +763,14 @@ fn add_cli_overrides(caps: &mut CapabilitySet, args: &SandboxArgs) -> Result<()>
     }
 
     for path in &args.read_file {
-        validate_requested_file(path, "CLI", &protected_roots)?;
+        validate_requested_file(path, "CLI", &protected_roots, false)?;
         if let Some(cap) = try_new_file(path, AccessMode::Read, "Skipping non-existent file")? {
             caps.add_fs(cap);
         }
     }
 
     for path in &args.write_file {
-        validate_requested_file(path, "CLI", &protected_roots)?;
+        validate_requested_file(path, "CLI", &protected_roots, false)?;
         if let Some(cap) = try_new_file(path, AccessMode::Write, "Skipping non-existent file")? {
             caps.add_fs(cap);
         }
@@ -826,6 +1002,153 @@ mod tests {
                 cap.is_file && cap.access == AccessMode::Read && cap.resolved == resolved_file
             }),
             "filesystem.read file entries should be granted as read-only file capabilities"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_from_profile_allow_file_keeps_missing_exact_file_on_macos() {
+        let dir = tempdir().expect("tmpdir");
+        let missing_file = dir.path().join("future.lock");
+        let expected_resolved = dir.path().canonicalize().expect("canonicalize dir").join(
+            missing_file
+                .file_name()
+                .expect("future file should have file name"),
+        );
+
+        let profile_path = dir.path().join("missing-file-profile.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                "meta": {{ "name": "missing-file-profile" }},
+                "filesystem": {{ "allow_file": ["{}"] }}
+            }}"#,
+                missing_file.display()
+            ),
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+
+        assert!(
+            caps.fs_capabilities().iter().any(|cap| {
+                cap.is_file
+                    && cap.access == AccessMode::ReadWrite
+                    && cap.original == missing_file
+                    && cap.resolved == expected_resolved
+            }),
+            "macOS profiles should preserve explicit missing exact-file grants"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_from_args_allow_file_resolves_parent_symlinks_for_missing_file_on_macos() {
+        let dir = tempdir().expect("tmpdir");
+        let target_dir = dir.path().join("target");
+        let link_dir = dir.path().join("link");
+        std::fs::create_dir_all(&target_dir).expect("create target dir");
+        std::os::unix::fs::symlink(&target_dir, &link_dir).expect("create symlink");
+
+        let missing_file = link_dir.join("future.lock");
+        let resolved_file = target_dir
+            .canonicalize()
+            .expect("canonicalize target dir")
+            .join("future.lock");
+        let args = SandboxArgs {
+            allow_file: vec![missing_file.clone()],
+            ..sandbox_args()
+        };
+
+        let (caps, _) = from_args_locked(&args).expect("build caps");
+
+        assert!(
+            caps.fs_capabilities().iter().any(|cap| {
+                cap.is_file
+                    && cap.access == AccessMode::ReadWrite
+                    && cap.original == missing_file
+                    && cap.resolved == resolved_file
+            }),
+            "macOS CLI exact-file grants should preserve original path and resolve parent symlinks"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_from_profile_allow_file_falls_back_to_exact_directory_when_present() {
+        let dir = tempdir().expect("tmpdir");
+        let lock_dir = dir.path().join("claude.lock");
+        std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+        let resolved_dir = lock_dir.canonicalize().expect("canonicalize lock dir");
+        let child = lock_dir.join("nested.txt");
+
+        let profile_path = dir.path().join("lock-dir-profile.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                "meta": {{ "name": "lock-dir-profile" }},
+                "filesystem": {{ "allow_file": ["{}"] }}
+            }}"#,
+                lock_dir.display()
+            ),
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+
+        assert!(
+            caps.fs_capabilities().iter().any(|cap| {
+                cap.is_file
+                    && cap.access == AccessMode::ReadWrite
+                    && cap.original == lock_dir
+                    && cap.resolved == resolved_dir
+            }),
+            "macOS profiles should preserve exact-path semantics when an allow_file entry resolves to a directory"
+        );
+        assert!(
+            !caps.path_covered(&child),
+            "exact-path fallback must not recursively cover descendants"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_from_profile_allow_file_rejects_directory_when_exact_dir_unsupported() {
+        let dir = tempdir().expect("tmpdir");
+        let lock_dir = dir.path().join("claude.lock");
+        std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+
+        let profile_path = dir.path().join("lock-dir-profile.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                "meta": {{ "name": "lock-dir-profile" }},
+                "filesystem": {{ "allow_file": ["{}"] }}
+            }}"#,
+                lock_dir.display()
+            ),
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let err = from_profile_locked(&profile, workdir.path(), &args).expect_err("should fail");
+        assert!(
+            matches!(err, NonoError::ExpectedFile(ref p) if p == &lock_dir),
+            "expected exact-file entries resolving to directories to fail closed, got: {err}"
         );
     }
 
@@ -1681,6 +2004,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_regex_escape_path_dots() {
         assert_eq!(
@@ -1715,11 +2039,13 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_regex_escape_path_no_metacharacters() {
         assert_eq!(regex_escape_path("/usr/local/bin"), "/usr/local/bin");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_regex_escape_path_special_chars() {
         assert_eq!(

@@ -79,6 +79,13 @@
       ],
       "description": "Opt-in gate for temporary direct LaunchServices opens on macOS. Must be paired with the CLI flag --allow-launch-services. Set to null to inherit from the base profile."
     },
+    "allow_gpu": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "null" }
+      ],
+      "description": "Opt-in gate for GPU access on Apple Silicon Macs through IOKit. Must be paired with the CLI flag --allow-gpu. Set to null to inherit from the base profile."
+    },
     "interactive": {
       "type": "boolean",
       "description": "Deprecated. Parsed for backward compatibility but ignored. Supervised mode preserves TTY by default.",

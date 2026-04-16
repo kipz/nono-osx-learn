@@ -430,9 +430,9 @@
       "description": "Claude Code macOS-specific state and credential paths",
       "platform": "macos",
       "allow": {
-        "read": [
+        "readwrite": [
           "$HOME/Library/Keychains/login.keychain-db",
-          "$HOME/.local/share/claude"
+          "$HOME/Library/Keychains/metadata.keychain-db"
         ]
       }
     },
@@ -449,8 +449,9 @@
       "description": "Codex macOS-specific state and credential paths",
       "platform": "macos",
       "allow": {
-        "read": [
-          "$HOME/Library/Keychains/login.keychain-db"
+        "readwrite": [
+          "$HOME/Library/Keychains/login.keychain-db",
+          "$HOME/Library/Keychains/metadata.keychain-db"
         ]
       }
     },
@@ -666,7 +667,11 @@
       },
       "filesystem": {
         "allow": ["$HOME/.claude", "$HOME/.cache/claude"],
-        "allow_file": ["$HOME/.claude.json", "$HOME/.claude.json.lock"]
+        "allow_file": [
+          "$HOME/.claude.json",
+          "$HOME/.claude.json.lock",
+          "$HOME/.claude.lock"
+        ]
       },
       "network": { "block": false },
       "workdir": { "access": "readwrite" },
