@@ -685,7 +685,7 @@ fn cmd_show(args: PolicyShowArgs) -> Result<()> {
     }
 
     // Raw Seatbelt rules — surfaced prominently so it is obvious a profile uses them.
-    #[cfg(target_os = "macos")]
+    // Shown on all platforms so cross-platform auditing is possible.
     if !profile.unsafe_macos_seatbelt_rules.is_empty() {
         println!();
         println!(

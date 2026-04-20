@@ -130,6 +130,8 @@ pub struct ProfileDef {
     pub packs: Vec<String>,
     #[serde(default)]
     pub command_args: Vec<String>,
+    #[serde(default)]
+    pub unsafe_macos_seatbelt_rules: Vec<String>,
 }
 
 impl ProfileDef {
@@ -166,7 +168,7 @@ impl ProfileDef {
             skipdirs: Vec::new(),
             packs: self.packs.clone(),
             command_args: self.command_args.clone(),
-            unsafe_macos_seatbelt_rules: Vec::new(),
+            unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
         }
     }
 }
