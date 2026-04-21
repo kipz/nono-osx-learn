@@ -2,11 +2,15 @@
 //!
 //! Handles `nono audit list|show` for viewing the audit trail of sandboxed sessions.
 
+use crate::audit_integrity::verify_audit_log;
+use crate::audit_ledger::verify_session_in_ledger;
 use crate::audit_session::{
     discover_sessions, format_bytes, is_legacy_audit_only_session, is_primary_audit_session,
     load_session, remove_session, SessionInfo,
 };
-use crate::cli::{AuditArgs, AuditCleanupArgs, AuditCommands, AuditListArgs, AuditShowArgs};
+use crate::cli::{
+    AuditArgs, AuditCleanupArgs, AuditCommands, AuditListArgs, AuditShowArgs, AuditVerifyArgs,
+};
 use crate::theme;
 use colored::Colorize;
 use nono::undo::SnapshotManager;
@@ -25,6 +29,7 @@ pub fn run_audit(args: AuditArgs) -> Result<()> {
     match args.command {
         AuditCommands::List(args) => cmd_list(args),
         AuditCommands::Show(args) => cmd_show(args),
+        AuditCommands::Verify(args) => cmd_verify(args),
         AuditCommands::Cleanup(args) => cmd_cleanup(args),
     }
 }
@@ -371,6 +376,97 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
+    let session = load_session(&args.session_id)?;
+    let result = verify_audit_log(&session.dir, session.metadata.audit_integrity.as_ref())?;
+    let ledger = verify_session_in_ledger(&session.metadata)?;
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "session": result,
+            "ledger": ledger,
+        }))
+        .map_err(|e| NonoError::Snapshot(format!("JSON serialization failed: {e}")))?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    let verified = result.records_verified
+        && result.event_count_matches
+        && result.chain_head_matches
+        && result.merkle_root_matches
+        && ledger.session_found
+        && ledger.session_digest_matches
+        && ledger.ledger_chain_verified;
+    let status = if verified {
+        "VERIFIED".green().bold()
+    } else {
+        "MISMATCH".red().bold()
+    };
+
+    eprintln!(
+        "{} Audit integrity for session {} {}",
+        prefix(),
+        session.metadata.session_id.white().bold(),
+        status
+    );
+    eprintln!("  Events:   {}", result.event_count);
+    eprintln!(
+        "  Chain:    {}",
+        result
+            .computed_chain_head
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    eprintln!(
+        "  Root:     {}",
+        result
+            .computed_merkle_root
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    eprintln!("  Scheme:   {}", result.merkle_scheme);
+
+    if session.metadata.audit_integrity.is_some() {
+        eprintln!(
+            "  Stored:   events={}, chain={}, root={}",
+            result
+                .stored_event_count
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            result
+                .stored_chain_head
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            result
+                .stored_merkle_root
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+    eprintln!(
+        "  Ledger:   {} (entries={}, head={})",
+        if ledger.session_found && ledger.session_digest_matches && ledger.ledger_chain_verified {
+            "verified".green().bold().to_string()
+        } else {
+            "mismatch".red().bold().to_string()
+        },
+        ledger.entry_count,
+        ledger
+            .ledger_head
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+
+    if verified {
+        Ok(())
+    } else {
+        Err(NonoError::Snapshot(
+            "Audit integrity verification failed".to_string(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

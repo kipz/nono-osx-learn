@@ -1,4 +1,5 @@
 use crate::audit_integrity::AuditRecorder;
+use crate::audit_ledger;
 use crate::launch_runtime::{rollback_base_exclusions, RollbackLaunchOptions};
 use crate::{config, output, rollback_preflight, rollback_session, rollback_ui};
 use nono::{AccessMode, CapabilitySet, Result};
@@ -486,6 +487,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         manager.save_session_metadata(&meta)?;
         if let Some(audit_state) = audit_state {
             nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
+            audit_ledger::append_session(&meta)?;
         }
         audit_saved = true;
 
@@ -523,6 +525,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                 audit_integrity,
             };
             nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
+            audit_ledger::append_session(&meta)?;
         }
     }
 

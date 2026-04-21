@@ -1694,6 +1694,8 @@ pub enum AuditCommands {
     List(AuditListArgs),
     /// Show audit details for a session
     Show(AuditShowArgs),
+    /// Verify audit integrity by recomputing hashes from the event log
+    Verify(AuditVerifyArgs),
     /// Remove old audit sessions
     Cleanup(AuditCleanupArgs),
 }
@@ -1737,6 +1739,21 @@ pub struct AuditListArgs {
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct AuditShowArgs {
+    /// Session ID (e.g., 20260214-143022-12345)
+    pub session_id: String,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AuditVerifyArgs {
     /// Session ID (e.g., 20260214-143022-12345)
     pub session_id: String,
 
@@ -2337,6 +2354,21 @@ mod tests {
                     assert!(show_args.json);
                 }
                 _ => panic!("Expected Show subcommand"),
+            },
+            _ => panic!("Expected Audit command"),
+        }
+    }
+
+    #[test]
+    fn test_audit_verify() {
+        let cli = Cli::parse_from(["nono", "audit", "verify", "20260214-143022-12345", "--json"]);
+        match cli.command {
+            Commands::Audit(args) => match args.command {
+                AuditCommands::Verify(verify_args) => {
+                    assert_eq!(verify_args.session_id, "20260214-143022-12345");
+                    assert!(verify_args.json);
+                }
+                _ => panic!("Expected Verify subcommand"),
             },
             _ => panic!("Expected Audit command"),
         }
