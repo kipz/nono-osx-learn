@@ -246,6 +246,33 @@ fn apply_profile_dir_allows(
     Ok(())
 }
 
+fn override_has_matching_user_intent_grant(
+    caps: &CapabilitySet,
+    override_path: &Path,
+) -> Result<bool> {
+    let canonical = if override_path.exists() {
+        override_path
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: override_path.to_path_buf(),
+                source,
+            })?
+    } else {
+        override_path.to_path_buf()
+    };
+
+    Ok(caps.fs_capabilities().iter().any(|cap| {
+        if !cap.source.is_user_intent() {
+            return false;
+        }
+        if cap.is_file {
+            cap.resolved == canonical
+        } else {
+            canonical.starts_with(&cap.resolved)
+        }
+    }))
+}
+
 fn validate_requested_dir(
     path: &Path,
     source: &str,
@@ -623,7 +650,9 @@ impl CapabilitySetExt for CapabilitySet {
         let mut profile_overrides = Vec::with_capacity(profile.policy.override_deny.len());
         for path_template in &profile.policy.override_deny {
             let path = expand_vars(path_template, workdir)?;
-            profile_overrides.push(path);
+            if override_has_matching_user_intent_grant(&caps, &path)? {
+                profile_overrides.push(path);
+            }
         }
 
         finalize_caps(
@@ -1597,10 +1626,12 @@ mod tests {
     }
 
     #[test]
-    fn test_from_profile_policy_override_deny_requires_matching_grant() {
+    fn test_cli_override_deny_requires_matching_grant() {
         // Override path is under temp dir which is covered by system groups,
         // but the grant check requires user-intent sources (User/Profile),
-        // so group coverage is not sufficient.
+        // so group coverage is not sufficient. Profile-level override_deny
+        // entries may be skipped when their platform-specific grants do not
+        // resolve on the current platform; CLI overrides should still fail.
         let dir = tempdir().expect("tmpdir");
         let denied = dir.path().join("denied_no_grant");
         std::fs::create_dir_all(&denied).expect("mkdir denied");
@@ -1612,8 +1643,7 @@ mod tests {
                 r#"{{
                     "meta": {{ "name": "override-deny-no-grant" }},
                     "policy": {{
-                        "add_deny_access": ["{path}"],
-                        "override_deny": ["{path}"]
+                        "add_deny_access": ["{path}"]
                     }}
                 }}"#,
                 path = denied.display()
@@ -1623,10 +1653,13 @@ mod tests {
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
 
         let workdir = tempdir().expect("workdir");
-        let args = sandbox_args();
+        let args = SandboxArgs {
+            override_deny: vec![denied.clone()],
+            ..sandbox_args()
+        };
 
         let err = from_profile_locked(&profile, workdir.path(), &args)
-            .expect_err("override_deny without user-intent grant should fail");
+            .expect_err("CLI override_deny without user-intent grant should fail");
         assert!(
             err.to_string().contains("no matching grant"),
             "unexpected error: {err}"
