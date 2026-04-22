@@ -170,7 +170,10 @@ The audit trail is intentionally narrow in what it claims to prove.
 - The event log is recorded by the trusted supervisor, not by the sandboxed child.
 - The default integrity structure protects the audit event stream for a single session and also records that session into the global audit ledger.
 - Without a future external signature or anchor, this is still host-local tamper evidence, not third-party attestation.
-- `argv` is recorded, but the launched executable binary is not currently hashed. The audit trail tells you what command string ran, not the exact binary bytes that the kernel executed.
+- For supervised runs, the supervisor hashes the main executable binary selected for launch and records its canonical path and SHA-256 digest.
+- That executable hash is still subject to a small hash-to-exec race window. nono hashes the file before `exec`, but does not yet `fexecve` from the same already-open file descriptor.
+- Only the main executable (`argv[0]` after resolution) is hashed. For `bash script.sh`, this commits `/bin/bash`, not `script.sh`, shared libraries, interpreters in a launch chain, or dynamically loaded plugins/modules.
+- Direct and monitor-style execution paths do not currently populate executable identity; this metadata is recorded by the supervised path.
 - `--audit-integrity` records filesystem-state Merkle roots over tracked writable paths, but it does not capture rollback objects or restore data. Use `--rollback` for that.
 - Filesystem-state hashing does not attest the full runtime closure of a process. Shared libraries, interpreters, dynamically loaded plugins, and other runtime dependencies are not committed unless separately recorded.
 - `network_events` and rollback metadata are separate recorded structures. They are not a claim of full system provenance or full host compromise detection.

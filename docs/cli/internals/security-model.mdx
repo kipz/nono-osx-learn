@@ -260,7 +260,9 @@ The audit subsystem has a narrower security claim than the sandbox itself.
 - The supervisor is trusted to record events honestly and completely. The sandboxed child cannot write its own audit log, but the audit log still depends on supervisor correctness.
 - Session-local hashes are not, by themselves, sufficient history integrity. nono therefore records audited sessions into a global audit ledger as sessions complete.
 - The current ledger is still local host state. Without a future signature or external anchor, a host attacker who can rewrite both the session files and the ledger can forge a self-consistent history.
-- The audit log records command strings and supervisor-observed events. It does not yet hash the launched executable binary, shared libraries, interpreters, or dynamic runtime dependencies.
+- For supervised sessions, the supervisor hashes the resolved main executable binary and binds that `{ resolved_path, sha256 }` identity into session metadata and the global audit ledger.
+- That executable identity is not full runtime provenance. Shared libraries, interpreter chains, scripts passed as arguments, and dynamically loaded runtime dependencies are not covered by that binary hash.
+- The executable hash is computed before `exec`, not from the final kernel-loaded file descriptor. A privileged attacker with write access to the executable path could still race between hash and execution.
 - Filesystem Merkle roots under `--audit-integrity` or `--rollback` commit tracked writable paths, not the full machine state.
 
 The correct way to read the feature today is:

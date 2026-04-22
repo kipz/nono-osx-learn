@@ -1,19 +1,19 @@
 use crate::audit_session::audit_root;
 use nix::fcntl::{Flock, FlockArg};
-use nono::undo::{
-    AuditIntegritySummary, ContentHash, ExecutableIdentity, NetworkAuditEvent, SessionMetadata,
-};
+use nono::undo::{AuditIntegritySummary, ContentHash, NetworkAuditEvent, SessionMetadata};
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 const AUDIT_LEDGER_FILENAME: &str = "ledger.ndjson";
 const AUDIT_LEDGER_LOCK_FILENAME: &str = "ledger.lock";
-const SESSION_DIGEST_DOMAIN: &[u8] = b"nono.audit.session-digest.v1\n";
-const LEDGER_CHAIN_DOMAIN: &[u8] = b"nono.audit.ledger.chain.v1\n";
+const SESSION_DIGEST_DOMAIN: &[u8] = b"nono.audit.session-digest.alpha\n";
+const LEDGER_CHAIN_DOMAIN: &[u8] = b"nono.audit.ledger.chain.alpha\n";
 const LEDGER_HASH_ALGORITHM: &str = "sha256";
 
 #[derive(Serialize)]
@@ -22,14 +22,20 @@ struct SessionDigestPayload<'a> {
     started: &'a str,
     ended: &'a Option<String>,
     command: &'a [String],
-    executable_identity: &'a Option<ExecutableIdentity>,
-    tracked_paths: &'a [PathBuf],
+    executable_identity: Option<ExecutableIdentityDigestPayload>,
+    tracked_paths: Vec<Vec<u8>>,
     snapshot_count: u32,
     exit_code: &'a Option<i32>,
     merkle_roots: &'a [ContentHash],
     network_events: &'a [NetworkAuditEvent],
     audit_event_count: u64,
     audit_integrity: &'a Option<AuditIntegritySummary>,
+}
+
+#[derive(Serialize)]
+struct ExecutableIdentityDigestPayload {
+    resolved_path: Vec<u8>,
+    sha256: ContentHash,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -67,8 +73,17 @@ pub(crate) fn compute_session_digest(metadata: &SessionMetadata) -> Result<Conte
         started: &metadata.started,
         ended: &metadata.ended,
         command: &metadata.command,
-        executable_identity: &metadata.executable_identity,
-        tracked_paths: &metadata.tracked_paths,
+        executable_identity: metadata.executable_identity.as_ref().map(|identity| {
+            ExecutableIdentityDigestPayload {
+                resolved_path: path_bytes(&identity.resolved_path),
+                sha256: identity.sha256,
+            }
+        }),
+        tracked_paths: metadata
+            .tracked_paths
+            .iter()
+            .map(|path| path_bytes(path))
+            .collect(),
         snapshot_count: metadata.snapshot_count,
         exit_code: &metadata.exit_code,
         merkle_roots: &metadata.merkle_roots,
@@ -83,6 +98,16 @@ pub(crate) fn compute_session_digest(metadata: &SessionMetadata) -> Result<Conte
     hasher.update(SESSION_DIGEST_DOMAIN);
     hasher.update(bytes);
     Ok(ContentHash::from_bytes(hasher.finalize().into()))
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
 }
 
 pub(crate) fn append_session(metadata: &SessionMetadata) -> Result<LedgerRecord> {
@@ -325,7 +350,11 @@ fn hash_ledger_link(
 mod tests {
     use super::*;
     use crate::test_env::{EnvVarGuard, ENV_LOCK};
-    use nono::undo::{NetworkAuditDecision, NetworkAuditMode};
+    use nono::undo::{ExecutableIdentity, NetworkAuditDecision, NetworkAuditMode};
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     fn sample_metadata(id: &str) -> SessionMetadata {
         SessionMetadata {
@@ -452,5 +481,23 @@ mod tests {
             merkle_root: ContentHash::from_bytes([3; 32]),
         });
         assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_digest_distinguishes_non_utf8_paths() {
+        let mut base = sample_metadata("20260421-200000-11111");
+        base.tracked_paths = vec![PathBuf::from(OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', b'/', 0xff,
+        ]))];
+        let mut changed = base.clone();
+        changed.tracked_paths = vec![PathBuf::from(OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', b'/', 0xfe,
+        ]))];
+
+        assert_ne!(
+            compute_session_digest(&base).unwrap(),
+            compute_session_digest(&changed).unwrap()
+        );
     }
 }

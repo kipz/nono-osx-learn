@@ -8,10 +8,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const AUDIT_EVENTS_FILENAME: &str = "audit-events.ndjson";
-const EVENT_DOMAIN: &[u8] = b"nono.audit.event.v1\n";
-const CHAIN_DOMAIN: &[u8] = b"nono.audit.chain.v1\n";
-const MERKLE_NODE_DOMAIN_V2: &[u8] = b"nono.audit.merkle.node.v2\n";
-const MERKLE_NODE_DOMAIN_V3: &[u8] = b"nono.audit.merkle.node.v3\n";
+const EVENT_DOMAIN: &[u8] = b"nono.audit.event.alpha\n";
+const CHAIN_DOMAIN: &[u8] = b"nono.audit.chain.alpha\n";
+const MERKLE_NODE_DOMAIN_ALPHA: &[u8] = b"nono.audit.merkle.alpha\n";
+const MERKLE_SCHEME_LABEL: &str = "alpha";
 const HASH_ALGORITHM: &str = "sha256";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,24 +49,6 @@ pub(crate) struct AuditEventRecord {
     pub(crate) event: AuditEventPayload,
 }
 
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum MerkleScheme {
-    LegacyV1,
-    DomainSeparatedV2,
-    DomainSeparatedV3,
-}
-
-impl MerkleScheme {
-    fn label(self) -> &'static str {
-        match self {
-            Self::LegacyV1 => "legacy_v1",
-            Self::DomainSeparatedV2 => "domain_separated_v2",
-            Self::DomainSeparatedV3 => "domain_separated_v3",
-        }
-    }
-}
-
 #[derive(Serialize)]
 pub(crate) struct AuditVerificationResult {
     pub(crate) hash_algorithm: String,
@@ -78,8 +60,6 @@ pub(crate) struct AuditVerificationResult {
     pub(crate) stored_chain_head: Option<ContentHash>,
     pub(crate) stored_merkle_root: Option<ContentHash>,
     pub(crate) event_count_matches: bool,
-    pub(crate) chain_head_matches: bool,
-    pub(crate) merkle_root_matches: bool,
     pub(crate) records_verified: bool,
 }
 
@@ -150,7 +130,7 @@ impl AuditRecorder {
 
     pub(crate) fn finalize(&self) -> Option<AuditIntegritySummary> {
         let chain_head = self.previous_chain?;
-        let merkle_root = merkle_root(&self.leaf_hashes, MerkleScheme::DomainSeparatedV3);
+        let merkle_root = merkle_root(&self.leaf_hashes);
         Some(AuditIntegritySummary {
             hash_algorithm: HASH_ALGORITHM.to_string(),
             event_count: self.event_count(),
@@ -209,7 +189,7 @@ fn hash_chain(previous: Option<&ContentHash>, leaf_hash: &ContentHash) -> Conten
     ContentHash::from_bytes(hasher.finalize().into())
 }
 
-fn merkle_root(leaves: &[ContentHash], scheme: MerkleScheme) -> ContentHash {
+fn merkle_root(leaves: &[ContentHash]) -> ContentHash {
     if leaves.is_empty() {
         return ContentHash::from_bytes(Sha256::digest(b"").into());
     }
@@ -220,28 +200,13 @@ fn merkle_root(leaves: &[ContentHash], scheme: MerkleScheme) -> ContentHash {
         for pair in level.chunks(2) {
             let left = pair[0];
             if pair.len() == 1 {
-                match scheme {
-                    MerkleScheme::LegacyV1 | MerkleScheme::DomainSeparatedV2 => {
-                        let mut hasher = Sha256::new();
-                        if matches!(scheme, MerkleScheme::DomainSeparatedV2) {
-                            hasher.update(MERKLE_NODE_DOMAIN_V2);
-                        }
-                        hasher.update(left);
-                        hasher.update(left);
-                        next.push(hasher.finalize().into());
-                    }
-                    MerkleScheme::DomainSeparatedV3 => next.push(left),
-                }
+                next.push(left);
                 continue;
             }
 
             let right = pair[1];
             let mut hasher = Sha256::new();
-            match scheme {
-                MerkleScheme::LegacyV1 => {}
-                MerkleScheme::DomainSeparatedV2 => hasher.update(MERKLE_NODE_DOMAIN_V2),
-                MerkleScheme::DomainSeparatedV3 => hasher.update(MERKLE_NODE_DOMAIN_V3),
-            }
+            hasher.update(MERKLE_NODE_DOMAIN_ALPHA);
             hasher.update(left);
             hasher.update(right);
             next.push(hasher.finalize().into());
@@ -267,6 +232,7 @@ pub(crate) fn verify_audit_log(
     let mut previous_chain: Option<ContentHash> = None;
     let mut leaf_hashes = Vec::new();
     let mut computed_chain_head: Option<ContentHash> = None;
+    let mut missing_canonical_event_json = false;
 
     for (index, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| {
@@ -331,6 +297,7 @@ pub(crate) fn verify_audit_log(
             }
             raw.as_bytes().to_vec()
         } else {
+            missing_canonical_event_json = true;
             serde_json::to_vec(&record.event).map_err(|e| {
                 NonoError::Snapshot(format!(
                     "Failed to serialize audit event for verification at line {}: {e}",
@@ -359,36 +326,17 @@ pub(crate) fn verify_audit_log(
         leaf_hashes.push(leaf_hash);
     }
 
-    let computed_merkle_v3 = if leaf_hashes.is_empty() {
+    let computed_merkle_root = if leaf_hashes.is_empty() {
         None
     } else {
-        Some(merkle_root(&leaf_hashes, MerkleScheme::DomainSeparatedV3))
-    };
-    let computed_merkle_v2 = if leaf_hashes.is_empty() {
-        None
-    } else {
-        Some(merkle_root(&leaf_hashes, MerkleScheme::DomainSeparatedV2))
-    };
-    let computed_merkle_v1 = if leaf_hashes.is_empty() {
-        None
-    } else {
-        Some(merkle_root(&leaf_hashes, MerkleScheme::LegacyV1))
+        Some(merkle_root(&leaf_hashes))
     };
 
-    let (computed_merkle_root, merkle_scheme) = match stored {
-        Some(summary) => {
-            if computed_merkle_v3 == Some(summary.merkle_root) {
-                (computed_merkle_v3, MerkleScheme::DomainSeparatedV3)
-            } else if computed_merkle_v2 == Some(summary.merkle_root) {
-                (computed_merkle_v2, MerkleScheme::DomainSeparatedV2)
-            } else if computed_merkle_v1 == Some(summary.merkle_root) {
-                (computed_merkle_v1, MerkleScheme::LegacyV1)
-            } else {
-                (computed_merkle_v3, MerkleScheme::DomainSeparatedV3)
-            }
-        }
-        None => (computed_merkle_v3, MerkleScheme::DomainSeparatedV3),
-    };
+    if stored.is_some() && !leaf_hashes.is_empty() && missing_canonical_event_json {
+        return Err(NonoError::Snapshot(
+            "Alpha audit log is missing canonical event_json bytes".to_string(),
+        ));
+    }
 
     let stored_event_count = stored.map(|s| s.event_count);
     let stored_chain_head = stored.map(|s| s.chain_head);
@@ -397,16 +345,26 @@ pub(crate) fn verify_audit_log(
     let event_count_matches = stored_event_count
         .map(|count| count == event_count)
         .unwrap_or(true);
-    let chain_head_matches = stored_chain_head
-        .map(|head| Some(head) == computed_chain_head)
-        .unwrap_or(true);
-    let merkle_root_matches = stored_merkle_root
-        .map(|root| Some(root) == computed_merkle_root)
-        .unwrap_or(true);
+
+    if let Some(stored_head) = stored_chain_head {
+        if Some(stored_head) != computed_chain_head {
+            return Err(NonoError::Snapshot(
+                "Alpha audit log chain head mismatch".to_string(),
+            ));
+        }
+    }
+
+    if let Some(stored_root) = stored_merkle_root {
+        if Some(stored_root) != computed_merkle_root {
+            return Err(NonoError::Snapshot(
+                "Alpha audit log Merkle root mismatch".to_string(),
+            ));
+        }
+    }
 
     Ok(AuditVerificationResult {
         hash_algorithm: HASH_ALGORITHM.to_string(),
-        merkle_scheme: merkle_scheme.label().to_string(),
+        merkle_scheme: MERKLE_SCHEME_LABEL.to_string(),
         event_count,
         computed_chain_head,
         computed_merkle_root,
@@ -414,8 +372,6 @@ pub(crate) fn verify_audit_log(
         stored_chain_head,
         stored_merkle_root,
         event_count_matches,
-        chain_head_matches,
-        merkle_root_matches,
         records_verified: true,
     })
 }
@@ -455,76 +411,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(recorder.event_count(), 1);
-    }
-
-    #[test]
-    fn verifier_accepts_legacy_merkle_nodes_for_existing_logs() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
-        recorder
-            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
-            .unwrap();
-        recorder
-            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
-            .unwrap();
-
-        let mut summary = recorder.finalize().unwrap();
-        summary.merkle_root = merkle_root(
-            &[
-                hash_event(
-                    &serde_json::to_vec(&AuditEventPayload::SessionStarted {
-                        started: "2026-04-21T00:00:00Z".to_string(),
-                        command: vec!["pwd".to_string()],
-                    })
-                    .unwrap(),
-                ),
-                hash_event(
-                    &serde_json::to_vec(&AuditEventPayload::SessionEnded {
-                        ended: "2026-04-21T00:00:01Z".to_string(),
-                        exit_code: 0,
-                    })
-                    .unwrap(),
-                ),
-            ],
-            MerkleScheme::LegacyV1,
-        );
-
-        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
-        assert_eq!(verified.merkle_scheme, "legacy_v1");
-        assert!(verified.merkle_root_matches);
-    }
-
-    #[test]
-    fn verifier_accepts_previous_domain_separated_duplicate_leaf_scheme() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
-        recorder
-            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
-            .unwrap();
-        recorder
-            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
-            .unwrap();
-        recorder
-            .record_network_event(NetworkAuditEvent {
-                timestamp_unix_ms: 1,
-                mode: NetworkAuditMode::Connect,
-                decision: NetworkAuditDecision::Allow,
-                target: "example.com".to_string(),
-                port: Some(443),
-                method: None,
-                path: None,
-                status: None,
-                reason: None,
-            })
-            .unwrap();
-
-        let mut summary = recorder.finalize().unwrap();
-        let leaves = read_leaf_hashes(dir.path().join(AUDIT_EVENTS_FILENAME));
-        summary.merkle_root = merkle_root(&leaves, MerkleScheme::DomainSeparatedV2);
-
-        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
-        assert_eq!(verified.merkle_scheme, "domain_separated_v2");
-        assert!(verified.merkle_root_matches);
     }
 
     #[test]
@@ -587,22 +473,42 @@ mod tests {
         let summary = recorder.finalize().unwrap();
         let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
         assert_eq!(verified.event_count, 5);
-        assert_eq!(verified.merkle_scheme, "domain_separated_v3");
+        assert_eq!(verified.merkle_scheme, "alpha");
         assert!(verified.records_verified);
-        assert!(verified.chain_head_matches);
-        assert!(verified.merkle_root_matches);
     }
 
-    fn read_leaf_hashes(path: PathBuf) -> Vec<ContentHash> {
-        let contents = std::fs::read_to_string(path).unwrap();
-        contents
+    #[test]
+    fn verifier_rejects_alpha_records_missing_event_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+
+        let path = dir.path().join(AUDIT_EVENTS_FILENAME);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let rewritten = contents
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
-                serde_json::from_str::<AuditEventRecord>(line)
-                    .unwrap()
-                    .leaf_hash
+                let mut record: AuditEventRecord = serde_json::from_str(line).unwrap();
+                record.event_json = None;
+                serde_json::to_string(&record).unwrap()
             })
-            .collect()
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{rewritten}\n")).unwrap();
+
+        let summary = recorder.finalize().unwrap();
+        let err = match verify_audit_log(dir.path(), Some(&summary)) {
+            Ok(_) => panic!("alpha verification should reject records missing event_json"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("missing canonical event_json bytes"));
     }
 }

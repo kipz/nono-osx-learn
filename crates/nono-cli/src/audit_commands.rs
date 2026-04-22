@@ -395,8 +395,6 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
 
     let verified = result.records_verified
         && result.event_count_matches
-        && result.chain_head_matches
-        && result.merkle_root_matches
         && ledger.session_found
         && ledger.session_digest_matches
         && ledger.ledger_chain_verified;
