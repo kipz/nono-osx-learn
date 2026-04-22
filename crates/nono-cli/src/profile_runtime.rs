@@ -1,5 +1,6 @@
 use crate::cli::SandboxArgs;
-use crate::{hooks, profile};
+use crate::{hooks, package, profile};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -24,14 +25,21 @@ pub(crate) struct PreparedProfile {
     pub(crate) allow_gpu: bool,
     pub(crate) allow_parent_of_protected: bool,
     pub(crate) override_deny_paths: Vec<PathBuf>,
+    pub(crate) allowed_env_vars: Option<Vec<String>>,
 }
 
-fn install_profile_hooks(profile: &profile::Profile, silent: bool) {
+#[derive(Clone, Copy)]
+struct PrepareProfileOptions {
+    install_hooks: bool,
+    hook_output_silent: bool,
+}
+
+fn install_profile_hooks(profile_name: Option<&str>, profile: &profile::Profile, silent: bool) {
     if profile.hooks.hooks.is_empty() {
         return;
     }
 
-    match hooks::install_profile_hooks(&profile.hooks.hooks) {
+    match hooks::install_profile_hooks(profile_name, &profile.hooks.hooks) {
         Ok(results) => {
             for (target, result) in results {
                 match result {
@@ -60,6 +68,168 @@ fn install_profile_hooks(profile: &profile::Profile, silent: bool) {
             }
         }
     }
+}
+
+/// Verify that all packs declared in the profile are installed and intact.
+///
+/// For each pack:
+/// 1. Check the pack directory exists
+/// 2. Verify artifact SHA-256 digests against the lockfile
+/// 3. Re-verify Sigstore bundles from the stored `.nono-trust.bundle` file
+fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
+    if packs.is_empty() {
+        return Ok(());
+    }
+
+    let lockfile = package::read_lockfile()?;
+
+    for pack_ref in packs {
+        let parts: Vec<&str> = pack_ref.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            return Err(nono::NonoError::PackageInstall(format!(
+                "invalid pack reference '{}': expected <namespace>/<name>",
+                pack_ref
+            )));
+        }
+        let (namespace, name) = (parts[0], parts[1]);
+
+        let install_dir = package::package_install_dir(namespace, name)?;
+        if !install_dir.exists() {
+            tracing::warn!(
+                "Pack '{}' declared by profile but not installed. \
+                 Install it with: nono pull {}",
+                pack_ref,
+                pack_ref
+            );
+            continue;
+        }
+
+        let locked = lockfile.packages.get(pack_ref);
+        if let Some(locked_pkg) = locked {
+            for (artifact_name, locked_artifact) in &locked_pkg.artifacts {
+                let artifact_path = install_dir.join(artifact_name);
+                if !artifact_path.exists() {
+                    return Err(nono::NonoError::PackageInstall(format!(
+                        "pack '{}' is missing artifact '{}'. Reinstall with: nono pull {} --force",
+                        pack_ref, artifact_name, pack_ref
+                    )));
+                }
+
+                let bytes = std::fs::read(&artifact_path).map_err(|e| {
+                    nono::NonoError::PackageInstall(format!(
+                        "failed to read artifact '{}' in pack '{}': {}",
+                        artifact_name, pack_ref, e
+                    ))
+                })?;
+                let digest = Sha256::digest(&bytes);
+                let hash = digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                if hash != locked_artifact.sha256 {
+                    return Err(nono::NonoError::PackageInstall(format!(
+                        "pack '{}' artifact '{}' has been tampered with.\n\
+                         Expected: {}\n\
+                         Found:    {}\n\
+                         Reinstall with: nono pull {} --force",
+                        pack_ref, artifact_name, locked_artifact.sha256, hash, pack_ref
+                    )));
+                }
+            }
+        }
+
+        let bundle_path = install_dir.join(".nono-trust.bundle");
+        if bundle_path.exists() {
+            verify_stored_bundles(&install_dir, &bundle_path, pack_ref)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-verify each artifact's Sigstore bundle from the stored trust bundle file.
+fn verify_stored_bundles(
+    install_dir: &Path,
+    bundle_path: &Path,
+    pack_ref: &str,
+) -> crate::Result<()> {
+    let bundle_content = std::fs::read_to_string(bundle_path).map_err(|e| {
+        nono::NonoError::PackageInstall(format!(
+            "failed to read trust bundle for pack '{}': {}",
+            pack_ref, e
+        ))
+    })?;
+
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&bundle_content).map_err(|e| {
+        nono::NonoError::PackageInstall(format!(
+            "failed to parse trust bundle for pack '{}': {}",
+            pack_ref, e
+        ))
+    })?;
+
+    let trusted_root = nono::trust::load_production_trusted_root()?;
+    let policy = nono::trust::VerificationPolicy::default();
+
+    for entry in &entries {
+        let artifact_name = entry
+            .get("artifact")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                nono::NonoError::PackageInstall(format!(
+                    "trust bundle entry missing 'artifact' field in pack '{}'",
+                    pack_ref
+                ))
+            })?;
+
+        let bundle_value = entry.get("bundle").ok_or_else(|| {
+            nono::NonoError::PackageInstall(format!(
+                "trust bundle entry missing 'bundle' field for '{}' in pack '{}'",
+                artifact_name, pack_ref
+            ))
+        })?;
+
+        let artifact_path = install_dir.join(artifact_name);
+        if !artifact_path.exists() {
+            continue;
+        }
+
+        let artifact_bytes = std::fs::read(&artifact_path).map_err(|e| {
+            nono::NonoError::PackageInstall(format!(
+                "failed to read '{}' for bundle verification in pack '{}': {}",
+                artifact_name, pack_ref, e
+            ))
+        })?;
+
+        let bundle_json = serde_json::to_string(bundle_value).map_err(|e| {
+            nono::NonoError::PackageInstall(format!(
+                "failed to serialize bundle for '{}' in pack '{}': {}",
+                artifact_name, pack_ref, e
+            ))
+        })?;
+
+        let bundle = nono::trust::load_bundle_from_str(
+            &bundle_json,
+            Path::new(&format!("{}.bundle", artifact_name)),
+        )?;
+
+        nono::trust::verify_bundle_subject_name(&bundle, Path::new(artifact_name))?;
+        nono::trust::verify_bundle(
+            &artifact_bytes,
+            &bundle,
+            &trusted_root,
+            &policy,
+            Path::new(artifact_name),
+        )
+        .map_err(|e| {
+            nono::NonoError::PackageInstall(format!(
+                "Sigstore verification failed for '{}' in pack '{}': {}\n\
+                 Reinstall with: nono pull {} --force",
+                artifact_name, pack_ref, e, pack_ref
+            ))
+        })?;
+    }
+
+    Ok(())
 }
 
 fn expand_override_deny_path(path: &Path, workdir: &Path) -> PathBuf {
@@ -108,14 +278,22 @@ fn collect_override_deny_paths(
     paths
 }
 
-pub(crate) fn prepare_profile(
+fn prepare_profile_with_options(
     args: &SandboxArgs,
-    silent: bool,
     workdir: &Path,
+    options: PrepareProfileOptions,
 ) -> crate::Result<PreparedProfile> {
     let loaded_profile = if let Some(ref profile_name) = args.profile {
         let profile = profile::load_profile(profile_name)?;
-        install_profile_hooks(&profile, silent);
+        verify_profile_packs(&profile.packs)?;
+
+        if !profile.packs.is_empty() && !options.hook_output_silent {
+            eprintln!("  Verified {} pack(s)", profile.packs.len());
+        }
+
+        if options.install_hooks {
+            install_profile_hooks(Some(profile_name), &profile, options.hook_output_silent);
+        }
         Some(profile)
     } else {
         None
@@ -198,6 +376,151 @@ pub(crate) fn prepare_profile(
             &args.override_deny,
             workdir,
         ),
+        allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
+            profile.environment.as_ref().map(|env_config| {
+                if let Some(err) =
+                    crate::exec_strategy::validate_allow_vars_pattern(&env_config.allow_vars)
+                {
+                    eprintln!("Warning: {}", err);
+                }
+                env_config.allow_vars.clone()
+            })
+        }),
         loaded_profile,
     })
+}
+
+pub(crate) fn prepare_profile(
+    args: &SandboxArgs,
+    silent: bool,
+    workdir: &Path,
+) -> crate::Result<PreparedProfile> {
+    prepare_profile_with_options(
+        args,
+        workdir,
+        PrepareProfileOptions {
+            install_hooks: true,
+            hook_output_silent: silent,
+        },
+    )
+}
+
+pub(crate) fn prepare_profile_for_preflight(
+    args: &SandboxArgs,
+    workdir: &Path,
+) -> crate::Result<PreparedProfile> {
+    prepare_profile_with_options(
+        args,
+        workdir,
+        PrepareProfileOptions {
+            install_hooks: false,
+            hook_output_silent: true,
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn prepare_profile_for_preflight_matches_runtime_resolution() {
+        let workdir = match tempdir() {
+            Ok(dir) => dir,
+            Err(err) => panic!("failed to create tempdir: {err}"),
+        };
+        let cli_override = workdir.path().join("cli-override");
+        if let Err(err) = fs::create_dir_all(&cli_override) {
+            panic!("failed to create CLI override path: {err}");
+        }
+
+        let profile_path = workdir.path().join("preflight-profile.json");
+        if let Err(err) = fs::write(
+            &profile_path,
+            r#"{
+                "extends": "default",
+                "meta": { "name": "preflight-profile" },
+                "workdir": { "access": "write" },
+                "rollback": { "exclude_patterns": ["target"] },
+                "network": {
+                    "allow_domain": ["example.com"],
+                    "upstream_bypass": ["localhost"],
+                    "listen_port": [8080]
+                },
+                "policy": {
+                    "override_deny": ["$WORKDIR/.git"]
+                }
+            }"#,
+        ) {
+            panic!("failed to write profile: {err}");
+        }
+
+        let args = SandboxArgs {
+            profile: Some(profile_path.to_string_lossy().into_owned()),
+            override_deny: vec![cli_override],
+            ..SandboxArgs::default()
+        };
+
+        let runtime = match prepare_profile(&args, true, workdir.path()) {
+            Ok(profile) => profile,
+            Err(err) => panic!("runtime prepare_profile failed: {err}"),
+        };
+        let preflight = match prepare_profile_for_preflight(&args, workdir.path()) {
+            Ok(profile) => profile,
+            Err(err) => panic!("preflight prepare_profile failed: {err}"),
+        };
+
+        assert_eq!(runtime.capability_elevation, preflight.capability_elevation);
+        #[cfg(target_os = "linux")]
+        assert_eq!(runtime.wsl2_proxy_policy, preflight.wsl2_proxy_policy);
+        assert_eq!(runtime.workdir_access, preflight.workdir_access);
+        assert_eq!(
+            runtime.rollback_exclude_patterns,
+            preflight.rollback_exclude_patterns
+        );
+        assert_eq!(
+            runtime.rollback_exclude_globs,
+            preflight.rollback_exclude_globs
+        );
+        assert_eq!(runtime.network_profile, preflight.network_profile);
+        assert_eq!(runtime.allow_domain, preflight.allow_domain);
+        assert_eq!(runtime.credentials, preflight.credentials);
+        assert_eq!(runtime.custom_credentials, preflight.custom_credentials);
+        assert_eq!(runtime.upstream_proxy, preflight.upstream_proxy);
+        assert_eq!(runtime.upstream_bypass, preflight.upstream_bypass);
+        assert_eq!(runtime.listen_ports, preflight.listen_ports);
+        assert_eq!(runtime.open_url_origins, preflight.open_url_origins);
+        assert_eq!(
+            runtime.open_url_allow_localhost,
+            preflight.open_url_allow_localhost
+        );
+        assert_eq!(
+            runtime.allow_launch_services,
+            preflight.allow_launch_services
+        );
+        assert_eq!(runtime.allow_gpu, preflight.allow_gpu);
+        assert_eq!(runtime.override_deny_paths, preflight.override_deny_paths);
+        assert_eq!(
+            runtime.loaded_profile.as_ref().map(|profile| {
+                (
+                    profile.meta.name.clone(),
+                    profile.extends.clone(),
+                    profile.security.groups.clone(),
+                    profile.workdir.access.clone(),
+                    profile.filesystem.allow.clone(),
+                )
+            }),
+            preflight.loaded_profile.as_ref().map(|profile| {
+                (
+                    profile.meta.name.clone(),
+                    profile.extends.clone(),
+                    profile.security.groups.clone(),
+                    profile.workdir.access.clone(),
+                    profile.filesystem.allow.clone(),
+                )
+            })
+        );
+    }
 }

@@ -37,7 +37,7 @@ mod tests {
             .contains(&"$HOME/.cache/claude".to_string()));
         assert!(profile
             .filesystem
-            .allow_file
+            .allow
             .contains(&"$HOME/.claude.lock".to_string()));
     }
 
@@ -83,7 +83,7 @@ mod tests {
             .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
         assert!(profile
             .filesystem
-            .allow_file
+            .allow
             .contains(&"$HOME/.claude.lock".to_string()));
     }
 

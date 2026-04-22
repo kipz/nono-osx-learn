@@ -1,6 +1,6 @@
 [package]
 name = "nono-cli"
-version = "0.31.0"
+version = "0.37.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -36,11 +36,11 @@ default = []
 test-trust-overrides = []
 
 [dependencies]
-nono = { version = "0.31.0", path = "../nono" }
-nono-proxy = { version = "0.31.0", path = "../nono-proxy" }
+nono = { version = "0.37.1", path = "../nono" }
+nono-proxy = { version = "0.37.1", path = "../nono-proxy" }
 clap = { version = "4", features = ["derive", "env"] }
 colored = "3"
-similar = "2"
+similar = "3"
 rand = "0.10"
 which = "8"
 toml = "1.0"
@@ -63,6 +63,7 @@ subtle = "2"
 hex = "0.4"
 
 ureq = "3"
+semver = "1"
 
 zeroize.workspace = true
 sha2.workspace = true

@@ -3,6 +3,7 @@
 //! Parses `policy.json` and resolves named groups into `CapabilitySet` entries
 //! and platform-specific rules using composable, platform-aware groups.
 
+use crate::package;
 use crate::profile;
 use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
 use serde::Deserialize;
@@ -126,6 +127,10 @@ pub struct ProfileDef {
     #[serde(default)]
     pub interactive: bool,
     #[serde(default)]
+    pub packs: Vec<String>,
+    #[serde(default)]
+    pub command_args: Vec<String>,
+    #[serde(default)]
     pub mediation: crate::mediation::MediationConfig,
 }
 
@@ -151,6 +156,7 @@ impl ProfileDef {
             policy,
             network: self.network.clone(),
             env_credentials: self.env_credentials.clone(),
+            environment: None,
             workdir: self.workdir.clone(),
             hooks: self.hooks.clone(),
             rollback: self.rollback.clone(),
@@ -160,6 +166,8 @@ impl ProfileDef {
             allow_parent_of_protected: None,
             interactive: self.interactive,
             skipdirs: Vec::new(),
+            packs: self.packs.clone(),
+            command_args: self.command_args.clone(),
             mediation: self.mediation.clone(),
         }
     }
@@ -275,6 +283,27 @@ pub(crate) fn escape_seatbelt_path(path: &str) -> Result<String> {
         }
     }
     Ok(result)
+}
+
+fn escape_seatbelt_regex_path(path: &str) -> Result<String> {
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        if c.is_control() {
+            return Err(NonoError::ConfigParse(format!(
+                "Path contains control character: {:?}",
+                path
+            )));
+        }
+        match c {
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
 }
 
 // ============================================================================
@@ -607,7 +636,7 @@ pub(crate) fn add_deny_access_rules(
         match resolve_parent_symlinks(&path) {
             Ok(resolved) => resolved,
             Err(e) => {
-                warn!(
+                debug!(
                     "Skipping parent-symlink resolution for {}: {}",
                     path.display(),
                     e
@@ -684,7 +713,9 @@ pub(crate) fn add_deny_access_rules(
 /// Add a narrow macOS exception for explicit keychain DB file grants.
 ///
 /// This keeps broad keychain deny groups active while allowing only the exact
-/// file capability intended by a profile or CLI flag.
+/// file capability intended by a profile or CLI flag, plus the backing
+/// SQLite/WAL/SHM files the Security framework actually touches under
+/// `~/Library/Keychains/<UUID>/...`.
 pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
     if !cfg!(target_os = "macos") {
         return;
@@ -716,39 +747,140 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
         false
     };
 
-    let allow_rules: Vec<String> = caps
-        .fs_capabilities()
-        .iter()
-        .filter(|cap| cap.is_file)
-        .filter(|cap| matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite))
-        .map(|cap| cap.resolved.clone())
-        .filter(|path| is_keychain_db(path))
-        .filter_map(|path| {
-            let path_str = match path_to_utf8(&path) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        "Skipping keychain DB exception for {}: {}",
-                        path.display(),
-                        e
-                    );
-                    return None;
+    let merge_access = |existing: &mut AccessMode, next: AccessMode| {
+        *existing = match (*existing, next) {
+            (AccessMode::ReadWrite, _) | (_, AccessMode::ReadWrite) => AccessMode::ReadWrite,
+            (AccessMode::Read, AccessMode::Write) | (AccessMode::Write, AccessMode::Read) => {
+                AccessMode::ReadWrite
+            }
+            (mode, _) => mode,
+        };
+    };
+
+    let mut explicit_paths: HashMap<PathBuf, AccessMode> = HashMap::new();
+    let mut keychain_roots: HashMap<PathBuf, AccessMode> = HashMap::new();
+
+    for cap in caps.fs_capabilities().iter().filter(|cap| cap.is_file) {
+        if !is_keychain_db(&cap.resolved) {
+            continue;
+        }
+
+        explicit_paths
+            .entry(cap.resolved.clone())
+            .and_modify(|mode| merge_access(mode, cap.access))
+            .or_insert(cap.access);
+
+        if let Some(root) = cap.resolved.parent() {
+            keychain_roots
+                .entry(root.to_path_buf())
+                .and_modify(|mode| merge_access(mode, cap.access))
+                .or_insert(cap.access);
+        }
+    }
+
+    let mut allow_rules = Vec::new();
+
+    for (path, access) in explicit_paths {
+        let path_str = match path_to_utf8(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain DB exception for {}: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let escaped = match escape_seatbelt_path(path_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain DB exception for {}: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let filter = format!("literal \"{}\"", escaped);
+        // Emit specific ops (file-read-data, file-write-data) in addition to the
+        // wildcards. In Apple's Seatbelt evaluator, a wildcard-op allow does not
+        // override an earlier specific-op deny on an overlapping path (the broad
+        // `deny_keychains_macos` group emits `(deny file-read-data (subpath ...))`).
+        // Emitting the specific op with a literal path ensures the override wins.
+        match access {
+            AccessMode::Read => {
+                allow_rules.push(format!("(allow file-read-data ({}))", filter));
+                allow_rules.push(format!("(allow file-read* ({}))", filter));
+            }
+            AccessMode::Write => {
+                allow_rules.push(format!("(allow file-write-data ({}))", filter));
+                allow_rules.push(format!("(allow file-write* ({}))", filter));
+            }
+            AccessMode::ReadWrite => {
+                allow_rules.push(format!("(allow file-read-data ({}))", filter));
+                allow_rules.push(format!("(allow file-read* ({}))", filter));
+                allow_rules.push(format!("(allow file-write-data ({}))", filter));
+                allow_rules.push(format!("(allow file-write* ({}))", filter));
+            }
+        }
+    }
+
+    for (root, access) in keychain_roots {
+        let root_str = match path_to_utf8(&root) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain runtime exception for {}: {}",
+                    root.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let escaped_root = match escape_seatbelt_regex_path(root_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain runtime exception for {}: {}",
+                    root.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let filters = [
+            format!(r#"regex #"^{}/\.fl[0-9A-Fa-f]+$""#, escaped_root),
+            format!(
+                r#"regex #"^{}/[^/]+/(?:[^/]+\.db(?:-(?:wal|shm))?|user\.kb)$""#,
+                escaped_root
+            ),
+        ];
+
+        // See comment above: emit specific ops alongside wildcards so they override
+        // the specific-op denies from deny_keychains_macos.
+        for filter in filters {
+            match access {
+                AccessMode::Read => {
+                    allow_rules.push(format!("(allow file-read-data ({}))", filter));
+                    allow_rules.push(format!("(allow file-read* ({}))", filter));
                 }
-            };
-            let escaped = match escape_seatbelt_path(path_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "Skipping keychain DB exception for {}: {}",
-                        path.display(),
-                        e
-                    );
-                    return None;
+                AccessMode::Write => {
+                    allow_rules.push(format!("(allow file-write-data ({}))", filter));
+                    allow_rules.push(format!("(allow file-write* ({}))", filter));
                 }
-            };
-            Some(format!("(allow file-read-data (literal \"{}\"))", escaped))
-        })
-        .collect();
+                AccessMode::ReadWrite => {
+                    allow_rules.push(format!("(allow file-read-data ({}))", filter));
+                    allow_rules.push(format!("(allow file-read* ({}))", filter));
+                    allow_rules.push(format!("(allow file-write-data ({}))", filter));
+                    allow_rules.push(format!("(allow file-write* ({}))", filter));
+                }
+            }
+        }
+    }
+
+    allow_rules.sort_unstable();
 
     for rule in allow_rules {
         if let Err(e) = caps.add_platform_rule(rule) {
@@ -1192,11 +1324,51 @@ pub fn load_embedded_policy() -> Result<Policy> {
     }
 
     let json = crate::config::embedded::embedded_policy_json();
-    let policy = load_policy(json)?;
+    let mut policy = load_policy(json)?;
+    load_package_groups(&mut policy)?;
     // Another thread may have raced us; that's fine — OnceLock keeps the
     // first value and our `policy` is simply dropped.
     let _ = CACHED.set(policy.clone());
     Ok(policy)
+}
+
+pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
+    // Tolerate missing config dir / lockfile — no packages installed means
+    // no groups to load. This is the common case in tests and fresh installs.
+    let lockfile = match package::read_lockfile() {
+        Ok(lf) => lf,
+        Err(_) => return Ok(()),
+    };
+    for package_key in lockfile.packages.keys() {
+        let (namespace, name) = package_key.split_once('/').ok_or_else(|| {
+            NonoError::PackageInstall(format!("invalid lockfile package key '{package_key}'"))
+        })?;
+        let groups_path = package::package_groups_path(namespace, name)?;
+        if !groups_path.exists() {
+            continue;
+        }
+
+        let content = std::fs::read_to_string(&groups_path).map_err(|e| NonoError::ConfigRead {
+            path: groups_path.clone(),
+            source: e,
+        })?;
+
+        let groups: HashMap<String, Group> = serde_json::from_str(&content).map_err(|e| {
+            NonoError::ConfigParse(format!("failed to parse {}: {e}", groups_path.display()))
+        })?;
+
+        for (group_name, group) in groups {
+            if policy.groups.contains_key(&group_name) {
+                return Err(NonoError::PackageInstall(format!(
+                    "package group '{}' collides with an existing policy group",
+                    group_name
+                )));
+            }
+            policy.groups.insert(group_name, group);
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -1307,7 +1479,7 @@ mod tests {
             .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
         assert!(profile
             .filesystem
-            .allow_file
+            .allow
             .contains(&"$HOME/.claude.lock".to_string()));
     }
 
@@ -1926,6 +2098,33 @@ mod tests {
     }
 
     #[test]
+    fn test_escape_seatbelt_regex_path() {
+        assert_eq!(
+            escape_seatbelt_regex_path("/simple/path").expect("simple path"),
+            "/simple/path"
+        );
+        assert_eq!(
+            escape_seatbelt_regex_path("/path.with+regex?(chars)").expect("regex chars"),
+            "/path\\.with\\+regex\\?\\(chars\\)"
+        );
+        assert_eq!(
+            escape_seatbelt_regex_path("/path\"quoted").expect("quote"),
+            "/path\\\"quoted"
+        );
+    }
+
+    #[test]
+    fn test_escape_seatbelt_regex_path_rejects_control_chars() {
+        assert!(escape_seatbelt_regex_path("/path\nwith\nnewlines").is_err());
+        assert!(escape_seatbelt_regex_path("/path\rwith\rreturns").is_err());
+        assert!(escape_seatbelt_regex_path("/path\0with\0nulls").is_err());
+        assert!(escape_seatbelt_regex_path("/path\twith\ttabs").is_err());
+        assert!(escape_seatbelt_regex_path("/path\x0bwith\x0cfeeds").is_err());
+        assert!(escape_seatbelt_regex_path("/path\x1bwith\x1bescape").is_err());
+        assert!(escape_seatbelt_regex_path("/path\x7fwith\x7fdel").is_err());
+    }
+
+    #[test]
     fn test_validate_deny_overlaps_detects_conflict() {
         use nono::FsCapability;
 
@@ -2010,20 +2209,22 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let original_tmpdir = std::env::var("TMPDIR").unwrap_or("/tmp".to_string());
 
         let _env = crate::test_env::EnvVarGuard::set_all(&[
             ("HOME", home.to_str().expect("home path")),
             ("TMPDIR", temp_root.to_str().expect("tmpdir path")),
         ]);
 
-        let skip_tmp = should_skip_group_allow_path("system_write_linux", Path::new("/tmp"))
-            .expect("check /tmp skip");
+        let skip_tmp =
+            should_skip_group_allow_path("system_write_linux", Path::new(&original_tmpdir))
+                .expect("check original TMPDIR skip");
         let skip_tmpdir = should_skip_group_allow_path("system_write_linux", &temp_root)
-            .expect("check TMPDIR skip");
+            .expect("check new TMPDIR skip");
 
         assert!(
             skip_tmp,
-            "/tmp should be skipped when HOME is nested under it"
+            "original TMPDIR should be skipped when HOME is nested under it"
         );
         assert!(
             skip_tmpdir,
@@ -2498,10 +2699,37 @@ mod tests {
         let rules = caps.platform_rules().join("\n");
         assert!(
             rules.contains(&format!(
-                "(allow file-read-data (literal \"{}\"))",
+                "(allow file-read* (literal \"{}\"))",
                 escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
             )),
             "expected login keychain DB exception rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB write rule, got: {}",
+            rules
+        );
+        // Specific-op rules must also be emitted so they override the specific-op
+        // deny from deny_keychains_macos: (deny file-read-data (subpath "...Keychains")).
+        // A file-read* wildcard allow does not override a file-read-data specific deny.
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read-data (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB file-read-data rule (to override specific deny), got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write-data (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB file-write-data rule (to override specific deny), got: {}",
             rules
         );
     }
@@ -2525,11 +2753,104 @@ mod tests {
         let rules = caps.platform_rules().join("\n");
         assert!(
             rules.contains(&format!(
-                "(allow file-read-data (literal \"{}\"))",
+                "(allow file-read* (literal \"{}\"))",
                 escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
                     .expect("escaped path")
             )),
             "expected metadata keychain DB exception rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB write rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read-data (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB file-read-data rule (to override specific deny), got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write-data (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB file-write-data rule (to override specific deny), got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_macos_keychain_db_exception_adds_runtime_keychain_rules() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let keychains = home.join("Library/Keychains");
+        std::fs::create_dir_all(&keychains).expect("mkdir keychains");
+        std::fs::write(keychains.join("login.keychain-db"), "").expect("write login db");
+        std::fs::write(keychains.join("metadata.keychain-db"), "").expect("write metadata db");
+
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "HOME",
+            home.to_str().expect("home path utf8"),
+        )]);
+
+        let login_db = keychains.join("login.keychain-db");
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: login_db.clone(),
+            resolved: login_db,
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        apply_macos_keychain_db_exception(&mut caps);
+
+        let escaped_root =
+            escape_seatbelt_regex_path(keychains.to_str().expect("keychains path utf8"))
+                .expect("escaped regex path");
+        let rules = caps.platform_rules().join("\n");
+
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read* (regex #\"^{}/\\.fl[0-9A-Fa-f]+$\"))",
+                escaped_root
+            )),
+            "expected root .fl keychain rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (regex #\"^{}/\\.fl[0-9A-Fa-f]+$\"))",
+                escaped_root
+            )),
+            "expected writable root .fl keychain rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read* (regex #\"^{}/[^/]+/(?:[^/]+\\.db(?:-(?:wal|shm))?|user\\.kb)$\"))",
+                escaped_root
+            )),
+            "expected runtime DB read rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (regex #\"^{}/[^/]+/(?:[^/]+\\.db(?:-(?:wal|shm))?|user\\.kb)$\"))",
+                escaped_root
+            )),
+            "expected runtime DB write rule, got: {}",
             rules
         );
     }

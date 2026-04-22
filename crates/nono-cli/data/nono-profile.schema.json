@@ -84,12 +84,22 @@
         { "type": "boolean" },
         { "type": "null" }
       ],
-      "description": "Opt-in gate for GPU access on Apple Silicon Macs through IOKit. Must be paired with the CLI flag --allow-gpu. Set to null to inherit from the base profile."
+      "description": "Opt-in gate for GPU access (Metal/IOKit on Apple Silicon macOS, render nodes on Linux). Intel Macs are not yet supported. Must be paired with the CLI flag --allow-gpu. Set to null to inherit from the base profile."
     },
     "interactive": {
       "type": "boolean",
       "description": "Deprecated. Parsed for backward compatibility but ignored. Supervised mode preserves TTY by default.",
       "deprecated": true
+    },
+    "packs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Pack dependencies verified at launch. Each entry is a namespace/name reference to an installed pack."
+    },
+    "command_args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Extra arguments appended to the child command at launch. Supports variable expansion (e.g. $NONO_PACKAGES)."
     }
   },
   "$defs": {
@@ -135,7 +145,8 @@
         "allowed_commands": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Commands to allow even when blocked by default policy. Applied before CLI --allow-command overrides."
+          "description": "Deprecated in v0.33.0. Startup-only command allowlist override. Not enforced for child processes; prefer resource-based controls instead.",
+          "deprecated": true
         },
         "signal_mode": {
           "oneOf": [
@@ -260,6 +271,12 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Additional deny.access paths to apply."
+        },
+        "add_deny_commands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer resource-based controls instead.",
+          "deprecated": true
         },
         "override_deny": {
           "type": "array",
@@ -412,6 +429,13 @@
           ],
           "description": "Name of the query parameter to add or replace with the credential. Required when inject_mode is \"query_param\"."
         },
+        "proxy": {
+          "oneOf": [
+            { "$ref": "#/$defs/ProxyInjectConfig" },
+            { "type": "null" }
+          ],
+          "description": "Optional proxy-side overrides for phantom token parsing. When omitted, proxy behavior uses top-level custom credential fields."
+        },
         "env_var": {
           "oneOf": [
             { "type": "string" },
@@ -426,6 +450,27 @@
           },
           "description": "L7 endpoint rules for method+path filtering. When non-empty, only requests matching at least one rule are allowed (default-deny). When empty or absent, all endpoints are permitted.",
           "default": []
+        },
+        "tls_ca": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Path to a PEM-encoded CA certificate file for upstream TLS. When set, the proxy trusts this CA in addition to system roots. Required for upstreams with self-signed or private CA certificates (e.g. a Kubernetes API server). Supports tilde (~) expansion."
+        },
+        "tls_client_cert": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Path to a PEM-encoded client certificate for upstream mutual TLS (mTLS). When set together with tls_client_key, the proxy presents this certificate during the TLS handshake. Required for upstreams that enforce client-certificate authentication."
+        },
+        "tls_client_key": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Path to the PEM-encoded private key corresponding to tls_client_cert. Must be set together with tls_client_cert."
         }
       }
     },
@@ -450,6 +495,55 @@
       "enum": ["header", "url_path", "query_param", "basic_auth"],
       "description": "Credential injection mode for the reverse proxy.",
       "default": "header"
+    },
+    "ProxyInjectConfig": {
+      "type": "object",
+      "description": "Optional proxy-side overrides for phantom token parsing. These settings only affect incoming client request validation, not outbound upstream credential injection.",
+      "additionalProperties": false,
+      "properties": {
+        "inject_mode": {
+          "oneOf": [
+            { "$ref": "#/$defs/InjectMode" },
+            { "type": "null" }
+          ],
+          "description": "Override inject mode for proxy-side phantom token parsing. Falls back to parent inject_mode when omitted."
+        },
+        "inject_header": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override header name for proxy-side header/basic_auth modes. Falls back to parent inject_header when omitted."
+        },
+        "credential_format": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override credential format for proxy-side header mode. Falls back to parent credential_format when omitted."
+        },
+        "path_pattern": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override path pattern for proxy-side url_path mode. Falls back to parent path_pattern when omitted."
+        },
+        "path_replacement": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override path replacement for proxy-side url_path mode. Falls back to parent path_replacement when omitted."
+        },
+        "query_param_name": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override query parameter name for proxy-side query_param mode. Falls back to parent query_param_name when omitted."
+        }
+      }
     },
     "SecretsConfig": {
       "type": "object",

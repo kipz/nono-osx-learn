@@ -1,7 +1,7 @@
 use crate::launch_runtime::{select_threading_context, LaunchPlan};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{execute_supervised_runtime, SupervisedRuntimeContext};
-use crate::{config, exec_strategy, output, sandbox_state};
+use crate::{command_blocking_deprecation, config, exec_strategy, output, sandbox_state};
 use nono::{CapabilitySet, NonoError, Result, Sandbox};
 use std::path::Path;
 use std::time::Duration;
@@ -108,9 +108,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     {
         return Err(NonoError::BlockedCommand {
             command: blocked,
-            reason: "This command is blocked by default due to destructive potential. \
-                     Use --allow-command to override if you understand the risks."
-                .to_string(),
+            reason: command_blocking_deprecation::BLOCKED_COMMAND_REASON.to_string(),
         });
     }
 
@@ -159,12 +157,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         output::print_supervised_info(flags.silent, rollback.requested, proxy.active);
     }
 
-    let active_proxy = start_proxy_runtime(proxy, &mut caps)?;
+    let active_proxy = start_proxy_runtime(proxy, &mut caps, &flags.workdir)?;
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
 
     // Set up command mediation (shim dir, server, env blocking) before sandbox.
-    let mediation_handle = crate::mediation::session::setup(&flags.mediation)?;
+    // The workdir is threaded through so per-command sandbox paths that
+    // reference `$WORKDIR` / `$VAR` resolve against the same directory the
+    // main sandbox uses.
+    let mediation_handle =
+        crate::mediation::session::setup(&flags.mediation, flags.workdir.clone())?;
 
     // If mediation is active, add shim directory and binary to sandbox rules.
     let mediation_path_str;
@@ -312,6 +314,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,
+        allowed_env_vars: flags.allowed_env_vars,
         extra_blocked_env: &mediation_env_block,
     };
 

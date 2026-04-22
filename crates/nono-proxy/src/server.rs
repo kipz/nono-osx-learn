@@ -150,8 +150,13 @@ impl ProxyHandle {
             if let Some(ref env_var) = route.env_var {
                 vars.push((env_var.clone(), self.token.to_string()));
             } else if let Some(ref cred_key) = route.credential_key {
-                let api_key_name = cred_key.to_uppercase();
-                vars.push((api_key_name, self.token.to_string()));
+                // Skip URI-format keys (e.g. env://, op://, apple-password://) —
+                // uppercasing a URI produces a nonsensical env var name. These
+                // routes must declare an explicit env_var to get phantom token injection.
+                if !cred_key.contains("://") {
+                    let api_key_name = cred_key.to_uppercase();
+                    vars.push((api_key_name, self.token.to_string()));
+                }
             }
         }
         vars
@@ -443,7 +448,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         .rsplit_once(':')
                         .map(|(h, p)| (h, p.parse::<u16>().unwrap_or(443)))
                         .unwrap_or((&host_port, 443));
-                    warn!(
+                    debug!(
                         "Blocked CONNECT to route upstream {} — use reverse proxy path instead",
                         authority
                     );
@@ -599,9 +604,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };
@@ -640,9 +648,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None, // No explicit env_var — should fall back to uppercase
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };
@@ -690,9 +701,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: Some("OPENAI_API_KEY".to_string()),
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };
@@ -746,9 +760,12 @@ mod tests {
                     path_pattern: None,
                     path_replacement: None,
                     query_param_name: None,
+                    proxy: None,
                     env_var: None,
                     endpoint_rules: vec![],
                     tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -760,9 +777,12 @@ mod tests {
                     path_pattern: None,
                     path_replacement: None,
                     query_param_name: None,
+                    proxy: None,
                     env_var: Some("GITHUB_TOKEN".to_string()),
                     endpoint_rules: vec![],
                     tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
                 },
             ],
             ..Default::default()
@@ -818,9 +838,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };
@@ -848,9 +871,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };
@@ -864,6 +890,90 @@ mod tests {
             vars[0].1, "http://127.0.0.1:58406/openai",
             "URL must not have trailing slash in path"
         );
+    }
+
+    #[test]
+    fn test_anthropic_credential_phantom_token_regression() {
+        // Regression test for issue #624: the built-in anthropic credential
+        // entry had no env_var or credential_key, so ANTHROPIC_API_KEY was
+        // never set to the phantom token. Only ANTHROPIC_BASE_URL was injected,
+        // leaving the sandbox to send the host's real key directly.
+        //
+        // Pre-fix state: route in loaded_routes but no env_var / credential_key
+        // => ANTHROPIC_API_KEY must NOT appear (demonstrates the bug).
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handle_no_env_var = ProxyHandle {
+            port: 12345,
+            token: Zeroizing::new("phantom".to_string()),
+            audit_log: audit::new_audit_log(),
+            shutdown_tx: shutdown_tx.clone(),
+            loaded_routes: ["anthropic".to_string()].into_iter().collect(),
+            no_proxy_hosts: Vec::new(),
+        };
+        let config_no_env_var = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                prefix: "anthropic".to_string(),
+                upstream: "https://api.anthropic.com".to_string(),
+                credential_key: None,
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "x-api-key".to_string(),
+                credential_format: "{}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+            }],
+            ..Default::default()
+        };
+        let vars_no_env_var = handle_no_env_var.credential_env_vars(&config_no_env_var);
+        assert!(
+            vars_no_env_var.iter().all(|(k, _)| k != "ANTHROPIC_API_KEY"),
+            "pre-fix: ANTHROPIC_API_KEY must not be set when neither env_var nor credential_key is defined (bug reproduced)"
+        );
+
+        // Post-fix state: route has env_var = "ANTHROPIC_API_KEY"
+        // => ANTHROPIC_API_KEY must be set to the phantom token.
+        let (shutdown_tx2, _) = tokio::sync::watch::channel(false);
+        let handle_fixed = ProxyHandle {
+            port: 12345,
+            token: Zeroizing::new("phantom".to_string()),
+            audit_log: audit::new_audit_log(),
+            shutdown_tx: shutdown_tx2,
+            loaded_routes: ["anthropic".to_string()].into_iter().collect(),
+            no_proxy_hosts: Vec::new(),
+        };
+        let config_fixed = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                prefix: "anthropic".to_string(),
+                upstream: "https://api.anthropic.com".to_string(),
+                credential_key: Some("ANTHROPIC_API_KEY".to_string()),
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "x-api-key".to_string(),
+                credential_format: "{}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("ANTHROPIC_API_KEY".to_string()),
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+            }],
+            ..Default::default()
+        };
+        let vars_fixed = handle_fixed.credential_env_vars(&config_fixed);
+        let api_key_var = vars_fixed.iter().find(|(k, _)| k == "ANTHROPIC_API_KEY");
+        assert!(
+            api_key_var.is_some(),
+            "post-fix: ANTHROPIC_API_KEY must be set to the phantom token"
+        );
+        assert_eq!(api_key_var.unwrap().1, "phantom");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::config::{InjectMode, RouteConfig};
 use crate::error::{ProxyError, Result};
 use base64::Engine;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 /// A loaded credential ready for injection.
@@ -22,26 +22,34 @@ use zeroize::Zeroizing;
 /// raw secret). Route-level configuration (upstream URL, L7 endpoint rules,
 /// custom TLS CA) is stored in [`crate::route::LoadedRoute`].
 pub struct LoadedCredential {
-    /// Injection mode
+    /// Upstream injection mode
     pub inject_mode: InjectMode,
+    /// Proxy-side injection mode used for phantom token parsing.
+    pub proxy_inject_mode: InjectMode,
     /// Raw credential value from keystore (for modes that need it directly)
     pub raw_credential: Zeroizing<String>,
 
     // --- Header mode ---
     /// Header name to inject (e.g., "Authorization")
     pub header_name: String,
+    /// Header name used for proxy-side phantom token validation.
+    pub proxy_header_name: String,
     /// Formatted header value (e.g., "Bearer sk-...")
     pub header_value: Zeroizing<String>,
 
     // --- URL path mode ---
     /// Pattern to match in incoming path (with {} placeholder)
     pub path_pattern: Option<String>,
+    /// Pattern to match in incoming proxy path (with {} placeholder)
+    pub proxy_path_pattern: Option<String>,
     /// Pattern for outgoing path (with {} placeholder)
     pub path_replacement: Option<String>,
 
     // --- Query param mode ---
     /// Query parameter name
     pub query_param_name: Option<String>,
+    /// Proxy-side query parameter name for phantom token validation.
+    pub proxy_query_param_name: Option<String>,
 }
 
 /// Custom Debug impl that redacts secret values to prevent accidental leakage
@@ -50,12 +58,16 @@ impl std::fmt::Debug for LoadedCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadedCredential")
             .field("inject_mode", &self.inject_mode)
+            .field("proxy_inject_mode", &self.proxy_inject_mode)
             .field("raw_credential", &"[REDACTED]")
             .field("header_name", &self.header_name)
+            .field("proxy_header_name", &self.proxy_header_name)
             .field("header_value", &"[REDACTED]")
             .field("path_pattern", &self.path_pattern)
+            .field("proxy_path_pattern", &self.proxy_path_pattern)
             .field("path_replacement", &self.path_replacement)
             .field("query_param_name", &self.query_param_name)
+            .field("proxy_query_param_name", &self.proxy_query_param_name)
             .finish()
     }
 }
@@ -94,10 +106,18 @@ impl CredentialStore {
 
                 let secret = match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, key) {
                     Ok(s) => s,
-                    Err(nono::NonoError::SecretNotFound(msg)) => {
-                        debug!(
-                            "Credential '{}' not available, skipping route: {}",
-                            normalized_prefix, msg
+                    Err(nono::NonoError::SecretNotFound(_)) => {
+                        let hint = if !key.contains("://") && cfg!(target_os = "macos") {
+                            format!(
+                                " To add it to the macOS keychain: security add-generic-password -s \"nono\" -a \"{}\" -w",
+                                key
+                            )
+                        } else {
+                            String::new()
+                        };
+                        warn!(
+                            "Credential '{}' not found for route '{}' — requests will proceed without credential injection.{}",
+                            key, normalized_prefix, hint
                         );
                         continue;
                     }
@@ -133,12 +153,32 @@ impl CredentialStore {
                     normalized_prefix.clone(),
                     LoadedCredential {
                         inject_mode: route.inject_mode.clone(),
+                        proxy_inject_mode: route
+                            .proxy
+                            .as_ref()
+                            .and_then(|p| p.inject_mode.clone())
+                            .unwrap_or_else(|| route.inject_mode.clone()),
                         raw_credential: secret,
                         header_name: route.inject_header.clone(),
+                        proxy_header_name: route
+                            .proxy
+                            .as_ref()
+                            .and_then(|p| p.inject_header.clone())
+                            .unwrap_or_else(|| route.inject_header.clone()),
                         header_value,
                         path_pattern: route.path_pattern.clone(),
+                        proxy_path_pattern: route
+                            .proxy
+                            .as_ref()
+                            .and_then(|p| p.path_pattern.clone())
+                            .or_else(|| route.path_pattern.clone()),
                         path_replacement: route.path_replacement.clone(),
                         query_param_name: route.query_param_name.clone(),
+                        proxy_query_param_name: route
+                            .proxy
+                            .as_ref()
+                            .and_then(|p| p.query_param_name.clone())
+                            .or_else(|| route.query_param_name.clone()),
                     },
                 );
             }
@@ -204,12 +244,16 @@ mod tests {
         // tracing output at debug level.
         let cred = LoadedCredential {
             inject_mode: InjectMode::Header,
+            proxy_inject_mode: InjectMode::Header,
             raw_credential: Zeroizing::new("sk-secret-12345".to_string()),
             header_name: "Authorization".to_string(),
+            proxy_header_name: "Authorization".to_string(),
             header_value: Zeroizing::new("Bearer sk-secret-12345".to_string()),
             path_pattern: None,
+            proxy_path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy_query_param_name: None,
         };
 
         let debug_output = format!("{:?}", cred);
@@ -245,9 +289,12 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         }];
         let store = CredentialStore::load(&routes);
         assert!(store.is_ok());

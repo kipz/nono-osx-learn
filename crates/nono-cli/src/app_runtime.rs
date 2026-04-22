@@ -4,6 +4,7 @@ use crate::command_runtime::{run_sandbox, run_shell, run_wrap};
 use crate::learn_runtime::run_learn;
 use crate::open_url_runtime::run_open_url_helper;
 use crate::output;
+use crate::package_cmd;
 use crate::policy_cmd;
 use crate::profile_cmd;
 use crate::rollback_commands;
@@ -85,6 +86,21 @@ fn dispatch_command(
         }
         Commands::Profile(args) => {
             run_command_with_update(update_handle, silent, || profile_cmd::run_profile(args))
+        }
+        Commands::Pull(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_pull(args))
+        }
+        Commands::Remove(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_remove(args))
+        }
+        Commands::Update(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_update(args))
+        }
+        Commands::Search(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_search(args))
+        }
+        Commands::List(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_list(args))
         }
         Commands::OpenUrlHelper(args) => run_open_url_helper(args),
     }

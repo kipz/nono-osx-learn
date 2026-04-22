@@ -257,8 +257,8 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
         root.insert("rollback".to_string(), serde_json::Value::Object(rollback));
 
         // NOTE: open_urls, allow_launch_services, and allow_gpu are intentionally
-        // omitted. Emitting them would replace inherited values from base profiles
-        // like claude-code (which grants OAuth2 origins and launch services).
+        // omitted. Emitting them would replace inherited values from base profiles like
+        // claude-code (which grants OAuth2 origins, launch services, and GPU access).
         // Absent = inherit from base. Authors who need to override these
         // should add them explicitly.
     }

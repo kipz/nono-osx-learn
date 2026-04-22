@@ -118,6 +118,14 @@ pub struct RouteConfig {
     #[serde(default)]
     pub query_param_name: Option<String>,
 
+    /// Optional overrides for proxy-side phantom token handling.
+    ///
+    /// When set, these values are used to validate the incoming phantom token
+    /// from the sandboxed client request. Outbound credential injection to the
+    /// upstream continues to use the top-level route fields.
+    #[serde(default)]
+    pub proxy: Option<ProxyInjectConfig>,
+
     /// Explicit environment variable name for the phantom token (e.g., "OPENAI_API_KEY").
     ///
     /// When set, this is used as the SDK API key env var name instead of deriving
@@ -143,6 +151,55 @@ pub struct RouteConfig {
     /// Kubernetes API servers).
     #[serde(default)]
     pub tls_ca: Option<String>,
+
+    /// Optional path to a PEM-encoded client certificate for upstream mTLS.
+    ///
+    /// When set together with `tls_client_key`, the proxy presents this
+    /// certificate to the upstream during TLS handshake. Required for
+    /// upstreams that enforce mutual TLS (e.g., Kubernetes API servers
+    /// configured with client-certificate authentication).
+    #[serde(default)]
+    pub tls_client_cert: Option<String>,
+
+    /// Optional path to a PEM-encoded private key for upstream mTLS.
+    ///
+    /// Must be set together with `tls_client_cert`. The key must correspond
+    /// to the certificate in `tls_client_cert`.
+    #[serde(default)]
+    pub tls_client_key: Option<String>,
+}
+
+/// Optional proxy-side overrides for credential injection shape.
+///
+/// These settings apply only to how the proxy validates the phantom token from
+/// the client request. Any field omitted here falls back to the corresponding
+/// top-level route field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyInjectConfig {
+    /// Optional injection mode override for proxy-side token parsing.
+    #[serde(default)]
+    pub inject_mode: Option<InjectMode>,
+
+    /// Optional header name override for header/basic_auth modes.
+    #[serde(default)]
+    pub inject_header: Option<String>,
+
+    /// Optional format override for header mode.
+    #[serde(default)]
+    pub credential_format: Option<String>,
+
+    /// Optional path pattern override for url_path mode.
+    #[serde(default)]
+    pub path_pattern: Option<String>,
+
+    /// Optional path replacement override for url_path mode.
+    #[serde(default)]
+    pub path_replacement: Option<String>,
+
+    /// Optional query parameter override for query_param mode.
+    #[serde(default)]
+    pub query_param_name: Option<String>,
 }
 
 /// An HTTP method+path access rule for reverse proxy endpoint filtering.

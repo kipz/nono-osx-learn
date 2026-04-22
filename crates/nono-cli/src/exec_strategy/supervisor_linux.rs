@@ -78,6 +78,27 @@ impl RateLimiter {
     }
 }
 
+/// Read the TGID (thread group ID / process ID) of a thread from /proc/<tid>/status.
+///
+/// `seccomp_data.pid` is the TID of the requesting thread, not the TGID. `/proc/self`
+/// is a symlink to `/proc/<tgid>`, so for correct procfs self-resolution we need the TGID.
+/// This matters when a grandchild process (e.g. nono→sh→bun) makes an openat syscall:
+/// `notif.pid` is bun's TID, not sh's PID, so we must look up bun's TGID to resolve
+/// `/proc/self/maps` to `/proc/<bun_tgid>/maps` instead of `/proc/<sh_pid>/maps`.
+///
+/// Runs in the unsandboxed supervisor context. Falls back to `tid` if the status file
+/// cannot be read (process already exited; the subsequent TOCTOU check will reject it).
+fn read_tgid(tid: u32) -> u32 {
+    std::fs::read_to_string(format!("/proc/{}/status", tid))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Tgid:\t"))
+                .and_then(|l| l["Tgid:\t".len()..].trim().parse::<u32>().ok())
+        })
+        .unwrap_or(tid)
+}
+
 /// Handle a seccomp notification on Linux.
 ///
 /// Flow:
@@ -192,7 +213,17 @@ pub(super) fn handle_seccomp_notification(
         }
     };
 
-    let procfs_context = ProcfsAccessContext::new(child.as_raw() as u32, Some(notif.pid));
+    // Use the requesting process's TGID (not TID) as process_pid so that /proc/self
+    // resolves to /proc/<tgid>/... for grandchild processes (e.g. nono→sh→bun).
+    // notif.pid is the TID; for single-threaded processes TID==TGID, but for
+    // multithreaded or grandchild processes we need the actual process leader PID.
+    let child_pid = child.as_raw() as u32;
+    let notifying_tgid = if notif.pid == child_pid {
+        child_pid
+    } else {
+        read_tgid(notif.pid)
+    };
+    let procfs_context = ProcfsAccessContext::new(notifying_tgid, Some(notif.pid));
     let resolved_path = match resolve_procfs_path_for_child(&path, Some(procfs_context)) {
         Ok(resolved) => resolved,
         Err(e) => {
@@ -203,6 +234,28 @@ pub(super) fn handle_seccomp_notification(
     };
     let canonicalized =
         std::fs::canonicalize(&resolved_path).unwrap_or_else(|_| resolved_path.clone());
+
+    // For the initial capability match, map a grandchild's /proc/<tgid> path back to the
+    // direct child's /proc/<child_pid>, because initial_caps are built from the direct
+    // child's /proc/self remapping (remap_procfs_self_references uses child.as_raw()).
+    // Any descendant process should benefit from the same proc-self read policy.
+    //
+    // Security note: this substitution only affects the policy LOOKUP KEY. The actual file
+    // opened by open_path_for_access continues to use `procfs_context` with notifying_tgid,
+    // so the correct /proc/<notifying_tgid>/... file is opened. validate_procfs_access also
+    // uses notifying_tgid as allowed_pid, blocking cross-process procfs reads.
+    let cap_check_path: std::borrow::Cow<std::path::Path> = if notifying_tgid != child_pid {
+        let notifying_prefix = format!("/proc/{}", notifying_tgid);
+        if let Ok(rel) = canonicalized.strip_prefix(&notifying_prefix) {
+            let mut p = std::path::PathBuf::from(format!("/proc/{}", child_pid));
+            p.push(rel);
+            std::borrow::Cow::Owned(p)
+        } else {
+            std::borrow::Cow::Borrowed(canonicalized.as_path())
+        }
+    } else {
+        std::borrow::Cow::Borrowed(canonicalized.as_path())
+    };
 
     // 4. Check protected roots BEFORE initial-set fast-path.
     let protected_root = crate::protected_paths::overlapping_protected_root(
@@ -239,7 +292,7 @@ pub(super) fn handle_seccomp_notification(
     // the requested access mode is already granted, proceed immediately. If the
     // path matches but only with narrower access, record the denial here so the
     // footer can explain the near-miss precisely.
-    match match_initial_capability(&canonicalized, access, initial_caps) {
+    match match_initial_capability(&cap_check_path, access, initial_caps) {
         InitialCapabilityMatch::Insufficient(cap) => {
             debug!(
                 "Seccomp: path {} matched initial capability {} but {} access was requested",

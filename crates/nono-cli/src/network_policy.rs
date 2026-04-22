@@ -8,6 +8,7 @@ use nono::{NonoError, Result};
 use nono_proxy::config::{EndpointRule, InjectMode, ProxyConfig, RouteConfig};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 use tracing::debug;
 
 // ============================================================================
@@ -186,6 +187,7 @@ pub fn resolve_credentials(
     policy: &NetworkPolicy,
     service_names: &[String],
     custom_credentials: &HashMap<String, CustomCredentialDef>,
+    workdir: &Path,
 ) -> Result<Vec<RouteConfig>> {
     if service_names.is_empty() {
         return Ok(Vec::new());
@@ -232,14 +234,23 @@ pub fn resolve_credentials(
                 path_pattern: cred.path_pattern.clone(),
                 path_replacement: cred.path_replacement.clone(),
                 query_param_name: cred.query_param_name.clone(),
+                proxy: cred.proxy.clone(),
                 env_var: cred.env_var.clone(),
                 endpoint_rules: cred.endpoint_rules.clone(),
                 tls_ca: cred
                     .tls_ca
                     .as_deref()
-                    .map(|p| {
-                        crate::policy::expand_path(p).map(|pb| pb.to_string_lossy().into_owned())
-                    })
+                    .map(|p| crate::profile::expand_str(p, workdir))
+                    .transpose()?,
+                tls_client_cert: cred
+                    .tls_client_cert
+                    .as_deref()
+                    .map(|p| crate::profile::expand_str(p, workdir))
+                    .transpose()?,
+                tls_client_key: cred
+                    .tls_client_key
+                    .as_deref()
+                    .map(|p| crate::profile::expand_str(p, workdir))
                     .transpose()?,
             });
         } else if let Some(cred) = policy.credentials.get(name) {
@@ -265,9 +276,12 @@ pub fn resolve_credentials(
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: cred.env_var.clone(),
                 endpoint_rules: cred.endpoint_rules.clone(),
                 tls_ca: None, // Built-in credentials don't support custom CAs
+                tls_client_cert: None,
+                tls_client_key: None,
             });
         }
         // We already validated existence above, so this else branch won't be hit
@@ -337,6 +351,12 @@ mod tests {
     use super::*;
     use crate::config::embedded::embedded_network_policy_json;
 
+    /// Stable workdir for `resolve_credentials` tests — the call sites here do
+    /// not exercise `$WORKDIR` expansion, so any absolute path works.
+    fn test_workdir() -> &'static Path {
+        Path::new("/")
+    }
+
     #[test]
     fn test_load_embedded_network_policy() {
         let json = embedded_network_policy_json();
@@ -388,7 +408,7 @@ mod tests {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).unwrap();
         // Empty service list = no credential injection
-        let routes = resolve_credentials(&policy, &[], &HashMap::new()).unwrap();
+        let routes = resolve_credentials(&policy, &[], &HashMap::new(), test_workdir()).unwrap();
         assert!(routes.is_empty());
     }
 
@@ -400,6 +420,7 @@ mod tests {
             &policy,
             &["openai".to_string(), "anthropic".to_string()],
             &HashMap::new(),
+            test_workdir(),
         )
         .unwrap();
         assert!(!routes.is_empty());
@@ -413,7 +434,7 @@ mod tests {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).unwrap();
         let routes =
-            resolve_credentials(&policy, &["openai".to_string()], &HashMap::new()).unwrap();
+            resolve_credentials(&policy, &["openai".to_string()], &HashMap::new(), test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].prefix, "openai");
     }
@@ -426,6 +447,7 @@ mod tests {
             &policy,
             &["nonexistent_service".to_string()],
             &HashMap::new(),
+            test_workdir(),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -452,13 +474,16 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
-        let routes = resolve_credentials(&policy, &["telegram".to_string()], &custom).unwrap();
+        let routes = resolve_credentials(&policy, &["telegram".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].prefix, "telegram");
         assert_eq!(routes[0].upstream, "https://api.telegram.org");
@@ -488,13 +513,16 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
-        let routes = resolve_credentials(&policy, &["openai".to_string()], &custom).unwrap();
+        let routes = resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].upstream, "https://my-proxy.example.com/openai");
         assert_eq!(routes[0].credential_key, Some("my_openai_key".to_string()));
@@ -520,9 +548,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
@@ -531,6 +562,7 @@ mod tests {
             &policy,
             &["openai".to_string(), "telegram".to_string()],
             &custom,
+            test_workdir(),
         )
         .unwrap();
 
@@ -562,13 +594,16 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
-        let routes = resolve_credentials(&policy, &["local".to_string()], &custom).unwrap();
+        let routes = resolve_credentials(&policy, &["local".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].upstream, "http://localhost:8080/api");
     }
@@ -640,13 +675,16 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
-        let routes = resolve_credentials(&policy, &["local".to_string()], &custom).unwrap();
+        let routes = resolve_credentials(&policy, &["local".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
     }
 
@@ -669,13 +707,16 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
-        let routes = resolve_credentials(&policy, &["local".to_string()], &custom).unwrap();
+        let routes = resolve_credentials(&policy, &["local".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
     }
 
@@ -698,13 +739,16 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
-        let routes = resolve_credentials(&policy, &["test".to_string()], &custom).unwrap();
+        let routes = resolve_credentials(&policy, &["test".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].inject_header, "X-Custom-Auth");
         assert_eq!(routes[0].credential_format, "Token {}");
@@ -732,19 +776,79 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: Some("OPENAI_API_KEY".to_string()),
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
         let routes =
-            resolve_credentials(&policy, &["openai".to_string()], &custom).expect("should resolve");
+            resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir()).expect("should resolve");
         assert_eq!(routes.len(), 1);
         assert_eq!(
             routes[0].env_var,
             Some("OPENAI_API_KEY".to_string()),
             "env_var must be propagated from CustomCredentialDef to RouteConfig"
+        );
+    }
+
+    #[test]
+    fn test_resolve_credentials_expands_env_vars_in_tls_paths() {
+        // TLS path fields on a custom credential should receive full $VAR /
+        // ${VAR} / ~ expansion so profile authors can reference per-user
+        // material (e.g. `$HOME/.config/.../ca.pem`) without hard-coding.
+        use crate::profile::CustomCredentialDef;
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("NONO_TEST_PKI_DIR", "/etc/my-pki"),
+        ]);
+
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).expect("policy should load");
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "openai".to_string(),
+            CustomCredentialDef {
+                upstream: "https://api.openai.com/v1".to_string(),
+                credential_key: "openai".to_string(),
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: Some("$HOME/.config/pki/ca.pem".to_string()),
+                tls_client_cert: Some("${NONO_TEST_PKI_DIR}/cert.pem".to_string()),
+                tls_client_key: Some("~/.config/pki/key.pem".to_string()),
+            },
+        );
+
+        let routes = resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir())
+            .expect("should resolve");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].tls_ca.as_deref(),
+            Some("/home/user/.config/pki/ca.pem")
+        );
+        assert_eq!(
+            routes[0].tls_client_cert.as_deref(),
+            Some("/etc/my-pki/cert.pem")
+        );
+        assert_eq!(
+            routes[0].tls_client_key.as_deref(),
+            Some("/home/user/.config/pki/key.pem")
         );
     }
 
@@ -757,7 +861,7 @@ mod tests {
 
         let custom = HashMap::new();
         let routes =
-            resolve_credentials(&policy, &["openai".to_string()], &custom).expect("should resolve");
+            resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir()).expect("should resolve");
         assert_eq!(routes.len(), 1);
         assert_eq!(
             routes[0].env_var, None,
@@ -772,7 +876,7 @@ mod tests {
 
         let custom = HashMap::new();
         let routes =
-            resolve_credentials(&policy, &["github".to_string()], &custom).expect("should resolve");
+            resolve_credentials(&policy, &["github".to_string()], &custom, test_workdir()).expect("should resolve");
         assert_eq!(routes.len(), 1);
 
         let github = &routes[0];
@@ -840,13 +944,16 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: Some("LD_PRELOAD".to_string()),
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
-        let result = resolve_credentials(&policy, &["evil".to_string()], &custom);
+        let result = resolve_credentials(&policy, &["evil".to_string()], &custom, test_workdir());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

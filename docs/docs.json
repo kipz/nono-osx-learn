@@ -40,6 +40,7 @@
       {
         "group": "Features",
         "pages": [
+          "cli/features/package-publishing",
           "cli/features/session-lifecycle",
           "cli/features/profiles-groups",
           "cli/features/profile-authoring",
@@ -48,6 +49,7 @@
           "cli/features/supervisor",
           "cli/features/networking",
           "cli/features/credential-injection",
+          "cli/features/environment",
           "cli/features/policy-introspection",
           "cli/features/learn",
           "cli/features/trust"

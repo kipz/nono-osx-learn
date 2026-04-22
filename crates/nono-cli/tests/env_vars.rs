@@ -261,3 +261,137 @@ fn env_conflict_allow_net_and_block_net() {
         "NONO_ALLOW_NET + NONO_BLOCK_NET should conflict"
     );
 }
+
+#[test]
+fn environment_allow_vars_with_profile() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let profile_path = dir.path().join("env-filter-profile.json");
+    std::fs::write(
+        &profile_path,
+        r#"{
+            "meta": { "name": "env-filter-test" },
+            "filesystem": { "allow": ["/usr", "/bin", "/lib", "/tmp"] },
+            "environment": {
+                "allow_vars": ["PATH"]
+            }
+        }"#,
+    )
+    .expect("write profile");
+
+    let output = nono_bin()
+        .env("MY_SECRET", "should_not_see")
+        .args([
+            "run",
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--dry-run",
+            "echo",
+        ])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "profile with environment.allow_vars should be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn environment_allow_vars_default_allows_all() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let profile_path = dir.path().join("no-env-filter-profile.json");
+    std::fs::write(
+        &profile_path,
+        r#"{
+            "meta": { "name": "no-env-filter-test" },
+            "filesystem": { "allow": ["/usr", "/bin", "/lib", "/tmp"] }
+        }"#,
+    )
+    .expect("write profile");
+
+    let output = nono_bin()
+        .args([
+            "run",
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--dry-run",
+            "echo",
+        ])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "profile without environment section should be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn environment_allow_vars_prefix_patterns() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let profile_path = dir.path().join("env-prefix-profile.json");
+    std::fs::write(
+        &profile_path,
+        r#"{
+            "meta": { "name": "env-prefix-test" },
+            "filesystem": { "allow": ["/usr", "/bin", "/lib", "/tmp"] },
+            "environment": {
+                "allow_vars": ["PATH", "HOME", "AWS_*", "MYAPP_*"]
+            }
+        }"#,
+    )
+    .expect("write profile");
+
+    let output = nono_bin()
+        .args([
+            "run",
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--dry-run",
+            "echo",
+        ])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "profile with prefix patterns should be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn environment_allow_vars_bare_star() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let profile_path = dir.path().join("env-bare-star-profile.json");
+    std::fs::write(
+        &profile_path,
+        r#"{
+            "meta": { "name": "env-bare-star-test" },
+            "filesystem": { "allow": ["/usr", "/bin", "/lib", "/tmp"] },
+            "environment": {
+                "allow_vars": ["*"]
+            }
+        }"#,
+    )
+    .expect("write profile");
+
+    let output = nono_bin()
+        .args([
+            "run",
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--dry-run",
+            "echo",
+        ])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "profile with bare * should be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

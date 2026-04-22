@@ -75,9 +75,8 @@ pub struct PolicyPatchConfig {
     /// Additional deny.access paths to apply.
     #[serde(default)]
     pub add_deny_access: Vec<String>,
-    /// Additional commands to block, extending deny.commands from groups.
-    /// Useful for blocking specific binaries (e.g. "docker", "kubectl") without
-    /// requiring changes to policy.json.
+    /// Deprecated startup-only command denylist extension.
+    /// Parsed for compatibility in v0.33.0, but not enforced for child processes.
     #[serde(default)]
     pub add_deny_commands: Vec<String>,
     /// Paths to exempt from deny groups.
@@ -138,6 +137,14 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub query_param_name: Option<String>,
 
+    /// Optional overrides for proxy-side phantom token handling.
+    ///
+    /// When set, these values control how the local proxy validates incoming
+    /// phantom tokens from the sandboxed process. Outbound upstream injection
+    /// still uses the top-level fields.
+    #[serde(default)]
+    pub proxy: Option<nono_proxy::config::ProxyInjectConfig>,
+
     /// Explicit environment variable name for the phantom token (e.g., "OPENAI_API_KEY").
     ///
     /// When set, the proxy uses this as the SDK API key env var instead of
@@ -163,6 +170,22 @@ pub struct CustomCredentialDef {
     /// ambiguity.
     #[serde(default)]
     pub tls_ca: Option<String>,
+
+    /// Optional path to a PEM-encoded client certificate for upstream mTLS.
+    ///
+    /// When set together with `tls_client_key`, the proxy presents this
+    /// certificate to the upstream during TLS handshake. Required for
+    /// upstreams that enforce mutual TLS (e.g., Kubernetes API servers
+    /// configured with client-certificate authentication).
+    #[serde(default)]
+    pub tls_client_cert: Option<String>,
+
+    /// Optional path to a PEM-encoded private key for upstream mTLS.
+    ///
+    /// Must be set together with `tls_client_cert`. The key must correspond
+    /// to the certificate in `tls_client_cert`.
+    #[serde(default)]
+    pub tls_client_key: Option<String>,
 }
 
 fn default_inject_header() -> String {
@@ -310,6 +333,126 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         InjectMode::BasicAuth => {
             // No additional required fields for basic_auth mode
             // Credential value is expected to be "username:password" format
+        }
+    }
+
+    validate_proxy_override(name, cred)?;
+
+    Ok(())
+}
+
+fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()> {
+    let Some(proxy) = cred.proxy.as_ref() else {
+        return Ok(());
+    };
+
+    let mode = proxy.inject_mode.as_ref().unwrap_or(&cred.inject_mode);
+
+    match mode {
+        InjectMode::Header | InjectMode::BasicAuth => {
+            let header = proxy
+                .inject_header
+                .as_deref()
+                .unwrap_or(cred.inject_header.as_str());
+            if header.is_empty() {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.inject_header for custom credential '{}' cannot be empty",
+                    name
+                )));
+            }
+            if !header.chars().all(is_http_token_char) {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.inject_header '{}' for custom credential '{}' contains invalid characters; \
+                     header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
+                    header, name
+                )));
+            }
+
+            if *mode == InjectMode::Header {
+                let format = proxy
+                    .credential_format
+                    .as_deref()
+                    .unwrap_or(cred.credential_format.as_str());
+                if format.contains('\r') || format.contains('\n') {
+                    return Err(NonoError::ProfileParse(format!(
+                        "proxy.credential_format for custom credential '{}' contains invalid CRLF characters; \
+                         this could enable header injection attacks",
+                        name
+                    )));
+                }
+            }
+        }
+        InjectMode::UrlPath => {
+            let pattern = proxy
+                .path_pattern
+                .as_deref()
+                .or(cred.path_pattern.as_deref())
+                .ok_or_else(|| {
+                    NonoError::ProfileParse(format!(
+                        "proxy.path_pattern is required for custom credential '{}' when effective inject_mode is 'url_path'",
+                        name
+                    ))
+                })?;
+            if !pattern.contains("{}") {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.path_pattern '{}' for custom credential '{}' must contain {{}} placeholder",
+                    pattern, name
+                )));
+            }
+            if pattern.contains('\r') || pattern.contains('\n') {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.path_pattern for custom credential '{}' contains invalid CRLF characters",
+                    name
+                )));
+            }
+
+            if let Some(replacement) = proxy
+                .path_replacement
+                .as_deref()
+                .or(cred.path_replacement.as_deref())
+            {
+                if !replacement.contains("{}") {
+                    return Err(NonoError::ProfileParse(format!(
+                        "proxy.path_replacement '{}' for custom credential '{}' must contain {{}} placeholder",
+                        replacement, name
+                    )));
+                }
+                if replacement.contains('\r') || replacement.contains('\n') {
+                    return Err(NonoError::ProfileParse(format!(
+                        "proxy.path_replacement for custom credential '{}' contains invalid CRLF characters",
+                        name
+                    )));
+                }
+            }
+        }
+        InjectMode::QueryParam => {
+            let param_name = proxy
+                .query_param_name
+                .as_deref()
+                .or(cred.query_param_name.as_deref())
+                .ok_or_else(|| {
+                    NonoError::ProfileParse(format!(
+                        "proxy.query_param_name is required for custom credential '{}' when effective inject_mode is 'query_param'",
+                        name
+                    ))
+                })?;
+
+            if param_name.is_empty() {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.query_param_name for custom credential '{}' cannot be empty",
+                    name
+                )));
+            }
+            if !param_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.query_param_name '{}' for custom credential '{}' must contain only \
+                     alphanumeric characters, underscores, and hyphens",
+                    param_name, name
+                )));
+            }
         }
     }
 
@@ -477,7 +620,7 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
 /// Validate env_credentials keys in a profile.
 ///
 /// Keys can be keyring account names, `op://` URIs, `apple-password://` URIs,
-/// `env://` URIs, or `file://` URIs.
+/// `keyring://` URIs, `env://` URIs, or `file://` URIs.
 /// Keyring account names are validated at load time by the keyring crate itself,
 /// but URI entries need structural validation upfront.
 fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
@@ -492,6 +635,10 @@ fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
                     "invalid Apple Passwords URI in env_credentials: {}",
                     e
                 ))
+            })?;
+        } else if nono::keystore::is_keyring_uri(key) {
+            nono::keystore::validate_keyring_uri(key).map_err(|e| {
+                NonoError::ProfileParse(format!("invalid keyring URI in env_credentials: {}", e))
             })?;
         } else if nono::keystore::is_env_uri(key) {
             nono::keystore::validate_env_uri(key).map_err(|e| {
@@ -840,8 +987,8 @@ pub struct SecurityConfig {
     /// Policy group names to resolve (from policy.json)
     #[serde(default)]
     pub groups: Vec<String>,
-    /// Commands to allow even when blocked by default policy (e.g. `["rm"]`).
-    /// Applied before CLI `--allow-command` overrides.
+    /// Deprecated startup-only command allowlist override.
+    /// Parsed for compatibility in v0.33.0, but not enforced for child processes.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
     /// Signal isolation mode. Controls whether the sandboxed process can signal
@@ -890,6 +1037,25 @@ pub struct RollbackConfig {
     /// Matched against the filename using standard glob syntax.
     #[serde(default)]
     pub exclude_globs: Vec<String>,
+}
+
+/// Controls which environment variables are passed to the sandboxed process.
+///
+/// By default, all environment variables are inherited from the parent process.
+/// When `allow_vars` is set, only the listed variables (and nono-injected
+/// credentials) are passed through. Supports exact names (`"PATH"`) and
+/// prefix patterns (`"AWS_*"`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentConfig {
+    /// Allow-list of environment variable names passed to the sandboxed process.
+    ///
+    /// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
+    /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
+    /// When empty, all variables are allowed (default).
+    /// Nono-injected credentials always bypass this list.
+    #[serde(default)]
+    pub allow_vars: Vec<String>,
 }
 
 /// Configuration for supervisor-delegated URL opening.
@@ -965,6 +1131,8 @@ pub struct Profile {
     #[serde(default, alias = "secrets")]
     pub env_credentials: SecretsConfig,
     #[serde(default)]
+    pub environment: Option<EnvironmentConfig>,
+    #[serde(default)]
     pub workdir: WorkdirConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -981,6 +1149,9 @@ pub struct Profile {
     /// When `None`, inherits from the base profile.
     #[serde(default)]
     pub allow_launch_services: Option<bool>,
+    /// Opt-in gate for GPU access (Metal/IOKit on macOS, render nodes on Linux).
+    /// Must be paired with the CLI flag `--allow-gpu`.
+    /// When `None`, inherits from the base profile.
     #[serde(default)]
     pub allow_gpu: Option<bool>,
     /// Opt-in to allow parent-of-protected-root grants on macOS.
@@ -996,6 +1167,14 @@ pub struct Profile {
     /// Treated like built-in heavy directories (for example `target`).
     #[serde(default)]
     pub skipdirs: Vec<String>,
+    /// Pack dependencies verified at launch before sandbox is applied.
+    /// Each entry is a `<namespace>/<name>` reference to an installed pack.
+    #[serde(default)]
+    pub packs: Vec<String>,
+    /// Extra arguments appended to the child command at launch.
+    /// Supports variable expansion (e.g. `$NONO_PACKAGES`).
+    #[serde(default)]
+    pub command_args: Vec<String>,
     /// Command mediation policy: intercept commands, inject credentials.
     #[serde(default)]
     pub mediation: crate::mediation::MediationConfig,
@@ -1022,6 +1201,8 @@ struct ProfileDeserialize {
     #[serde(default, alias = "secrets")]
     env_credentials: SecretsConfig,
     #[serde(default)]
+    environment: Option<EnvironmentConfig>,
+    #[serde(default)]
     workdir: WorkdirConfig,
     #[serde(default)]
     hooks: HooksConfig,
@@ -1039,6 +1220,10 @@ struct ProfileDeserialize {
     #[serde(default)]
     skipdirs: Vec<String>,
     #[serde(default)]
+    packs: Vec<String>,
+    #[serde(default)]
+    command_args: Vec<String>,
+    #[serde(default)]
     mediation: crate::mediation::MediationConfig,
 }
 
@@ -1052,6 +1237,7 @@ impl From<ProfileDeserialize> for Profile {
             policy: raw.policy,
             network: raw.network,
             env_credentials: raw.env_credentials,
+            environment: raw.environment,
             workdir: raw.workdir,
             hooks: raw.hooks,
             rollback: raw.rollback,
@@ -1061,6 +1247,8 @@ impl From<ProfileDeserialize> for Profile {
             allow_parent_of_protected: raw.allow_parent_of_protected,
             interactive: raw.interactive,
             skipdirs: raw.skipdirs,
+            packs: raw.packs,
+            command_args: raw.command_args,
             mediation: raw.mediation,
         }
     }
@@ -1087,6 +1275,20 @@ pub fn is_user_override(name: &str) -> bool {
     get_user_profile_path(name)
         .map(|p| p.exists())
         .unwrap_or(false)
+}
+
+/// Return the package directory that owns a profile symlink, if any.
+///
+/// A package-managed profile appears in `~/.config/nono/profiles/` as a symlink
+/// into the package store. This helper resolves that relationship so package
+/// hooks and other assets can be located relative to the installed package.
+#[allow(dead_code)]
+pub fn get_package_for_profile(name: &str) -> Option<PathBuf> {
+    if !is_valid_profile_name(name) {
+        return None;
+    }
+
+    crate::package::is_profile_symlink_into_package_store(name)
 }
 
 /// Load a profile's raw (unresolved) extends target names.
@@ -1133,6 +1335,12 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 /// 1. User profiles from ~/.config/nono/profiles/<name>.json (allows customization)
 /// 2. Built-in profiles (compiled into binary, fallback)
 pub fn load_profile(name_or_path: &str) -> Result<Profile> {
+    // Registry reference (namespace/name) — detect before the file path check
+    // since the `/` would otherwise be treated as a path separator.
+    if is_registry_ref(name_or_path) {
+        return load_registry_profile(name_or_path);
+    }
+
     // Direct file path: contains separator or ends with .json
     if name_or_path.contains('/') || name_or_path.ends_with(".json") {
         return load_profile_from_path(Path::new(name_or_path));
@@ -1160,6 +1368,89 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
     }
 
     Err(NonoError::ProfileNotFound(name_or_path.to_string()))
+}
+
+/// Returns true if the string looks like a registry package reference
+/// (`namespace/name` or `namespace/name@version`) rather than a filesystem path.
+fn is_registry_ref(s: &str) -> bool {
+    // Strip optional @version suffix for the path check
+    let path_part = s.split_once('@').map_or(s, |(p, _)| p);
+    let parts: Vec<&str> = path_part.split('/').collect();
+    parts.len() == 2
+        && !s.starts_with('.')
+        && !s.starts_with('~')
+        && !s.starts_with('/')
+        && !s.ends_with(".json")
+        && parts.iter().all(|p| !p.is_empty())
+}
+
+/// Load a profile from a registry pack. If the pack isn't installed locally,
+/// pull it first (Docker-style auto-pull with Sigstore verification).
+fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
+    let package_ref = crate::package::parse_package_ref(name_or_path)?;
+    let install_dir =
+        crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
+
+    // Check if pack is already installed
+    if !install_dir.join("package.json").exists() {
+        eprintln!("Profile '{}' not found locally.", package_ref.key());
+
+        // Auto-pull from registry
+        crate::package_cmd::run_pull(crate::cli::PullArgs {
+            package_ref: name_or_path.to_string(),
+            registry: None,
+            force: false,
+            init: false,
+            help: None,
+        })?;
+    }
+
+    // Read manifest to check pack type and find profile artifacts
+    let manifest_path = install_dir.join("package.json");
+    if !manifest_path.exists() {
+        return Err(NonoError::ProfileNotFound(format!(
+            "pack '{}' failed to install",
+            package_ref.key()
+        )));
+    }
+
+    let manifest_json = std::fs::read_to_string(&manifest_path).map_err(NonoError::Io)?;
+    let manifest: crate::package::PackageManifest =
+        serde_json::from_str(&manifest_json).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid package.json in '{}': {e}",
+                package_ref.key()
+            ))
+        })?;
+
+    if manifest.pack_type != crate::package::PackType::Policy {
+        return Err(NonoError::ProfileParse(format!(
+            "'{}' is a {} — only policy packs can be used with --profile.\n\
+             Use 'nono pull {}' to install it instead.",
+            package_ref.key(),
+            manifest.pack_type.label(),
+            package_ref.key()
+        )));
+    }
+
+    // Find the profile JSON in the installed pack
+    for artifact in &manifest.artifacts {
+        if artifact.artifact_type == crate::package::ArtifactType::Profile {
+            let install_name = artifact.install_as.as_deref().unwrap_or(&artifact.path);
+            let profile_path = install_dir
+                .join("profiles")
+                .join(format!("{install_name}.json"));
+            if profile_path.exists() {
+                tracing::info!("Loading registry profile from: {}", profile_path.display());
+                return finalize_profile(load_from_file(&profile_path)?);
+            }
+        }
+    }
+
+    Err(NonoError::ProfileParse(format!(
+        "no profile found in pack '{}'",
+        package_ref.key()
+    )))
 }
 
 /// Load a profile from a direct file path.
@@ -1461,6 +1752,14 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 merged
             },
         },
+        environment: match (&base.environment, &child.environment) {
+            (None, None) => None,
+            (Some(base_env), None) => Some(base_env.clone()),
+            (None, Some(child_env)) => Some(child_env.clone()),
+            (Some(base_env), Some(child_env)) => Some(EnvironmentConfig {
+                allow_vars: dedup_append(&base_env.allow_vars, &child_env.allow_vars),
+            }),
+        },
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
         // A child cannot override a base's workdir grant to None. This is a v1 limitation;
         // fixing it requires wrapping in Option<WorkdirAccess> and updating all consumers.
@@ -1497,6 +1796,8 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             .or(base.allow_parent_of_protected),
         interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
+        packs: dedup_append(&base.packs, &child.packs),
+        command_args: dedup_append(&base.command_args, &child.command_args),
         // Child's mediation config takes precedence; base is ignored.
         // (Merging two mediation configs would be complex and is not needed.)
         mediation: if child.mediation.is_active() {
@@ -1587,11 +1888,23 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
         && !name.ends_with('-')
 }
 
-/// Expand environment variables in a path string
+/// Expand environment variables in a path string.
 ///
-/// Supported variables:
+/// Convenience wrapper around [`expand_str`] that returns `PathBuf`. See
+/// [`expand_str`] for the list of supported variables and their precedence.
+pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
+    expand_str(path, workdir).map(PathBuf::from)
+}
+
+/// Expand environment variables in an arbitrary profile string.
+///
+/// Same semantics as [`expand_vars`] but returns a `String`, so it can be used
+/// for non-path profile fields (e.g. `args_prefix` in command mediation rules)
+/// without forcing the value through `PathBuf` round-tripping.
+///
+/// Supported variables (explicit, with defaults / validated sources):
 /// - $WORKDIR: Working directory (--workdir or cwd)
-/// - $HOME: User's home directory
+/// - $HOME: User's home directory (from `config::validated_home`, not raw `$HOME` env)
 /// - $XDG_CONFIG_HOME: XDG config directory
 /// - $XDG_DATA_HOME: XDG data directory
 /// - $XDG_STATE_HOME: XDG state directory
@@ -1600,12 +1913,21 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 /// - $TMPDIR: System temporary directory
 /// - $UID: Current user ID
 ///
-/// If $HOME cannot be determined and the path uses $HOME or XDG variables,
-/// the unexpanded variable is left in place (which will cause the path to not exist).
-pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
+/// After the explicit pass, any remaining `$VAR` / `${VAR}` tokens whose name
+/// matches `[A-Z_][A-Z0-9_]*` are looked up in the process environment. If set,
+/// they are substituted; if unset, they are left literal (same fallback as
+/// `$XDG_RUNTIME_DIR`), so downstream consumers observe the raw token. The
+/// generic pass is linear — substituted content is not rescanned, so `$A=$B`
+/// cycles cannot loop. Lower-case tokens like `$foo` are never expanded,
+/// matching shell convention for environment variables.
+///
+/// If $HOME cannot be determined and the input uses $HOME or XDG variables,
+/// the unexpanded variable is left in place.
+pub fn expand_str(input: &str, workdir: &Path) -> Result<String> {
     use crate::config;
 
     let home = config::validated_home()?;
+    let path = input;
 
     // Expand ~/... to $HOME/... before other substitutions
     let path = if let Some(rest) = path.strip_prefix("~/") {
@@ -1677,7 +1999,87 @@ pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
         expanded = expanded.replace("$XDG_RUNTIME_DIR", rt);
     }
 
-    Ok(PathBuf::from(expanded))
+    // Expand $NONO_PACKAGES to the package store directory
+    if expanded.contains("$NONO_PACKAGES") {
+        let packages_dir = crate::package::package_store_dir()?;
+        expanded = expanded.replace("$NONO_PACKAGES", &packages_dir.to_string_lossy());
+    }
+
+    // Final pass: expand any remaining $VAR / ${VAR} tokens from the process
+    // environment. Runs once, linearly — substituted content is not rescanned
+    // (`$A=$B`-style cycles cannot loop). Unset variables are left literal so
+    // the resulting path fails to resolve and the caller skips it with a
+    // "does not exist" warning.
+    expanded = expand_remaining_env_vars(&expanded);
+
+    Ok(expanded)
+}
+
+/// Expand any remaining `$VAR` / `${VAR}` tokens in `input` from the process
+/// environment. Only uppercase+underscore+digit identifiers are recognised —
+/// lowercase tokens (e.g. `$foo`) are left literal to avoid false positives.
+/// Unset variables are left literal. Single linear pass.
+fn expand_remaining_env_vars(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        // Handle `${VAR}`
+        if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(close) = bytes[i + 2..].iter().position(|&b| b == b'}') {
+                let name = &input[i + 2..i + 2 + close];
+                if is_valid_env_var_name(name) {
+                    match std::env::var(name) {
+                        Ok(val) => out.push_str(&val),
+                        Err(_) => out.push_str(&input[i..i + 3 + close]),
+                    }
+                    i += 3 + close;
+                    continue;
+                }
+            }
+            // Malformed or invalid name — emit the `$` literally and continue.
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        // Handle `$VAR` — first char must be [A-Z_], remainder [A-Z0-9_].
+        let name_start = i + 1;
+        let first = bytes.get(name_start).copied();
+        if !matches!(first, Some(c) if c == b'_' || c.is_ascii_uppercase()) {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        let mut end = name_start + 1;
+        while end < bytes.len()
+            && (bytes[end] == b'_'
+                || bytes[end].is_ascii_uppercase()
+                || bytes[end].is_ascii_digit())
+        {
+            end += 1;
+        }
+        let name = &input[name_start..end];
+        match std::env::var(name) {
+            Ok(val) => out.push_str(&val),
+            Err(_) => out.push_str(&input[i..end]),
+        }
+        i = end;
+    }
+    out
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.bytes();
+    match chars.next() {
+        Some(c) if c == b'_' || c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == b'_' || c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 /// List available profiles (built-in + user)
@@ -1811,6 +2213,133 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_vars_generic_env_set() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("FOO", "/tmp/foo"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$FOO/bar", &workdir).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/tmp/foo/bar"));
+    }
+
+    #[test]
+    fn test_expand_vars_generic_env_unset() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Pre-register FOO so EnvVarGuard will restore whatever ambient value
+        // exists, then remove it for the scope of the test.
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("FOO", ""),
+        ]);
+        _env.remove("FOO");
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$FOO/bar", &workdir).expect("valid env");
+        assert_eq!(
+            expanded,
+            PathBuf::from("$FOO/bar"),
+            "unset $FOO should be left literal"
+        );
+    }
+
+    #[test]
+    fn test_expand_vars_generic_braces() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("FOO", "/a"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("${FOO}/bar", &workdir).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/a/bar"));
+    }
+
+    #[test]
+    fn test_expand_vars_generic_lowercase_not_expanded() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Ambient lower-case `foo` env var is set — $foo must remain literal.
+        // Set it directly (EnvVarGuard pattern matches on key, and we want to
+        // prove the recogniser rejects lower-case rather than the lookup
+        // failing).
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("foo", "/should-not-appear"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$foo/bar", &workdir).expect("valid env");
+        assert_eq!(
+            expanded,
+            PathBuf::from("$foo/bar"),
+            "lower-case $foo must not be expanded even when env var is set"
+        );
+    }
+
+    #[test]
+    fn test_expand_vars_known_vars_precedence() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Set HOME to a specific value — validated_home() reads this.
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user")]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$HOME/x", &workdir).expect("valid env");
+        assert_eq!(
+            expanded,
+            PathBuf::from("/home/user/x"),
+            "explicit $HOME pass must run before generic env pass"
+        );
+    }
+
+    #[test]
+    fn test_expand_str_returns_string_with_embedded_tokens() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("USER", "jcarnegie"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+
+        // expand_str handles non-path strings (e.g. args_prefix entries) so
+        // things like `security find-generic-password $USER ...` work.
+        let expanded = expand_str("$USER", &workdir).expect("valid env");
+        assert_eq!(expanded, "jcarnegie");
+
+        let expanded = expand_str("${USER}-creds", &workdir).expect("valid env");
+        assert_eq!(expanded, "jcarnegie-creds");
+
+        // Unknown vars stay literal.
+        let expanded = expand_str("$DEFINITELY_UNSET_XYZ", &workdir).expect("valid env");
+        assert_eq!(expanded, "$DEFINITELY_UNSET_XYZ");
+
+        // Explicit-pass variables still resolve.
+        let expanded = expand_str("$HOME/cfg", &workdir).expect("valid env");
+        assert_eq!(expanded, "/home/user/cfg");
+    }
+
+    #[test]
     fn test_resolve_user_config_dir_uses_valid_absolute_xdg() {
         let _guard = match crate::test_env::ENV_LOCK.lock() {
             Ok(g) => g,
@@ -1921,6 +2450,67 @@ mod tests {
     }
 
     #[test]
+    fn test_environment_config_default() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        assert!(profile.environment.is_none());
+    }
+
+    #[test]
+    fn test_environment_config_with_allow_vars() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "allow_vars": ["PATH", "HOME", "AWS_*"]
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        assert_eq!(
+            profile
+                .environment
+                .as_ref()
+                .expect("environment")
+                .allow_vars,
+            vec!["PATH", "HOME", "AWS_*"]
+        );
+    }
+
+    #[test]
+    fn test_environment_config_deny_unknown_fields() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "allow_vars": ["PATH"],
+                "unknown_field": true
+            }
+        }"#;
+
+        let result = serde_json::from_str::<Profile>(json_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_environment_config_empty_allow_vars() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "allow_vars": []
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let env_config = profile
+            .environment
+            .as_ref()
+            .expect("environment should be Some");
+        assert!(env_config.allow_vars.is_empty());
+    }
+
+    #[test]
     fn test_validate_env_credentials_accepts_apple_password_uri() {
         let json_str = r#"{
             "meta": { "name": "test-profile" },
@@ -1945,6 +2535,46 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         let err = validate_env_credential_keys(&profile).expect_err("should reject");
         assert!(err.to_string().contains("Apple Passwords URI"));
+    }
+
+    #[test]
+    fn test_validate_env_credentials_accepts_keyring_uri() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "env_credentials": {
+                "keyring://gh:github.com/alice": "GH_TOKEN"
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        assert!(validate_env_credential_keys(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_credentials_accepts_keyring_uri_with_decode() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "env_credentials": {
+                "keyring://gh:github.com/alice?decode=go-keyring": "GH_TOKEN"
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        assert!(validate_env_credential_keys(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_credentials_rejects_invalid_keyring_uri() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "env_credentials": {
+                "keyring://gh:github.com": "GH_TOKEN"
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let err = validate_env_credential_keys(&profile).expect_err("should reject");
+        assert!(err.to_string().contains("keyring URI"));
     }
 
     #[test]
@@ -2179,9 +2809,12 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         }
     }
 
@@ -2339,9 +2972,12 @@ mod tests {
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -2357,9 +2993,12 @@ mod tests {
             path_pattern: None, // Missing required field
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("missing path_pattern should be rejected");
@@ -2377,9 +3016,12 @@ mod tests {
             path_pattern: Some("/bot/token/".to_string()), // No {} placeholder
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("pattern without {} should be rejected");
@@ -2397,9 +3039,12 @@ mod tests {
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot{}/".to_string()),
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -2415,9 +3060,12 @@ mod tests {
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot/fixed/".to_string()), // No {} placeholder
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("replacement without {} should be rejected");
@@ -2435,9 +3083,12 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("key".to_string()),
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         assert!(validate_custom_credential("google_maps", &cred).is_ok());
     }
@@ -2453,9 +3104,12 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None, // Missing required field
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("missing query_param_name should be rejected");
@@ -2473,9 +3127,12 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("".to_string()), // Empty
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("empty query_param_name should be rejected");
@@ -2493,13 +3150,67 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
         assert!(validate_custom_credential("example", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_proxy_override_query_param_requires_name() {
+        let mut cred = header_cred_builder();
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: Some(InjectMode::QueryParam),
+            inject_header: None,
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        });
+
+        let result = validate_custom_credential("test", &cred);
+        let err = result.expect_err("proxy query_param_name should be required");
+        assert!(err
+            .to_string()
+            .contains("proxy.query_param_name is required"));
+    }
+
+    #[test]
+    fn test_validate_proxy_override_query_param_with_fallback_name() {
+        let mut cred = header_cred_builder();
+        cred.query_param_name = Some("api_key".to_string());
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: Some(InjectMode::QueryParam),
+            inject_header: None,
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        });
+
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_proxy_override_url_path_with_fallback_pattern() {
+        let mut cred = header_cred_builder();
+        cred.path_pattern = Some("/bot/{}/".to_string());
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: Some(InjectMode::UrlPath),
+            inject_header: None,
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        });
+
+        assert!(validate_custom_credential("test", &cred).is_ok());
     }
 
     // ============================================================================
@@ -2658,6 +3369,7 @@ mod tests {
                     m
                 },
             },
+            environment: None,
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
@@ -2673,10 +3385,12 @@ mod tests {
                 allow_localhost: false,
             }),
             allow_launch_services: Some(false),
-            allow_gpu: None,
+            allow_gpu: Some(false),
             allow_parent_of_protected: None,
             interactive: false,
             skipdirs: vec!["vendor".to_string()],
+            packs: vec![],
+            command_args: vec![],
             mediation: crate::mediation::MediationConfig::default(),
         }
     }
@@ -2729,6 +3443,7 @@ mod tests {
                     m
                 },
             },
+            environment: None,
             workdir: WorkdirConfig {
                 access: WorkdirAccess::None,
             },
@@ -2744,10 +3459,12 @@ mod tests {
                 allow_localhost: true,
             }),
             allow_launch_services: Some(true),
-            allow_gpu: None,
+            allow_gpu: Some(true),
             allow_parent_of_protected: Some(true),
             interactive: false,
             skipdirs: vec!["dist".to_string()],
+            packs: vec![],
+            command_args: vec![],
             mediation: crate::mediation::MediationConfig::default(),
         }
     }
@@ -2820,9 +3537,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
@@ -2838,9 +3558,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
@@ -2974,9 +3697,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
@@ -2992,9 +3718,12 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         );
 
@@ -3360,33 +4089,27 @@ mod tests {
     #[test]
     fn test_merge_profiles_allow_gpu() {
         // 1. Child inherits from base when child's value is None.
-        let mut base = base_profile();
-        base.allow_gpu = Some(true);
-        let child = child_profile(); // allow_gpu is None
-        let merged = merge_profiles(base, child);
+        let mut child = child_profile();
+        child.allow_gpu = None;
+        let merged = merge_profiles(base_profile(), child);
         assert_eq!(
             merged.allow_gpu,
-            Some(true),
+            Some(false),
             "Child should inherit allow_gpu from base"
         );
 
         // 2. Child overrides base when child has a value.
-        let mut base = base_profile();
-        base.allow_gpu = Some(true);
-        let mut child = child_profile();
-        child.allow_gpu = Some(false);
-        let merged = merge_profiles(base, child);
+        let merged = merge_profiles(base_profile(), child_profile());
         assert_eq!(
             merged.allow_gpu,
-            Some(false),
+            Some(true),
             "Child should override base allow_gpu"
         );
 
         // 3. Child's value is used when base has no value.
-        let base = base_profile(); // allow_gpu is None
-        let mut child = child_profile();
-        child.allow_gpu = Some(true);
-        let merged = merge_profiles(base, child);
+        let mut base = base_profile();
+        base.allow_gpu = None;
+        let merged = merge_profiles(base, child_profile());
         assert_eq!(
             merged.allow_gpu,
             Some(true),
@@ -4203,9 +4926,12 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         assert!(
             validate_custom_credential("example", &cred).is_ok(),
@@ -4224,9 +4950,12 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             endpoint_rules: vec![],
             env_var: None,
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI without env_var should be rejected");
@@ -4248,9 +4977,12 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI with relative path should be rejected");
@@ -4272,9 +5004,12 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(

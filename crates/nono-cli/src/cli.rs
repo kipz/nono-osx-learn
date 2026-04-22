@@ -47,6 +47,13 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   audit      View audit trail of sandboxed commands
   trust      Manage file trust and attestation
 
+\x1b[1mPACKS\x1b[0m
+  pull       Install a signed nono pack from the registry
+  remove     Remove an installed nono pack
+  update     Update installed nono packs
+  search     Search the registry for nono packs
+  list       List installed nono packs
+
 \x1b[1mPOLICY & PROFILES\x1b[0m
   policy     Inspect policy groups, profiles, and security rules
   profile    Create and manage nono profiles
@@ -468,9 +475,187 @@ IN-BAND DETACH:
 ")]
     Profile(ProfileCmdArgs),
 
+    /// Install a signed nono pack from the registry
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono pull <namespace>/<name>[@<version>] [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono pull nono-project/claude-code
+  nono pull nono-project/claude-code@1.2.0 --registry http://localhost:3000
+  nono pull nono-project/claude-code --init
+")]
+    Pull(PullArgs),
+
+    /// Remove an installed nono pack
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono remove <namespace>/<name>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono remove nono-project/claude-code
+")]
+    Remove(RemoveArgs),
+
+    /// Update installed nono packs
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono update [<namespace>/<name>] [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono update
+  nono update nono-project/claude-code
+")]
+    Update(UpdateArgs),
+
+    /// Search the registry for nono packs
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono search <query> [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono search claude
+  nono search sandbox --json
+")]
+    Search(SearchArgs),
+
+    /// List installed nono packs
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono list --installed [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono list --installed
+  nono list --installed --json
+")]
+    List(ListArgs),
+
     /// Internal: open a URL via supervisor IPC
     #[command(hide = true)]
     OpenUrlHelper(OpenUrlHelperArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PullArgs {
+    /// Package reference (<namespace>/<name>[@<version>])
+    pub package_ref: String,
+
+    /// Registry base URL
+    #[arg(
+        long,
+        env = "NONO_REGISTRY",
+        value_name = "URL",
+        help_heading = "OPTIONS"
+    )]
+    pub registry: Option<String>,
+
+    /// Overwrite conflicts and accept signer changes
+    #[arg(long, help_heading = "OPTIONS")]
+    pub force: bool,
+
+    /// Copy project instructions into the current directory
+    #[arg(long, help_heading = "OPTIONS")]
+    pub init: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct RemoveArgs {
+    /// Installed package reference (<namespace>/<name>)
+    pub package_ref: String,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct UpdateArgs {
+    /// Optional package reference (<namespace>/<name>)
+    pub package_ref: Option<String>,
+
+    /// Registry base URL
+    #[arg(
+        long,
+        env = "NONO_REGISTRY",
+        value_name = "URL",
+        help_heading = "OPTIONS"
+    )]
+    pub registry: Option<String>,
+
+    /// Accept signer changes
+    #[arg(long, help_heading = "OPTIONS")]
+    pub force: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct SearchArgs {
+    /// Search query
+    pub query: String,
+
+    /// Registry base URL
+    #[arg(
+        long,
+        env = "NONO_REGISTRY",
+        value_name = "URL",
+        help_heading = "OPTIONS"
+    )]
+    pub registry: Option<String>,
+
+    /// Output as JSON
+    #[arg(long, help_heading = "OPTIONS")]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct ListArgs {
+    /// Show installed nono packs
+    #[arg(long, help_heading = "OPTIONS")]
+    pub installed: bool,
+
+    /// Output as JSON
+    #[arg(long, help_heading = "OPTIONS")]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
 }
 
 /// Arguments for the hidden open-url-helper subcommand.
@@ -810,11 +995,11 @@ pub struct SandboxArgs {
     pub env_credential_map: Vec<String>,
 
     // ── Commands ─────────────────────────────────────────────────────────
-    /// Allow a normally-blocked dangerous command (use with caution)
+    /// Deprecated startup-only command allowlist override (not child-process enforced)
     #[arg(long, value_name = "CMD", help_heading = "COMMANDS")]
     pub allow_command: Vec<String>,
 
-    /// Block an additional command beyond the default blocklist
+    /// Deprecated startup-only command denylist extension (not child-process enforced)
     #[arg(long, value_name = "CMD", help_heading = "COMMANDS")]
     pub block_command: Vec<String>,
 
@@ -833,7 +1018,7 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
 
-    /// Allow GPU access on Apple Silicon Macs through IOKit
+    /// Allow GPU access (Metal/IOKit on Apple Silicon macOS, render nodes on Linux)
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_gpu: bool,
 
@@ -971,11 +1156,11 @@ pub struct WrapSandboxArgs {
     pub env_credential_map: Vec<String>,
 
     // ── Commands ─────────────────────────────────────────────────────────
-    /// Allow a normally-blocked dangerous command (use with caution)
+    /// Deprecated startup-only command allowlist override (not child-process enforced)
     #[arg(long, value_name = "CMD", help_heading = "COMMANDS")]
     pub allow_command: Vec<String>,
 
-    /// Block an additional command beyond the default blocklist
+    /// Deprecated startup-only command denylist extension (not child-process enforced)
     #[arg(long, value_name = "CMD", help_heading = "COMMANDS")]
     pub block_command: Vec<String>,
 
@@ -994,7 +1179,7 @@ pub struct WrapSandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
 
-    /// Allow GPU access on Apple Silicon Macs through IOKit
+    /// Allow GPU access (Metal/IOKit on Apple Silicon macOS, render nodes on Linux)
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_gpu: bool,
 
@@ -1122,7 +1307,7 @@ pub struct RunArgs {
     pub no_diagnostics: bool,
 
     /// Disable the audit trail for this session
-    #[arg(long, conflicts_with = "rollback", help_heading = "OPTIONS")]
+    #[arg(long, help_heading = "OPTIONS")]
     pub no_audit: bool,
 
     /// Disable trust verification (not recommended for production)
@@ -2854,7 +3039,8 @@ mod tests {
     /// If you add a new command to the `Commands` enum, add it here too.
     const ALL_SUBCOMMANDS: &[&str] = &[
         "setup", "run", "shell", "wrap", "learn", "why", "ps", "stop", "detach", "attach", "logs",
-        "inspect", "prune", "rollback", "audit", "trust", "policy", "profile",
+        "inspect", "prune", "rollback", "audit", "trust", "policy", "profile", "pull", "remove",
+        "update", "search", "list",
     ];
 
     #[test]

@@ -539,6 +539,53 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         NetworkMode::Blocked => {
             profile.push_str("(deny network*)\n");
             profile.push_str(MDNS_RULES);
+            // On macOS, connect(2) to a Unix domain socket is classified by Seatbelt
+            // as network-outbound. Emit per-path rules for all explicitly granted
+            // filesystem capabilities so that Unix sockets (IPC, notification daemons,
+            // etc.) remain reachable in restricted modes. See: #687
+            //
+            // Files   -> (allow network-outbound (path "..."))   literal socket path
+            // Dirs    -> (allow network-outbound (subpath "...")) sockets anywhere inside
+            //
+            // Both resolved and original paths are emitted to handle /tmp -> /private/tmp
+            // symlinks, matching the mDNSResponder dual-path pattern above.
+            for cap in caps.fs_capabilities() {
+                let (filter, resolved_str) = if cap.is_file {
+                    (
+                        "path",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
+                } else {
+                    (
+                        "subpath",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
+                };
+                let escaped = escape_path(resolved_str)?;
+                profile.push_str(&format!(
+                    "(allow network-outbound ({} \"{}\"))\n",
+                    filter, escaped
+                ));
+                if cap.original != cap.resolved {
+                    if let Some(orig_str) = cap.original.to_str() {
+                        let escaped_orig = escape_path(orig_str)?;
+                        profile.push_str(&format!(
+                            "(allow network-outbound ({} \"{}\"))\n",
+                            filter, escaped_orig
+                        ));
+                    }
+                }
+            }
             if !localhost_ports.is_empty() {
                 // Allow system-socket for TCP (required for connect/bind)
                 profile.push_str(
@@ -562,6 +609,44 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             // Block all network, then allow only localhost TCP to the proxy port.
             profile.push_str("(deny network*)\n");
             profile.push_str(MDNS_RULES);
+            // Same Unix socket logic as Blocked mode above. See: #687
+            for cap in caps.fs_capabilities() {
+                let (filter, resolved_str) = if cap.is_file {
+                    (
+                        "path",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
+                } else {
+                    (
+                        "subpath",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
+                };
+                let escaped = escape_path(resolved_str)?;
+                profile.push_str(&format!(
+                    "(allow network-outbound ({} \"{}\"))\n",
+                    filter, escaped
+                ));
+                if cap.original != cap.resolved {
+                    if let Some(orig_str) = cap.original.to_str() {
+                        let escaped_orig = escape_path(orig_str)?;
+                        profile.push_str(&format!(
+                            "(allow network-outbound ({} \"{}\"))\n",
+                            filter, escaped_orig
+                        ));
+                    }
+                }
+            }
             profile.push_str(&format!(
                 "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
                 port
@@ -853,6 +938,67 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_profile_with_gpu_iokit_rules() {
+        let mut caps = CapabilitySet::new();
+        // Minimal IOKit surface: AGXDeviceUserClient is the only class required
+        // for Metal compute on Apple Silicon. IOSurfaceRootUserClient is tried
+        // opportunistically but Metal continues without it when denied.
+        caps.add_platform_rule(
+            "(allow iokit-open \
+                (iokit-user-client-class \
+                    \"AGXDeviceUserClient\"))",
+        )
+        .unwrap();
+        caps.add_platform_rule("(allow iokit-get-properties)")
+            .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow iokit-open"));
+        assert!(profile.contains("AGXDeviceUserClient"));
+        assert!(!profile.contains("IOGPU"));
+        assert!(!profile.contains("AGXSharedUserClient"));
+        assert!(!profile.contains("IOSurfaceRootUserClient"));
+        assert!(profile.contains("(allow iokit-get-properties)"));
+    }
+
+    #[test]
+    fn test_generate_profile_gpu_rules_ordering() {
+        // GPU rules (as platform rules) should appear between read and write rules
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test"),
+            resolved: PathBuf::from("/test"),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+        caps.add_platform_rule("(allow iokit-get-properties)")
+            .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+
+        let read_pos = profile
+            .find("(allow file-read* (subpath \"/test\"))")
+            .expect("read rule not found");
+        let iokit_pos = profile
+            .find("(allow iokit-get-properties)")
+            .expect("iokit rule not found");
+        let write_pos = profile
+            .find("(allow file-write* (subpath \"/test\"))")
+            .expect("write rule not found");
+
+        assert!(
+            read_pos < iokit_pos,
+            "read rules must come before GPU/IOKit platform rules"
+        );
+        assert!(
+            iokit_pos < write_pos,
+            "GPU/IOKit platform rules must come before write rules"
+        );
+    }
+
+    #[test]
     fn test_escape_path_injection_via_newline() {
         // An attacker embeds a newline to break out of the quoted string and inject
         // a new S-expression. This must be rejected, not silently altered.
@@ -1082,6 +1228,119 @@ mod tests {
         // Under (deny default), processes cannot create sockets without this,
         // even when network-outbound/inbound are permitted.
         assert!(profile.contains("(allow system-socket)"));
+    }
+
+    /// Regression test for #687: Unix domain socket paths explicitly granted via
+    /// --allow-file must remain reachable in ProxyOnly and Blocked modes.
+    /// On macOS, connect(2) to a Unix socket is classified as network-outbound by
+    /// Seatbelt, so (deny network*) blocks it unless a per-path rule is emitted.
+    #[test]
+    fn test_generate_profile_unix_socket_allowed_in_proxy_only_mode() {
+        let mut caps = CapabilitySet::new().proxy_only(54321);
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/tmp/test.sock"),
+            resolved: PathBuf::from("/private/tmp/test.sock"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        // Must deny all network and then allow the proxy port
+        assert!(profile.contains("(deny network*)"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:54321\"))"));
+        // Must allow outbound to the Unix socket path (both original and resolved)
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/tmp/test.sock\"))"),
+            "must allow network-outbound to resolved socket path"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (path \"/tmp/test.sock\"))"),
+            "must allow network-outbound to original (symlink) socket path"
+        );
+    }
+
+    #[test]
+    fn test_generate_profile_unix_socket_allowed_in_blocked_mode() {
+        let mut caps = CapabilitySet::new().block_network();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/var/run/app.sock"),
+            resolved: PathBuf::from("/private/var/run/app.sock"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny network*)"));
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/var/run/app.sock\"))"),
+            "must allow network-outbound to resolved socket path in blocked mode"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (path \"/var/run/app.sock\"))"),
+            "must allow network-outbound to original socket path in blocked mode"
+        );
+        // Must NOT open up general TCP outbound
+        assert!(!profile.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn test_generate_profile_unix_socket_subpath_for_directories() {
+        // Directory capabilities should emit (subpath "...") network-outbound rules
+        // so that Unix sockets anywhere inside the directory remain reachable.
+        // e.g. --allow /var/run/ should allow connecting to /var/run/app.sock.
+        let mut caps = CapabilitySet::new().proxy_only(54321);
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/tmp/mydir"),
+            resolved: PathBuf::from("/private/tmp/mydir"),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow network-outbound (subpath \"/private/tmp/mydir\"))"),
+            "directory caps must emit subpath network-outbound rules"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (subpath \"/tmp/mydir\"))"),
+            "directory caps must emit subpath rule for original (symlink) path too"
+        );
+        // Must NOT use the literal-path form for directories
+        assert!(
+            !profile.contains("(allow network-outbound (path \"/private/tmp/mydir\"))"),
+            "directories must not use (path ...) — that is for literal file sockets"
+        );
+    }
+
+    #[test]
+    fn test_generate_profile_unix_socket_rules_not_emitted_in_allow_all() {
+        // AllowAll already permits all network-outbound — no per-path socket rules
+        // should be emitted (they would be redundant noise).
+        let mut caps = CapabilitySet::new(); // default = AllowAll
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/tmp/test.sock"),
+            resolved: PathBuf::from("/private/tmp/test.sock"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow network-outbound)\n"),
+            "AllowAll must still emit blanket rule"
+        );
+        assert!(
+            !profile.contains("(allow network-outbound (path \"/private/tmp/test.sock\"))"),
+            "AllowAll must not emit per-path socket rules"
+        );
     }
 
     #[test]

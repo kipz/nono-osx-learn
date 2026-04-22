@@ -1136,6 +1136,9 @@ fn format_identity(identity: &trust::SignerIdentity) -> String {
     match identity {
         trust::SignerIdentity::Keyed { key_id } => format!("{key_id} (keyed)"),
         trust::SignerIdentity::Keyless {
+            build_signer_uri, ..
+        } if !build_signer_uri.is_empty() => build_signer_uri.clone(),
+        trust::SignerIdentity::Keyless {
             repository,
             workflow,
             ..
@@ -1468,6 +1471,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(key_id),
                 public_key: Some(pub_key_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };
@@ -1516,6 +1520,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(key_id),
                 public_key: Some(pub_key_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };
@@ -1560,6 +1565,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(key_id),
                 public_key: Some(pub_key_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };
@@ -1597,6 +1603,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(key_id),
                 public_key: Some(pub_key_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };
@@ -1639,6 +1646,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(other_key_id),
                 public_key: Some(other_pub_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };

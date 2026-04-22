@@ -1808,15 +1808,7 @@ fn parse_resolved_sendto(line: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn extract_sendto_buffer(line: &str) -> Option<String> {
     // Determine where to start looking for the quoted buffer
-    let search_start = if let Some(pos) = line.find("iov_base=") {
-        // sendmsg: buffer is in iov_base="..."
-        pos
-    } else if let Some(pos) = line.find("sendto(") {
-        // sendto: buffer is the second argument
-        pos
-    } else {
-        return None;
-    };
+    let search_start = line.find("iov_base=").or_else(|| line.find("sendto("))?;
 
     let after = &line[search_start..];
 

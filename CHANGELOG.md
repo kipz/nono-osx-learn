@@ -1,5 +1,276 @@
 # Changelog
 
+## [0.37.1] - 2026-04-17
+
+### Bug Fixes
+
+- *(macos)* Emit specific-op seatbelt rules for keychain DB allows
+
+- *(sandbox)* Allow Unix domain socket connections in restricted network modes
+
+- *(learn)* Print profile JSON as fallback when save fails
+
+
+### Documentation
+
+- Add github to credential route configuration
+
+
+### Miscellaneous
+
+- Upgrade rustls-webpki to 0.103.12 to fix RUSTSEC-2026-0098 and RUSTSEC-2026-0099
+
+- Upgrade rustls-webpki to 0.103.12 to fix RUSTSEC-2026-0098 and RUSTSEC-2026-0099
+
+
+### Style
+
+- Apply rustfmt
+
+## [0.37.0] - 2026-04-16
+
+### Bug Fixes
+
+- *(claude-code)* Enable token refresh via .claude.json symlink
+
+- *(profiles)* Prevent infinite recursion in profile extends check
+
+- *(sandbox)* Support claude-code profile extensions and simplify config
+
+
+### Features
+
+- *(claude-code)* Pre-create claude config lock directory
+
+
+### Refactoring
+
+- *(proxy-tls)* Remove rustls-pemfile and use pki_types for pem parsing
+
+## [0.36.0] - 2026-04-15
+
+### Bug Fixes
+
+- *(proxy)* Downgrade CONNECT-to-route-upstream log from warn to debug
+
+
+### Features
+
+- Add ?decode=go-keyring query param for keyring:// URIs
+
+- Add keyring:// URI scheme for custom-service credential lookup
+
+## [0.35.0] - 2026-04-14
+
+### Bug Fixes
+
+- Chore: lint
+
+- Chore: revert to json! obj syntax
+
+- Chore: split predicate out again for provider specific claims
+
+- Refactor: expose build config URI extension
+
+- *(pty)* Improve session gone error detection when connecting
+
+- *(cli)* Increase detached session startup timeout and order
+
+
+### Features
+
+- *(trust)* Support GitLab ID tokens for signing
+
+- Strip proxy artifacts and fix upstream connection handling
+
+
+### Miscellaneous
+
+- Revert doc string
+
+- Drop example workflow in comment
+
+- Mention GitLab tokens in doc comment
+
+
+### Refactoring
+
+- Use append to merge signer fields
+
+- Use build signer URI extension for trust
+
+## [0.34.0] - 2026-04-13
+
+### Bug Fixes
+
+- *(gpu)* Grant NVIDIA procfs paths required for CUDA init under --allow-gpu
+
+- *(gpu)* Add nvidia-uvm-tools to GPU device allowlist
+
+- *(proxy)* Add missing proxy field in regression tests
+
+- *(network-policy)* Activate anthropic credential in claude-code profile
+
+- *(proxy)* Set ANTHROPIC_API_KEY phantom token for anthropic credential
+
+- *(sandbox)* Use relative path for ~/.claude.json symlink
+
+- *(sandbox)* Redirect ~/.claude.json to ~/.claude/ via symlink on all unix platforms
+
+
+### Dependencies
+
+- *(deps)* Bump rustls from 0.23.37 to 0.23.38
+
+- *(deps)* Bump similar from 2.7.0 to 3.1.0
+
+- *(deps)* Bump rand from 0.10.0 to 0.10.1
+
+- *(deps)* Bump always-further/agent-sign from 0.0.8 to 0.0.11
+
+- *(deps)* Bump peter-evans/repository-dispatch from 3.0.0 to 4.0.1
+
+- *(deps)* Bump docker/build-push-action from 7.0.0 to 7.1.0
+
+- *(deps)* Bump softprops/action-gh-release from 2.6.1 to 3.0.0
+
+- *(deps)* Bump actions/upload-artifact from 7.0.0 to 7.0.1
+
+
+### Features
+
+- *(macos)* Auto-enable claude launch services, refine keychain access
+
+
+### Refactoring
+
+- *(policy)* Improve seatbelt path regex escaping
+
+
+### Testing
+
+- *(gpu)* Add unit + integration coverage for NVIDIA procfs grants
+
+- *(gpu)* Extract is_nvidia_compute_device predicate and add unit tests
+
+- *(proxy)* Add regression test for issue #624 phantom token bug
+
+
+### Style
+
+- Fix rustfmt formatting in sandbox_prepare.rs
+
+## [0.33.0] - 2026-04-12
+
+### Bug Fixes
+
+- Address review feedback on downstream bump workflows
+
+- *(fmt)* Sort imports alphabetically in command_runtime.rs
+
+- *(shell)* Initialize proxy runtime when credentials are configured
+
+- *(cli)* Decouple audit trail from rollback
+
+- *(proxy)* Guard macOS keychain hint with platform check
+
+- *(proxy)* Warn when keychain credential is not found
+
+- *(landlock)* Widen /proc/self Landlock rule to /proc for grandchild access
+
+- *(seccomp)* Resolve /proc/self correctly for grandchild processes
+
+- *(cli)* Adjust ps command output column widths
+
+- *(cli)* Align status and attach columns in ps output
+
+- *(test)* Add --allow-cwd to GPU integration tests
+
+- *(cli)* Compile dummy GPU function for non-macOS tests
+
+- *(pty-proxy)* Exit early if client socket cannot be set nonblocking
+
+- *(pty)* Correctly handle blocking state for attach streams
+
+- *(sandbox)* Prevent interactive CWD prompt in detached mode
+
+- Tighten GPU IOKit surface to AGXDeviceUserClient only
+
+- *(test)* Handle non-default TMPDIR in linux nested home grant test
+
+- *(policy)* Remove broad ~/.local allow from openclaw profile on Linux
+
+
+### CI/CD
+
+- Remove nono-registry from downstream dispatch
+
+- Add release automation for downstream SDK repos
+
+
+### Documentation
+
+- *(readme)* Add early alpha warning and remove separator
+
+- *(readme)* Overhaul content and visuals
+
+- *(cli)* Clarify --allow-gpu flag behavior and profile interaction
+
+
+### Features
+
+- *(macos)* Make parent-of-protected-root relaxation opt-in via profile
+
+- *(gpu)* Add WSL2 GPU support via /dev/dxg passthrough
+
+- *(gpu)* Add WSL2 GPU support via /dev/dxg passthrough
+
+- *(gpu)* Add Linux GPU access and improve macOS support
+
+- *(profile)* Introduce separate profile preparation for preflight
+
+- *(cli)* Introduce pre-flight CWD prompt for detached launches
+
+
+### Miscellaneous
+
+- Remove test results file
+
+
+### Performance
+
+- *(seccomp)* Skip read_tgid for direct child and use Cow for cap_check_path
+
+
+### Refactoring
+
+- *(cli-validation)* Propagate protected parent flag to cli validation
+
+- *(command-blocking)* Improve deprecation warning messages
+
+- *(command-blocking)* Deprecate startup-only command blocking
+
+
+### Testing
+
+- *(macos)* Address Gemini review feedback
+
+- *(macos)* Align GPU IOKit tests with tightened surface from #635
+
+- *(gpu)* Skip DRM tests if no render node permissions
+
+## [Unreleased]
+
+### Deprecations
+
+- Deprecate startup-only command blocking surfaces in `v0.33.0`, add compatibility warnings, and document the child-process bypass.
+
+## [0.32.0] - 2026-04-10
+
+### Features
+
+- Add upstream mTLS client certificate support
+
 ## [0.31.0] - 2026-04-10
 
 ### Bug Fixes
@@ -894,4 +1165,3 @@
 ### 🚀 Features
 
 - First release of seperarate nono and nono-cli packages
-

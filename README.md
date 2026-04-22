@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/nono-logo.png" alt="nono logo" width="600"/>
+<img src="assets/logo.gif" alt="nono logo" width="600"/>
 
 <p>
   From the creator of
@@ -22,16 +22,40 @@
   </a>
 </p>
 
+---
+</div>
+
+
+<div align="center">
+
+<img src="assets/term.gif" alt="nono terminal demo" width="800"/>
+
 </div>
 
 > [!WARNING]
-> Early alpha -- not yet audited for production use. Active development may cause breakage. Please don't point a coding agent at the repo and raise large LLM-generated security issues, we likely already know about them; instead ask in [Discord](https://discord.gg/pPcjYzGvbS) first.
+> Early alpha -- not yet security audited for production use. Active development may cause breakage.
+
+
+> [!NOTE]
+> Claude Code Logins from within the sandbox -  there has been a regression in v0.36.0 impacting claude code logins - which we hope is now fixed in v0.37.0. If however, you're still seeing the issue, please open an issue outlining with your installation method (npm, curl, brew) along with your OS. Thanks for your patience! 
 
 ---
 
-nono wraps any AI agent or process in a kernel-isolated sandbox in seconds. No hypervisor. No infrastructure required. A single binary, zero added latency, and flexible enough to fit a solo developer's workflow or a fleet of agents running at scale in production.
+Most sandboxes feel like sandboxes. Rigid, sluggish, and designed for a different problem entirely. nono was built from the ground up for AI agents - and the developer workfows they need to thrive - agent multiplexing, snapshots, credential injection, supply chain security out of the box. Develop alongside nono, then deploy anywhere: CI pipelines, Kubernetes, cloud VMs, microVMs. The one stop shop for all your clankers.
 
-**Platform support:** macOS, Linux, and [WSL2](https://nono.sh/docs/cli/internals/wsl2). Native Windows coming soon.
+---
+
+## Latest News
+
+- **nono registry** - we will be bringing online a skill and policy registry to allow uses to contribute agent skills (SKILLS.md, hooks, scripts etc), and policy - this will allow us to more easily scale to supporting all of the different agents, installers and linux dists. Security will be baked in from the start. [Read more here](https://github.com/always-further/nono/issues/630)
+
+- **WSL2 support** -- Auto-detection with ~84% feature coverage out of the box. Run `nono setup --check-only` to see what's available. ([#522](https://github.com/always-further/nono/pull/522))
+
+[All updates](https://github.com/always-further/nono/discussions/categories/announcements)
+
+---
+
+**Platform support:** macOS, Linux, and [WSL2](https://nono.sh/docs/cli/internals/wsl2).
 
 **Install:**
 ```bash
@@ -42,46 +66,13 @@ Other options in the [Installation Guide](https://docs.nono.sh/cli/getting_start
 
 ---
 
-## Latest News
-
-**nono registry** - we will be bringing online a skill and policy registry to allow uses to contribute agent skills (SKILLS.md, hooks, scripts etc), and policy - this will allow us to more easily scale to supporting all of the different agents, installers and linux dists. Security will be baked in from the start. [Read more here](https://github.com/always-further/nono/issues/630)
-
-**Detach and reattach to sandboxed agents** -- Run agents in the background with `nono run --detach`, reconnect with `nono attach`. Includes `nono ps`, `nono stop`, and `nono inspect`. ([#526](https://github.com/always-further/nono/pull/526))
-
-**WSL2 support** -- Auto-detection with ~84% feature coverage out of the box. Run `nono setup --check-only` to see what's available. ([#522](https://github.com/always-further/nono/pull/522))
-
-**Portable capability manifests** -- Export fully-resolved sandbox configs with `nono policy show <profile> --format manifest` for CI/Kubernetes deployment. ([#534](https://github.com/always-further/nono/pull/534))
-
-**API endpoint filtering** -- Control which endpoints agents can reach with L7 filtering: `--allow-endpoint 'github:GET:/repos/*/issues/**'`. ([#513](https://github.com/always-further/nono/pull/513))
-
-**Custom CAs and file-based credentials for k8s** -- `tls_ca` for self-signed endpoints ([#548](https://github.com/always-further/nono/pull/548)), `file://` URIs for mounted secrets ([#552](https://github.com/always-further/nono/pull/552)).
-
-[All updates](https://github.com/always-further/nono/discussions/categories/announcements)
-
----
-
 ## Quick Start
-
-```bash
-# Any CLI agent -- just put your command after --
-$ nono run --profile claude-code -- claude
-
-# or with tmux style multiplexer and atomic snapshots
-$ nono run --detached --profile claude-code --rollback -- claude
-Started detached session 7a6a652f7273fe60.
-Attach with: nono attach 7a6a652f7273fe60
-
-# Any given command
-nono run -- python3 my_agent.py
-nono run --read /data -- npx @modelcontextprotocol/server-filesystem /data
-nono run --profile codex -- codex
-```
 
 Built-in profiles for [Claude Code](https://docs.nono.sh/cli/clients/claude-code), [Codex](https://docs.nono.sh/cli/clients/codex), [OpenCode](https://docs.nono.sh/cli/clients/opencode), [OpenClaw](https://docs.nono.sh/cli/clients/openclaw), and [Swival](https://docs.nono.sh/cli/clients/swival) -- or [define your own](https://docs.nono.sh/cli/features/profiles-groups).
 
-## Library
+## Libraries and Bindings
 
-The core is a Rust library that can be embedded into any application. Policy-free -- it applies only what clients explicitly request.
+The core is a Rust library that can be embedded into any application. Policy-free - it applies only what clients explicitly request.
 
 ```rust
 use nono::{CapabilitySet, Sandbox};

@@ -14,6 +14,7 @@ mod env_sanitization;
 #[cfg(target_os = "linux")]
 mod supervisor_linux;
 
+use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -37,6 +38,7 @@ use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
+pub(crate) use env_sanitization::validate_allow_vars_pattern;
 
 /// Resolve a program name to its absolute path.
 ///
@@ -270,6 +272,10 @@ pub struct ExecConfig<'a> {
     /// sends the notify fd; parent expects to receive it.
     #[cfg(target_os = "linux")]
     pub seccomp_proxy_fallback: bool,
+    /// Allow-list of environment variable names. When set, only variables
+    /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
+    /// passed to the child. Nono-injected credentials always bypass this.
+    pub allowed_env_vars: Option<Vec<String>>,
     /// Additional env var names to block from the child (from mediation.env.block).
     /// Complements the hardcoded injection-vector list in env_sanitization.rs.
     pub extra_blocked_env: &'a [String],
@@ -346,13 +352,25 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.env_clear();
     cmd.current_dir(config.current_dir);
 
-    let extra_blocked: Vec<&str> = std::iter::once("NONO_CAP_FILE")
-        .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
-        .collect();
+    let extra_blocked: Vec<&str> = [
+        "NONO_CAP_FILE",
+        DETACHED_LAUNCH_ENV,
+        DETACHED_SESSION_ID_ENV,
+        DETACHED_CWD_PROMPT_RESPONSE_ENV,
+    ]
+    .into_iter()
+    .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
+    .collect();
     for (key, value) in std::env::vars() {
-        if !should_skip_env_var(&key, &config.env_vars, &extra_blocked) {
-            cmd.env(&key, &value);
+        if should_skip_env_var(&key, &config.env_vars, &extra_blocked) {
+            continue;
         }
+        if let Some(ref allowed) = config.allowed_env_vars {
+            if !env_sanitization::is_env_var_allowed(&key, allowed) {
+                continue;
+            }
+        }
+        cmd.env(&key, &value);
     }
 
     cmd.args(cmd_args).env("NONO_CAP_FILE", config.cap_file);
@@ -461,18 +479,28 @@ pub fn execute_supervised(
     let mut browser_shim: Option<BrowserShim> = None;
 
     // Copy current environment, filtering dangerous and overridden vars
-    let extra_blocked_supervised: Vec<&str> = ["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"]
-        .iter()
-        .copied()
-        .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
-        .collect();
+    let extra_blocked_supervised: Vec<&str> = [
+        "NONO_CAP_FILE",
+        "NONO_SUPERVISOR_FD",
+        DETACHED_LAUNCH_ENV,
+        DETACHED_SESSION_ID_ENV,
+        DETACHED_CWD_PROMPT_RESPONSE_ENV,
+    ]
+    .into_iter()
+    .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
+    .collect();
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            let should_skip = should_skip_env_var(k, &config.env_vars, &extra_blocked_supervised);
-            if !should_skip {
-                if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
-                    env_c.push(cstr);
+            if should_skip_env_var(k, &config.env_vars, &extra_blocked_supervised) {
+                continue;
+            }
+            if let Some(ref allowed) = config.allowed_env_vars {
+                if !env_sanitization::is_env_var_allowed(k, allowed) {
+                    continue;
                 }
+            }
+            if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
+                env_c.push(cstr);
             }
         }
     }
@@ -641,6 +669,8 @@ pub fn execute_supervised(
             let mut child_caps = config.caps.clone();
             #[cfg(target_os = "linux")]
             child_caps.remap_procfs_self_references(std::process::id(), None);
+            #[cfg(target_os = "linux")]
+            child_caps.widen_procfs_self_to_proc();
             #[cfg(target_os = "linux")]
             let effective_caps: &CapabilitySet = &child_caps;
 
@@ -1114,6 +1144,16 @@ pub fn execute_supervised(
                         wait_for_child_with_pty(child, pty_proxy.as_mut(), config.startup_timeout)?;
                     (status, Vec::new())
                 };
+
+            // Close the attach listener immediately so no new attach
+            // connections can sneak in during teardown.  Without this,
+            // the kernel keeps accepting connections into the listen
+            // backlog even though nobody is calling accept(), and the
+            // attaching client gets EPIPE ("Broken pipe") when it
+            // tries to send the handshake.
+            if let Some(ref mut p) = pty_proxy {
+                p.shutdown_attach_listener();
+            }
 
             let exit_code = match status {
                 WaitStatus::Exited(_, code) => {
@@ -3213,6 +3253,58 @@ mod tests {
             Some(ProcfsAccessContext::new(4242, Some(4343))),
         );
         assert!(result.is_err());
+    }
+
+    // --- Grandchild procfs regression tests (issue #602) ---
+    //
+    // When bun is a grandchild (nono→sh→bun), notifying_tgid=bun's PID (e.g. 1001),
+    // not the direct child sh's PID (e.g. 1000). These tests verify the fix uses
+    // the correct PID for /proc/self resolution and access validation.
+
+    #[test]
+    fn test_resolve_procfs_self_for_grandchild_tgid() {
+        // After the fix, process_pid=notifying_tgid=1001 (bun).
+        // /proc/self/maps must resolve to /proc/1001/maps, not /proc/1000/maps.
+        let path = resolve_procfs_path_for_child(
+            Path::new("/proc/self/maps"),
+            Some(ProcfsAccessContext::new(1001, Some(1001))),
+        );
+        assert_eq!(path.ok(), Some(PathBuf::from("/proc/1001/maps")));
+    }
+
+    #[test]
+    fn test_validate_procfs_access_allows_grandchild_own_path() {
+        // notifying_tgid=1001 (bun): accessing /proc/1001/maps is allowed.
+        let result = validate_procfs_access(
+            Path::new("/proc/1001/maps"),
+            Some(ProcfsAccessContext::new(1001, Some(1001))),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_procfs_access_blocks_grandchild_accessing_sibling() {
+        // notifying_tgid=1001 (bun): accessing /proc/1000/maps (sh's maps) is blocked.
+        // This verifies the fix does NOT allow cross-process procfs reads.
+        let result = validate_procfs_access(
+            Path::new("/proc/1000/maps"),
+            Some(ProcfsAccessContext::new(1001, Some(1001))),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_procfs_self_wrong_pid_demonstrates_bug() {
+        // Demonstrates the pre-fix bug: if process_pid=1000 (sh) but the requesting
+        // process is bun (1001), /proc/self/maps incorrectly resolves to /proc/1000/maps.
+        // After the fix, process_pid is always notifying_tgid, so this construction
+        // would never be used for bun's request.
+        let path = resolve_procfs_path_for_child(
+            Path::new("/proc/self/maps"),
+            Some(ProcfsAccessContext::new(1000, Some(1001))), // broken: sh's PID for bun's request
+        );
+        // This produces the wrong path (sh's maps instead of bun's maps).
+        assert_eq!(path.ok(), Some(PathBuf::from("/proc/1000/maps")));
     }
 
     /// Verify that the supervisor loop runs and exits cleanly without a PTY relay.

@@ -100,13 +100,16 @@ fn offer_save_profile(result: &learn::LearnResult, command: &[String]) -> Result
 
     let config_dir = profile::resolve_user_config_dir()?;
     let profiles_dir = config_dir.join("nono").join("profiles");
-    std::fs::create_dir_all(&profiles_dir).map_err(|e| {
-        NonoError::LearnError(format!(
-            "Failed to create profiles directory {}: {}",
+    if let Err(e) = std::fs::create_dir_all(&profiles_dir) {
+        eprintln!(
+            "{} Failed to create profiles directory {}: {}",
+            "Error:".red(),
             profiles_dir.display(),
             e
-        ))
-    })?;
+        );
+        print_profile_fallback(&profile_json);
+        return Ok(());
+    }
 
     let profile_path = profiles_dir.join(format!("{}.json", profile_name));
 
@@ -125,13 +128,16 @@ fn offer_save_profile(result: &learn::LearnResult, command: &[String]) -> Result
         }
     }
 
-    std::fs::write(&profile_path, profile_json).map_err(|e| {
-        NonoError::LearnError(format!(
-            "Failed to write profile to {}: {}",
+    if let Err(e) = std::fs::write(&profile_path, &profile_json) {
+        eprintln!(
+            "{} Failed to write profile to {}: {}",
+            "Error:".red(),
             profile_path.display(),
             e
-        ))
-    })?;
+        );
+        print_profile_fallback(&profile_json);
+        return Ok(());
+    }
 
     eprintln!("\n{} {}", "Profile saved:".green(), profile_path.display());
     eprintln!(
@@ -142,4 +148,18 @@ fn offer_save_profile(result: &learn::LearnResult, command: &[String]) -> Result
     );
 
     Ok(())
+}
+
+fn print_profile_fallback(profile_json: &str) {
+    eprintln!(
+        "\n{} Profile could not be saved. Copy the JSON below to create it manually:",
+        "Note:".yellow()
+    );
+    eprintln!(
+        "Save it to {} or run {} to find the correct path.",
+        "~/.config/nono/profiles/<name>.json".bold(),
+        "nono config".bold()
+    );
+    eprintln!();
+    println!("{}", profile_json);
 }

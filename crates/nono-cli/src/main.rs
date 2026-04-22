@@ -7,6 +7,7 @@ mod audit_commands;
 mod capability_ext;
 mod cli;
 mod cli_bootstrap;
+mod command_blocking_deprecation;
 mod command_runtime;
 mod config;
 mod credential_runtime;
@@ -22,6 +23,8 @@ mod mediation;
 mod network_policy;
 mod open_url_runtime;
 mod output;
+mod package;
+mod package_cmd;
 mod policy;
 mod policy_cmd;
 mod profile;
@@ -31,6 +34,7 @@ mod protected_paths;
 mod proxy_runtime;
 mod pty_proxy;
 mod query_ext;
+mod registry_client;
 mod rollback_commands;
 mod rollback_preflight;
 mod rollback_runtime;
@@ -65,10 +69,14 @@ use cli_bootstrap::{
     collect_legacy_network_warnings, init_theme, init_tracing, normalize_legacy_flag_env_vars,
     print_legacy_network_warnings,
 };
+use command_blocking_deprecation::{
+    collect_cli_warnings, print_warnings as print_deprecation_warnings,
+};
 use nono::Result;
 use tracing::error;
 
 const DETACHED_LAUNCH_ENV: &str = "NONO_DETACHED_LAUNCH";
+const DETACHED_CWD_PROMPT_RESPONSE_ENV: &str = "NONO_DETACHED_CWD_PROMPT_RESPONSE";
 const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 
 pub(crate) use launch_runtime::rollback_base_exclusions;
@@ -81,6 +89,8 @@ fn main() {
     init_tracing(&cli);
     init_theme(&cli);
     print_legacy_network_warnings(&legacy_network_warnings, cli.silent);
+    let command_blocking_warnings = collect_cli_warnings(&cli);
+    print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
     if let Err(e) = run_cli(cli) {
         error!("{}", e);
@@ -99,6 +109,8 @@ mod tests {
         trust_interception_active,
     };
     use crate::proxy_runtime::{resolve_effective_proxy_settings, EffectiveProxySettings};
+    #[cfg(target_os = "linux")]
+    use crate::sandbox_prepare::maybe_enable_gpu;
     use crate::sandbox_prepare::maybe_enable_macos_gpu;
     #[cfg(target_os = "macos")]
     use crate::sandbox_prepare::maybe_enable_macos_launch_services;
@@ -212,6 +224,7 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            allowed_env_vars: None,
             mediation: mediation::MediationConfig::default(),
         };
 
@@ -255,6 +268,7 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            allowed_env_vars: None,
             mediation: mediation::MediationConfig::default(),
         };
 
@@ -472,12 +486,6 @@ mod tests {
                 .any(|r| r.contains("AGXDeviceUserClient")),
             "AGXDeviceUserClient platform rule should be present"
         );
-        assert!(
-            caps.platform_rules()
-                .iter()
-                .any(|r| r.contains("IOSurfaceRootUserClient")),
-            "IOSurfaceRootUserClient platform rule should be present"
-        );
     }
 
     #[cfg(target_os = "macos")]
@@ -517,5 +525,45 @@ mod tests {
             err.to_string().contains("only supported on macOS"),
             "error should mention macOS support"
         );
+    }
+
+    /// On Linux, maybe_enable_gpu should succeed if GPU devices exist, or return
+    /// a clear "no GPU devices found" error if not. It must NOT hard-fail just
+    /// because /dev/dri is absent — headless NVIDIA (CUDA-only) and AMD (ROCm-only)
+    /// machines may lack DRM render nodes entirely.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_maybe_enable_gpu_linux_does_not_require_dri() {
+        let mut caps = CapabilitySet::new();
+
+        let result = maybe_enable_gpu(&mut caps, true, true);
+
+        // On a GPU machine: Ok(true) with fs capabilities added.
+        // On a non-GPU CI machine: Err mentioning "no GPU devices found".
+        // Either outcome is correct. What must NOT happen is an error about
+        // /dev/dri specifically, which would break NVIDIA/ROCm-only setups.
+        match result {
+            Ok(enabled) => {
+                assert!(enabled, "should be active when devices are found");
+                assert!(
+                    caps.has_fs(),
+                    "should have granted fs capabilities for GPU devices"
+                );
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("no GPU devices found"),
+                    "error on non-GPU machine should be generic, not DRI-specific: {msg}"
+                );
+                // Verify the error lists all checked paths
+                assert!(
+                    msg.contains("renderD"),
+                    "error should mention renderD: {msg}"
+                );
+                assert!(msg.contains("nvidia"), "error should mention nvidia: {msg}");
+                assert!(msg.contains("kfd"), "error should mention kfd: {msg}");
+            }
+        }
     }
 }
