@@ -463,7 +463,7 @@ pub(super) fn handle_seccomp_notification(
                     verified.publisher,
                 );
                 // Verified skill file — open and inject fd for read access
-                match open_path_for_access(&path, &access, config.never_grant, None, None) {
+                match open_path_for_access(&path, &access, config.protected_roots, None, None) {
                     Ok(file) => {
                         if notif_id_valid(notify_fd, notif.id)? {
                             if let Err(e) = inject_fd(notify_fd, notif.id, file.as_raw_fd()) {
