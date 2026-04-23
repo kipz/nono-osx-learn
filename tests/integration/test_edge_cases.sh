@@ -127,7 +127,8 @@ expect_output_contains "NONO_CAP_FILE is set" "NONO_CAP_FILE=" \
 echo ""
 echo "--- Non-existent Paths ---"
 
-expect_output_contains "grant non-existent directory is skipped with warning" "Skipping non-existent path" \
+expect_output_contains "grant non-existent directory is skipped with warning" \
+    "some requested sandbox grants were skipped because the path does not exist" \
     "$NONO_BIN" run --allow /nonexistent/path/that/does/not/exist/anywhere -- echo "should run"
 
 if is_macos; then
