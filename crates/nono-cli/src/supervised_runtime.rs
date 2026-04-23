@@ -1,9 +1,11 @@
+use crate::audit_attestation::AuditSigner;
+use crate::audit_integrity::AuditRecorder;
 use crate::launch_runtime::{
     ProxyLaunchOptions, RollbackLaunchOptions, SessionLaunchOptions, TrustLaunchOptions,
 };
 use crate::rollback_runtime::{
-    create_audit_state, finalize_supervised_exit, initialize_rollback_state,
-    warn_if_rollback_flags_ignored, AuditState, RollbackExitContext,
+    create_audit_state, finalize_supervised_exit, initialize_audit_snapshots,
+    initialize_rollback_state, warn_if_rollback_flags_ignored, AuditState, RollbackExitContext,
 };
 use std::sync::{Arc, OnceLock};
 
@@ -12,7 +14,9 @@ use crate::{
     DETACHED_SESSION_ID_ENV,
 };
 use colored::Colorize;
+use nono::undo::ExecutableIdentity;
 use nono::{CapabilitySet, Result};
+use std::sync::Mutex;
 
 struct SessionRuntimeState {
     started: String,
@@ -30,6 +34,8 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) trust: &'a TrustLaunchOptions,
     pub(crate) proxy: &'a ProxyLaunchOptions,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
+    pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
+    pub(crate) audit_signer: Option<&'a AuditSigner>,
     pub(crate) silent: bool,
     /// Pre-generated session ID from execution_runtime, shared with the mediation audit log.
     pub(crate) pre_session_id: Option<String>,
@@ -154,6 +160,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         trust,
         proxy,
         proxy_handle,
+        executable_identity,
+        audit_signer,
         silent,
         pre_session_id,
         pre_session_name,
@@ -187,7 +195,30 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         pty_pair,
     } = session_runtime;
 
+    let audit_tracked_paths = crate::rollback_runtime::derive_audit_tracked_paths(caps);
     let rollback_state = initialize_rollback_state(rollback, caps, audit_state.as_ref(), silent)?;
+    let audit_snapshot_state = if rollback_state.is_none() && rollback.audit_integrity {
+        match audit_state.as_ref() {
+            Some(state) => initialize_audit_snapshots(caps, state, rollback)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let audit_recorder = if audit_state.is_some() && !rollback.no_audit_integrity {
+        audit_state
+            .as_ref()
+            .map(|state| AuditRecorder::new(state.session_dir.clone()).map(Mutex::new))
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(recorder_mutex) = audit_recorder.as_ref() {
+        let mut recorder = recorder_mutex
+            .lock()
+            .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
+        recorder.record_session_started(started.clone(), command.to_vec())?;
+    }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
     let approval_backend = terminal_approval::TerminalApproval;
@@ -200,6 +231,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         detach_sequence: session.detach_sequence.as_deref(),
         open_url_origins: &proxy.open_url_origins,
         open_url_allow_localhost: proxy.open_url_allow_localhost,
+        audit_recorder: audit_recorder.as_ref(),
         allow_launch_services_active: proxy.allow_launch_services_active,
         #[cfg(target_os = "linux")]
         proxy_port: match caps.network_mode() {
@@ -243,7 +275,13 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     finalize_supervised_exit(RollbackExitContext {
         audit_state: audit_state.as_ref(),
         rollback_state,
+        audit_snapshot_state,
+        audit_tracked_paths,
+        audit_recorder: audit_recorder.as_ref(),
+        audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
+        executable_identity,
+        audit_signer,
         started: &started,
         ended: &ended,
         command,
