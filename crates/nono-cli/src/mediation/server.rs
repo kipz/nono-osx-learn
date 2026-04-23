@@ -211,7 +211,15 @@ async fn handle_connection(
     let (response, action_type) = apply(request, commands, broker, &ctx, approval).await;
 
     write_response(&mut stream, &response).await?;
-    log_mediated_audit(audit_log_dir, &command_name, &args, &response, action_type, Some(command_pid), audit_info);
+    log_mediated_audit(
+        audit_log_dir,
+        &command_name,
+        &args,
+        &response,
+        action_type,
+        Some(command_pid),
+        audit_info,
+    );
     Ok(())
 }
 

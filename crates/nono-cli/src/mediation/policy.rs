@@ -1845,7 +1845,7 @@ mod tests {
             args: vec![],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
 
         let broker = make_broker();
@@ -1906,7 +1906,7 @@ mod tests {
             args: vec![],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
 
         let broker = make_broker();
@@ -1963,7 +1963,7 @@ mod tests {
             args: vec![],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
 
         let broker = make_broker();
@@ -2021,7 +2021,7 @@ mod tests {
             args: vec![],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
 
         let broker = make_broker();
