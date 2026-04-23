@@ -9,7 +9,7 @@ use crate::profile::{expand_vars, Profile};
 use crate::protected_paths::{self, ProtectedRoots};
 use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
 use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+use tracing::{debug, info};
 
 /// Try to create a directory capability, warning and skipping on PathNotFound.
 /// Propagates all other errors.
@@ -17,7 +17,7 @@ fn try_new_dir(path: &Path, access: AccessMode, label: &str) -> Result<Option<Fs
     match FsCapability::new_dir(path, access) {
         Ok(cap) => Ok(Some(cap)),
         Err(NonoError::PathNotFound(_)) => {
-            warn!("{}: {}", label, path.display());
+            info!("{}: {}", label, path.display());
             Ok(None)
         }
         Err(e) => Err(e),
@@ -122,7 +122,7 @@ fn handle_missing_file_capability(
     _access: AccessMode,
     label: &str,
 ) -> Result<Option<FsCapability>> {
-    warn!("{}: {}", label, path.display());
+    info!("{}: {}", label, path.display());
     Ok(None)
 }
 

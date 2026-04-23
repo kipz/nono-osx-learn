@@ -9,7 +9,7 @@ use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError,
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // JSON schema types
@@ -970,10 +970,10 @@ pub fn apply_deny_overrides(
         }
 
         // Warn about the security relaxation
-        crate::output::print_warning(&format!(
+        info!(
             "override_deny relaxing deny rule for '{}'",
             canonical.display()
-        ));
+        );
 
         // On macOS: emit Seatbelt allow rules to punch through deny.
         // Only emit rules matching the effective access mode from the union

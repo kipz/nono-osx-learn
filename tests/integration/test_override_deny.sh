@@ -236,11 +236,16 @@ echo ""
 echo "--- Warning output ---"
 
 if [[ -d "$DOCKER_DIR" ]]; then
-    expect_output_contains "override_deny shows styled warning" \
-        "warning:" \
+    expect_output_not_contains "override_deny hides advisory by default" \
+        "override_deny relaxing deny rule" \
         "$NONO_BIN" run --profile "$PROFILES_DIR/docker-override.json" --dry-run -- echo ok
+
+    expect_output_contains "override_deny shows advisory with -v" \
+        "override_deny relaxing deny rule" \
+        "$NONO_BIN" run -v --profile "$PROFILES_DIR/docker-override.json" --dry-run -- echo ok
 else
-    skip_test "override_deny shows styled warning" "~/.docker not found"
+    skip_test "override_deny hides advisory by default" "~/.docker not found"
+    skip_test "override_deny shows advisory with -v" "~/.docker not found"
 fi
 
 # =============================================================================

@@ -43,10 +43,14 @@ expect_output_empty() {
     return 1
 }
 
-expect_output_contains \
-    "claude-code dry-run surfaces missing profile warnings without --silent" \
-    "Profile file '\$HOME/Library/Keychains/login.keychain-db' does not exist, skipping" \
+expect_output_empty \
+    "claude-code dry-run hides missing profile warnings by default" \
     "$NONO_BIN" run --profile claude-code --allow-cwd --dry-run -- echo ok
+
+expect_output_contains \
+    "claude-code dry-run shows missing profile warnings with -v" \
+    "Profile file '\$HOME/Library/Keychains/login.keychain-db' does not exist, skipping" \
+    "$NONO_BIN" run -v --profile claude-code --allow-cwd --dry-run -- echo ok
 
 expect_output_empty \
     "silent dry-run suppresses tracing warnings and CLI status output" \
