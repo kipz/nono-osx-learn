@@ -577,4 +577,176 @@ mod tests {
             .to_string()
             .contains("missing canonical event_json bytes"));
     }
+
+    // ---------------------------------------------------------------------
+    // Mediation stream tests (parameterized payload + distinct config).
+    // ---------------------------------------------------------------------
+
+    /// Minimal payload for exercising the generic recorder with a non-
+    /// `AuditEventPayload` type. Mirrors the mediation `AuditEvent` shape.
+    #[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq)]
+    struct FakeMediationEvent {
+        command: String,
+        ts: u64,
+        exit_code: i32,
+    }
+
+    #[test]
+    fn mediation_recorder_chains_and_merkles() {
+        // Append events under MEDIATION_EVENTS_CONFIG and verify that
+        // finalize() produces a summary that matches a fresh verification
+        // pass — proves chain + Merkle math is correct under the distinct
+        // domain-separation labels.
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder: AuditRecorder<FakeMediationEvent> =
+            AuditRecorder::new(dir.path().to_path_buf(), &MEDIATION_EVENTS_CONFIG).unwrap();
+        for i in 0..5 {
+            recorder
+                .append_event(FakeMediationEvent {
+                    command: format!("cmd-{i}"),
+                    ts: 1_775_000_000 + i as u64,
+                    exit_code: 0,
+                })
+                .unwrap();
+        }
+        let summary = recorder.finalize().unwrap();
+        assert_eq!(summary.event_count, 5);
+
+        let verified = verify_audit_log::<FakeMediationEvent>(
+            dir.path(),
+            Some(&summary),
+            &MEDIATION_EVENTS_CONFIG,
+        )
+        .unwrap();
+        assert!(verified.records_verified);
+        assert!(verified.event_count_matches);
+        assert_eq!(verified.computed_chain_head, Some(summary.chain_head));
+        assert_eq!(verified.computed_merkle_root, Some(summary.merkle_root));
+    }
+
+    #[test]
+    fn mediation_verify_fails_on_tampered_log() {
+        // Append events, flip a single byte in the on-disk JSONL, then
+        // re-verify and expect a failure. Proves the chain/Merkle check
+        // actually catches tampering for the mediation stream.
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder: AuditRecorder<FakeMediationEvent> =
+            AuditRecorder::new(dir.path().to_path_buf(), &MEDIATION_EVENTS_CONFIG).unwrap();
+        for i in 0..3 {
+            recorder
+                .append_event(FakeMediationEvent {
+                    command: format!("c{i}"),
+                    ts: 100 + i as u64,
+                    exit_code: 0,
+                })
+                .unwrap();
+        }
+        let summary = recorder.finalize().unwrap();
+
+        // Tamper: flip one character in the command field of the first event.
+        let log_path = dir.path().join(MEDIATION_EVENTS_CONFIG.filename);
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let tampered = contents.replacen("\"command\":\"c0\"", "\"command\":\"X0\"", 1);
+        assert_ne!(contents, tampered, "replacement must have changed bytes");
+        std::fs::write(&log_path, tampered).unwrap();
+
+        let result = verify_audit_log::<FakeMediationEvent>(
+            dir.path(),
+            Some(&summary),
+            &MEDIATION_EVENTS_CONFIG,
+        );
+        assert!(
+            result.is_err(),
+            "tampered mediation log should fail verification"
+        );
+    }
+
+    #[test]
+    fn mediation_and_audit_configs_produce_different_chain_heads() {
+        // Same event bytes under different domain-separation labels must
+        // produce different leaf + chain hashes. Guards against cross-
+        // stream replay.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_m = tempfile::tempdir().unwrap();
+        let event = FakeMediationEvent {
+            command: "ls".to_string(),
+            ts: 1,
+            exit_code: 0,
+        };
+
+        let mut rec_a: AuditRecorder<FakeMediationEvent> =
+            AuditRecorder::new(dir_a.path().to_path_buf(), &AUDIT_EVENTS_CONFIG).unwrap();
+        rec_a.append_event(event.clone()).unwrap();
+        let sum_a = rec_a.finalize().unwrap();
+
+        let mut rec_m: AuditRecorder<FakeMediationEvent> =
+            AuditRecorder::new(dir_m.path().to_path_buf(), &MEDIATION_EVENTS_CONFIG).unwrap();
+        rec_m.append_event(event).unwrap();
+        let sum_m = rec_m.finalize().unwrap();
+
+        assert_ne!(
+            sum_a.chain_head, sum_m.chain_head,
+            "distinct domain labels must yield distinct chain heads"
+        );
+        assert_ne!(
+            sum_a.merkle_root, sum_m.merkle_root,
+            "distinct domain labels must yield distinct Merkle roots"
+        );
+    }
+
+    #[test]
+    fn mediation_recorder_under_concurrent_appenders() {
+        // Pound on a shared `Arc<Mutex<AuditRecorder>>` from many threads,
+        // matching the mediation server's two concurrent write paths
+        // (stream handler + datagram receiver). Each thread appends N
+        // events; after joining, the total event_count and chain must
+        // reflect all appends with no lost/duplicated records.
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorder: Arc<Mutex<AuditRecorder<FakeMediationEvent>>> = Arc::new(Mutex::new(
+            AuditRecorder::new(dir.path().to_path_buf(), &MEDIATION_EVENTS_CONFIG).unwrap(),
+        ));
+
+        const THREADS: usize = 10;
+        const PER_THREAD: usize = 20;
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let r = Arc::clone(&recorder);
+            handles.push(thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let ev = FakeMediationEvent {
+                        command: format!("t{t}-i{i}"),
+                        ts: (t * 1000 + i) as u64,
+                        exit_code: 0,
+                    };
+                    // Critical section: lock → append → drop guard. Matches the
+                    // discipline enforced in mediation::server::log_mediated_audit.
+                    r.lock().unwrap().append_event(ev).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let expected_count = (THREADS * PER_THREAD) as u64;
+        let guard = recorder.lock().unwrap();
+        assert_eq!(guard.event_count(), expected_count);
+        let summary = guard.finalize().unwrap();
+        drop(guard);
+
+        // Re-verify on disk — proves chain integrity held across all
+        // concurrent appends.
+        let verified = verify_audit_log::<FakeMediationEvent>(
+            dir.path(),
+            Some(&summary),
+            &MEDIATION_EVENTS_CONFIG,
+        )
+        .unwrap();
+        assert_eq!(verified.event_count, expected_count);
+        assert!(verified.records_verified);
+        assert!(verified.event_count_matches);
+    }
 }
