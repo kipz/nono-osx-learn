@@ -567,6 +567,12 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     profile.push_str("(allow system-fsctl)\n");
     profile.push_str("(allow system-info)\n");
 
+    // IOKit: allow user-client access. Required by JVM-based tools (e.g. Bazel)
+    // that call IORegisterForSystemPower() for power management notifications.
+    // Without this, the IOKit call silently returns MACH_PORT_NULL, causing
+    // hard crashes in programs that CHECK the result.
+    profile.push_str("(allow iokit-open)\n");
+
     // Allow reading the root directory entry itself (required for exec path resolution)
     profile.push_str("(allow file-read* (literal \"/\"))\n");
 
@@ -825,6 +831,23 @@ mod tests {
         assert!(profile.contains("(deny default)"));
         // Network is allowed by default
         assert!(profile.contains("(allow network-outbound)"));
+    }
+
+    #[test]
+    fn test_generate_profile_always_allows_iokit_open() {
+        // Regression: JVM-based tools (e.g. Bazel) call IORegisterForSystemPower()
+        // during startup. Without (allow iokit-open) the IOKit call returns
+        // MACH_PORT_NULL and the JVM server aborts on a CHECK. This rule must be
+        // present in every generated profile, including a default (empty) one.
+        // See DataDog/shadowfax#52 and the original (dropped) kipz/nono#3.
+        let caps = CapabilitySet::default();
+        let profile = generate_profile(&caps).unwrap();
+        assert!(
+            profile.contains("(allow iokit-open)\n"),
+            "generated profile must contain the unscoped `(allow iokit-open)` \
+             rule to keep JVM-based tools (e.g. Bazel) from crashing during \
+             startup. Full profile was:\n{profile}"
+        );
     }
 
     #[test]
