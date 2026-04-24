@@ -16,7 +16,6 @@ use super::session::ResolvedCommand;
 use super::{AuditEvent, SessionAuditInfo};
 use crate::audit_integrity::AuditRecorder;
 use nix::libc;
-use nono::NonoError;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -230,9 +229,11 @@ async fn handle_connection(
 ///
 /// Critical section: `lock()` → `append_event()` → drop guard. No `.await`,
 /// no reentrancy into the server/policy/broker. If the mutex is poisoned
-/// (some earlier writer panicked), the event is dropped with a warning —
+/// (some earlier writer panicked), the event is dropped with an error —
 /// further writes would be unsafe because the recorder's in-memory chain
-/// state is potentially inconsistent with the file on disk.
+/// state is potentially inconsistent with the file on disk. Dropped events
+/// are surfaced at `error!` level with the session id so downstream log
+/// aggregation can alert on the missing tail.
 fn log_mediated_audit(
     audit_recorder: &Mutex<AuditRecorder<AuditEvent>>,
     command: &str,
@@ -258,25 +259,41 @@ fn log_mediated_audit(
         sandboxed_pid: audit_info.sandboxed_pid.get().copied(),
         command_pid,
     };
-    append_to_recorder(audit_recorder, event);
+    append_to_recorder(audit_recorder, event, &audit_info.session_id);
 }
 
 /// Acquire the recorder lock, append one event, release. Common helper
 /// between the mediation stream path and the datagram receiver path so
 /// both paths share identical locking discipline.
-fn append_to_recorder(audit_recorder: &Mutex<AuditRecorder<AuditEvent>>, event: AuditEvent) {
+///
+/// Failures here (append error or poisoned lock) log at `error!` with the
+/// session id: because the per-command stream is chain-hashed and DSSE-
+/// signed, a silently dropped event produces an on-disk log that still
+/// verifies but is missing records — the exact failure mode the signing is
+/// meant to surface. Escalating to `error!` makes the gap visible to log
+/// aggregation even though we cannot retroactively seal the chain.
+fn append_to_recorder(
+    audit_recorder: &Mutex<AuditRecorder<AuditEvent>>,
+    event: AuditEvent,
+    session_id: &str,
+) {
     match audit_recorder.lock() {
         Ok(mut guard) => {
             if let Err(err) = guard.append_event(event) {
-                warn!("mediation audit: failed to append event: {}", err);
+                error!(
+                    session_id = session_id,
+                    "mediation audit: failed to append event: {}", err
+                );
             }
         }
         Err(_) => {
             // Poisoned mutex: a prior writer panicked mid-append. Further
             // writes are unsafe because recorder state may be inconsistent
-            // with the on-disk chain. Drop the event with a warning.
-            let _ = NonoError::Snapshot("Mediation audit recorder lock poisoned".to_string());
-            warn!("mediation audit: recorder lock poisoned, dropping event");
+            // with the on-disk chain.
+            error!(
+                session_id = session_id,
+                "mediation audit: recorder lock poisoned, dropping event (chain integrity compromised for this session)"
+            );
         }
     }
 }
@@ -366,7 +383,7 @@ async fn run_audit_receiver(
                     event.session_name = audit_info.session_name.clone();
                     event.nono_pid = audit_info.nono_pid;
                     event.sandboxed_pid = audit_info.sandboxed_pid.get().copied();
-                    append_to_recorder(&audit_recorder, event);
+                    append_to_recorder(&audit_recorder, event, &audit_info.session_id);
                 } else {
                     warn!("audit socket: failed to parse event");
                 }

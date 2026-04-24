@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::marker::PhantomData;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const HASH_ALGORITHM: &str = "sha256";
@@ -109,9 +110,13 @@ pub(crate) struct AuditRecorder<P: Serialize> {
 impl<P: Serialize> AuditRecorder<P> {
     pub(crate) fn new(session_dir: PathBuf, config: &'static RecorderConfig) -> Result<Self> {
         let path = session_dir.join(config.filename);
+        // 0o600: audit streams hold command args, approval decisions, URLs, and
+        // capability metadata — sensitive on multi-user hosts. Set the mode at
+        // creation time rather than relying on umask (usually 0o022 → 0o644).
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&path)
             .map_err(|e| {
                 NonoError::Snapshot(format!(
@@ -237,9 +242,38 @@ fn hash_chain(
     ContentHash::from_bytes(hasher.finalize().into())
 }
 
+/// Compute a Merkle root over `leaves`, domain-separated by `domain`.
+///
+/// Deviations from RFC 6962 and why they're safe here:
+///
+/// 1. **Empty tree:** returns `H(domain)` rather than `SHA256("")`. The latter is
+///    a well-known constant (`e3b0c442…b855`) that would collide across every
+///    stream and violate the cross-stream domain-separation invariant stated on
+///    `RecorderConfig`.
+///
+/// 2. **Unpaired-node promotion:** an odd node at a given level is promoted
+///    upward unchanged rather than paired with itself and re-hashed (the
+///    CVE-2012-2459 duplication attack on Bitcoin's Merkle tree). Safe here
+///    because the audit log is append-only and every leaf carries a unique
+///    `sequence` field baked into its hashed JSON — duplicating a leaf would
+///    require two records with the same sequence number, which verification
+///    rejects in `verify_audit_log` before the Merkle check ever runs.
+///
+/// 3. **No leaf/internal prefix byte:** RFC 6962 prefixes leaves with `0x00`
+///    and internal nodes with `0x01` to rule out leaf-as-internal confusion.
+///    Safe here because leaves are hashed under `event_domain`
+///    (`nono.audit.event.alpha\n` / `nono.mediation.event.alpha\n`) while
+///    internal nodes are hashed under `merkle_domain`
+///    (`nono.audit.merkle.alpha\n` / `nono.mediation.merkle.alpha\n`). A crafted
+///    event whose bytes equal `L || R` still hashes to
+///    `H(event_domain || bytes)`, which cannot collide with
+///    `H(merkle_domain || L || R)` under SHA-256. See the
+///    `merkle_leaf_and_internal_hashes_are_disjoint` test.
 fn merkle_root(leaves: &[ContentHash], domain: &[u8]) -> ContentHash {
     if leaves.is_empty() {
-        return ContentHash::from_bytes(Sha256::digest(b"").into());
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        return ContentHash::from_bytes(hasher.finalize().into());
     }
 
     let mut level: Vec<[u8; 32]> = leaves.iter().map(|leaf| *leaf.as_bytes()).collect();
@@ -748,5 +782,98 @@ mod tests {
         assert_eq!(verified.event_count, expected_count);
         assert!(verified.records_verified);
         assert!(verified.event_count_matches);
+    }
+
+    #[test]
+    fn empty_merkle_root_is_domain_separated() {
+        // The empty-tree case must respect the cross-stream domain-separation
+        // invariant stated on `RecorderConfig`. Returning a constant like
+        // `SHA256("")` would collide across every stream.
+        let empty_audit = merkle_root(&[], AUDIT_EVENTS_CONFIG.merkle_domain);
+        let empty_mediation = merkle_root(&[], MEDIATION_EVENTS_CONFIG.merkle_domain);
+        assert_ne!(
+            empty_audit, empty_mediation,
+            "empty-tree Merkle roots must differ across streams"
+        );
+        assert_ne!(
+            *empty_audit.as_bytes(),
+            *ContentHash::from_bytes(Sha256::digest(b"").into()).as_bytes(),
+            "empty-tree Merkle root must not be the well-known SHA-256 of the empty string"
+        );
+    }
+
+    #[test]
+    fn merkle_leaf_and_internal_hashes_are_disjoint() {
+        // Rules out leaf-vs-internal-node confusion even without RFC 6962
+        // prefix bytes. `hash_event(x, event_domain)` produces
+        // `H(event_domain || x)`, while an internal node at this level
+        // produces `H(merkle_domain || L || R)`. Because `event_domain` and
+        // `merkle_domain` differ, SHA-256 cannot collide the two regardless
+        // of the attacker-chosen payload `x`.
+        for config in [&AUDIT_EVENTS_CONFIG, &MEDIATION_EVENTS_CONFIG] {
+            for sample in [
+                &b""[..],
+                b"{}",
+                // A synthetic "internal-node shape": 64 bytes of two concatenated
+                // 32-byte hashes. If leaf/internal were confused, this is what
+                // an attacker would craft.
+                &[0xAAu8; 64][..],
+                b"\x00\x01\x02\x03",
+            ] {
+                let leaf = hash_event(sample, config.event_domain);
+
+                // Build an internal node whose children bytes happen to equal
+                // `sample` padded/truncated to 64 bytes — matches the loop body
+                // in `merkle_root`.
+                let mut padded = [0u8; 64];
+                let n = sample.len().min(64);
+                padded[..n].copy_from_slice(&sample[..n]);
+                let (left, right) = padded.split_at(32);
+                let mut hasher = Sha256::new();
+                hasher.update(config.merkle_domain);
+                hasher.update(left);
+                hasher.update(right);
+                let internal = ContentHash::from_bytes(hasher.finalize().into());
+
+                assert_ne!(
+                    leaf,
+                    internal,
+                    "leaf and internal-node hashes must not collide (config={}, sample_len={})",
+                    config.merkle_scheme_label,
+                    sample.len()
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_log_file_mode_is_owner_only() {
+        // Regression guard for the info-disclosure fix: both streams must
+        // land on disk with mode 0o600 at creation time, matching the
+        // mediation sockets' hygiene. Without the explicit `.mode(0o600)`,
+        // the default umask of 0o022 would leave the file at 0o644.
+        use std::os::unix::fs::PermissionsExt;
+
+        for config in [&AUDIT_EVENTS_CONFIG, &MEDIATION_EVENTS_CONFIG] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut recorder: AuditRecorder<FakeMediationEvent> =
+                AuditRecorder::new(dir.path().to_path_buf(), config).unwrap();
+            recorder
+                .append_event(FakeMediationEvent {
+                    command: "probe".to_string(),
+                    ts: 1,
+                    exit_code: 0,
+                })
+                .unwrap();
+
+            let path = dir.path().join(config.filename);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "{} must be created with mode 0o600 (got 0o{:o})",
+                config.filename, mode
+            );
+        }
     }
 }
