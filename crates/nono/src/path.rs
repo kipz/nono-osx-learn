@@ -56,15 +56,15 @@ mod tests {
 
     #[test]
     fn existing_path_canonicalizes() {
-        let dir = tempfile::tempdir().unwrap();
-        let canonical = dir.path().canonicalize().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = dir.path().canonicalize().expect("canonicalize");
         assert_eq!(try_canonicalize(dir.path()), canonical);
     }
 
     #[test]
     fn nonexistent_leaf_uses_ancestor() {
-        let dir = tempfile::tempdir().unwrap();
-        let canonical_dir = dir.path().canonicalize().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize");
         let nonexistent = dir.path().join("does_not_exist");
         let result = try_canonicalize(&nonexistent);
         assert_eq!(result, canonical_dir.join("does_not_exist"));
@@ -72,8 +72,8 @@ mod tests {
 
     #[test]
     fn nonexistent_nested_uses_deepest_ancestor() {
-        let dir = tempfile::tempdir().unwrap();
-        let canonical_dir = dir.path().canonicalize().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize");
         let nonexistent = dir.path().join("a").join("b").join("c");
         let result = try_canonicalize(&nonexistent);
         assert_eq!(result, canonical_dir.join("a").join("b").join("c"));
@@ -81,16 +81,16 @@ mod tests {
 
     #[test]
     fn existing_symlink_resolves_through() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         let real_file = dir.path().join("real.txt");
-        fs::write(&real_file, "hello").unwrap();
+        fs::write(&real_file, "hello").expect("write file");
         let link = dir.path().join("link.txt");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_file, &link).unwrap();
+        std::os::unix::fs::symlink(&real_file, &link).expect("symlink");
         #[cfg(unix)]
         {
             let result = try_canonicalize(&link);
-            assert_eq!(result, real_file.canonicalize().unwrap());
+            assert_eq!(result, real_file.canonicalize().expect("canonicalize"));
         }
     }
 }
