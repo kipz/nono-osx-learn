@@ -44,12 +44,17 @@ pub fn validate_caps_against_protected_roots(
     protected_roots: &[PathBuf],
     allow_parent_of_protected: bool,
 ) -> Result<()> {
+    // Pre-canonicalize once so the per-capability loop doesn't repeat the work.
+    let resolved_roots: Vec<PathBuf> = protected_roots
+        .iter()
+        .map(|p| try_canonicalize(p))
+        .collect();
     for cap in caps.fs_capabilities() {
         validate_requested_path_against_protected_roots(
             &cap.resolved,
             cap.is_file,
             &cap.source.to_string(),
-            protected_roots,
+            &resolved_roots,
             allow_parent_of_protected,
         )?;
     }
@@ -77,8 +82,9 @@ pub fn validate_requested_path_against_protected_roots(
     let requested_path = try_canonicalize(path);
 
     for protected_root in protected_roots {
-        let inside_protected = requested_path.starts_with(protected_root);
-        let parent_of_protected = !is_file && protected_root.starts_with(&requested_path);
+        let resolved_root = try_canonicalize(protected_root);
+        let inside_protected = requested_path.starts_with(&resolved_root);
+        let parent_of_protected = !is_file && resolved_root.starts_with(&requested_path);
 
         // inside_protected is always a hard error on all platforms
         if inside_protected {
@@ -86,7 +92,7 @@ pub fn validate_requested_path_against_protected_roots(
                 "Refusing to grant '{}' (source: {}) because it overlaps protected nono state root '{}'.",
                 requested_path.display(),
                 source,
-                protected_root.display(),
+                resolved_root.display(),
             )));
         }
 
@@ -97,7 +103,7 @@ pub fn validate_requested_path_against_protected_roots(
                 "Refusing to grant '{}' (source: {}) because it overlaps protected nono state root '{}'.",
                 requested_path.display(),
                 source,
-                protected_root.display(),
+                resolved_root.display(),
             )));
         }
     }
@@ -126,14 +132,15 @@ pub fn overlapping_protected_root(
     let requested_path = try_canonicalize(path);
 
     for protected_root in protected_roots {
-        let inside_protected = requested_path.starts_with(protected_root);
+        let resolved_root = try_canonicalize(protected_root);
+        let inside_protected = requested_path.starts_with(&resolved_root);
         if inside_protected {
-            return Some(protected_root.clone());
+            return Some(resolved_root);
         }
 
-        let parent_of_protected = !is_file && protected_root.starts_with(&requested_path);
+        let parent_of_protected = !is_file && resolved_root.starts_with(&requested_path);
         if parent_of_protected && !cfg!(target_os = "macos") {
-            return Some(protected_root.clone());
+            return Some(resolved_root);
         }
     }
 
