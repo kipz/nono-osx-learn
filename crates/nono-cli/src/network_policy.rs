@@ -224,6 +224,7 @@ pub fn resolve_credentials(
             }
 
             let oauth2 = cred.auth.clone();
+            let exec = cred.exec.clone();
 
             routes.push(RouteConfig {
                 prefix: name.clone(),
@@ -260,6 +261,7 @@ pub fn resolve_credentials(
                     })
                     .transpose()?,
                 oauth2,
+                exec,
             });
         } else if let Some(cred) = policy.credentials.get(name) {
             // Validate env_var against dangerous variable blocklist
@@ -291,6 +293,7 @@ pub fn resolve_credentials(
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                exec: None,
             });
         }
         // We already validated existence above, so this else branch won't be hit
@@ -497,6 +500,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -537,6 +541,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -573,6 +578,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -619,6 +625,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -701,6 +708,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -734,6 +742,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -767,6 +776,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -805,6 +815,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -917,6 +928,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -975,6 +987,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
@@ -1023,6 +1036,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                exec: None,
             },
         );
 
