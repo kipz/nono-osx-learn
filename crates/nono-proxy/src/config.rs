@@ -181,6 +181,23 @@ pub struct RouteConfig {
     /// Mutually exclusive with `credential_key` — use one or the other.
     #[serde(default)]
     pub oauth2: Option<OAuth2Config>,
+
+    /// When true, CONNECT requests whose target host matches this
+    /// route's `upstream` host are terminated by the proxy's session CA
+    /// (`crate::intercept`) instead of being passed through as a
+    /// transparent TCP tunnel. Used by the OAuth-capture path
+    /// (Layer 1.2 of `2026-04-27-capture-anthropic-auth.md`) so the
+    /// proxy can read and rewrite OAuth token-endpoint responses.
+    ///
+    /// Default: false. The CONNECT dispatcher (Layer 1.3) will be
+    /// responsible for honouring this flag; until that lands, setting
+    /// it has no effect.
+    ///
+    /// Note: this is the *inverse* direction of the existing `tls_ca`
+    /// field (which trusts an upstream's self-signed cert). Don't
+    /// conflate them.
+    #[serde(default)]
+    pub tls_intercept: bool,
 }
 
 /// Optional proxy-side overrides for credential injection shape.
@@ -779,5 +796,46 @@ mod tests {
         let route: RouteConfig = serde_json::from_str(json).unwrap();
         assert!(route.oauth2.is_none());
         assert!(route.credential_key.is_some());
+    }
+
+    #[test]
+    fn test_route_config_tls_intercept_defaults_false() {
+        let json = r#"{
+            "prefix": "/anthropic",
+            "upstream": "https://api.anthropic.com"
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            !route.tls_intercept,
+            "tls_intercept must default to false for backward compatibility"
+        );
+    }
+
+    #[test]
+    fn test_route_config_tls_intercept_explicit_true() {
+        let json = r#"{
+            "prefix": "/claude-oauth",
+            "upstream": "https://claude.ai",
+            "tls_intercept": true
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(route.tls_intercept);
+    }
+
+    #[test]
+    fn test_route_config_tls_intercept_round_trips_through_serialization() {
+        // Serialization → deserialization should preserve the value so
+        // profile-save flows do not silently drop the flag.
+        let original = serde_json::from_str::<RouteConfig>(
+            r#"{
+                "prefix": "/claude-oauth",
+                "upstream": "https://claude.ai",
+                "tls_intercept": true
+            }"#,
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&original).unwrap();
+        let round_tripped: RouteConfig = serde_json::from_str(&serialized).unwrap();
+        assert!(round_tripped.tls_intercept);
     }
 }

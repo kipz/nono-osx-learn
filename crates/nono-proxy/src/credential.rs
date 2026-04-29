@@ -444,6 +444,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            tls_intercept: false,
         }];
         let store = CredentialStore::load(&routes, &tls);
         assert!(store.is_ok());
@@ -546,6 +547,7 @@ mod tests {
                 client_secret: "env://TEST_OAUTH2_CLIENT_SECRET".to_string(),
                 scope: String::new(),
             }),
+            tls_intercept: false,
         }];
 
         let store = CredentialStore::load(&routes, &tls);
