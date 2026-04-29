@@ -100,6 +100,13 @@ fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMecha
             }
             crate::config::InjectMode::UrlPath => NetworkAuditAuthMechanism::PhantomPath,
             crate::config::InjectMode::QueryParam => NetworkAuditAuthMechanism::PhantomQuery,
+            // OauthCapture routes shouldn't carry a credential_key (it's
+            // ignored — see credential.rs warning), so this arm is
+            // unreachable in steady state. Defensive default until plan
+            // step 17 audit hardening adds a dedicated variant.
+            crate::config::InjectMode::OauthCapture { .. } => {
+                NetworkAuditAuthMechanism::PhantomHeader
+            }
         });
     }
 
@@ -117,6 +124,8 @@ fn injection_mode_for_route(route: &RouteConfig) -> Option<NetworkAuditInjection
             crate::config::InjectMode::UrlPath => NetworkAuditInjectionMode::UrlPath,
             crate::config::InjectMode::QueryParam => NetworkAuditInjectionMode::QueryParam,
             crate::config::InjectMode::BasicAuth => NetworkAuditInjectionMode::BasicAuth,
+            // See comment on the auth-mechanism helper above.
+            crate::config::InjectMode::OauthCapture { .. } => NetworkAuditInjectionMode::Header,
         });
     }
 

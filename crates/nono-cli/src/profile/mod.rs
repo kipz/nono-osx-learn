@@ -518,6 +518,12 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
                 // No additional required fields for basic_auth mode
                 // Credential value is expected to be "username:password" format
             }
+            InjectMode::OauthCapture { .. } => {
+                // OauthCapture routes don't validate against credential_key
+                // — the secret is captured at runtime from the response
+                // body, not pre-loaded from the keystore. credential.rs
+                // warns when both are set; profile-load just accepts.
+            }
         }
     }
 
@@ -638,6 +644,11 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
                     param_name, name
                 )));
             }
+        }
+        InjectMode::OauthCapture { .. } => {
+            // OauthCapture has no proxy-side phantom-token shape to
+            // validate; the `proxy` block's fields (inject_header,
+            // path_pattern, query_param_name) don't apply.
         }
     }
 

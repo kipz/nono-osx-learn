@@ -299,6 +299,12 @@ where
                     InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
                     InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
                     InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                    // OauthCapture is response-side and shouldn't reach
+                    // here; plan step 17 audit hardening adds the proper
+                    // variant.
+                    InjectMode::OauthCapture { .. } => {
+                        nono::undo::NetworkAuditInjectionMode::Header
+                    }
                 }),
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
                 ..audit::EventContext::default()
@@ -370,6 +376,11 @@ where
                 }
                 InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
                 InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+                // OauthCapture is response-side; defensive default
+                // until plan step 17 adds a dedicated variant.
+                InjectMode::OauthCapture { .. } => {
+                    nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+                }
             }),
             auth_outcome: cred.map(|_| nono::undo::NetworkAuditAuthOutcome::Succeeded),
             managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
@@ -378,6 +389,9 @@ where
                 InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
                 InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
                 InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                // OauthCapture is response-side; see comment on the
+                // deeper-indented arm above.
+                InjectMode::OauthCapture { .. } => nono::undo::NetworkAuditInjectionMode::Header,
             }),
             denial_category: None,
         },
@@ -406,6 +420,11 @@ where
                     }
                     InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
                     InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+                    // OauthCapture is response-side; see comment on the
+                    // shallower-indented arm above.
+                    InjectMode::OauthCapture { .. } => {
+                        nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+                    }
                 }),
                 auth_outcome: cred.map(|_| nono::undo::NetworkAuditAuthOutcome::Succeeded),
                 managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
@@ -414,6 +433,12 @@ where
                     InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
                     InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
                     InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                    // OauthCapture is response-side and shouldn't reach
+                    // here; plan step 17 audit hardening adds the proper
+                    // variant.
+                    InjectMode::OauthCapture { .. } => {
+                        nono::undo::NetworkAuditInjectionMode::Header
+                    }
                 }),
                 denial_category: Some(
                     nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,

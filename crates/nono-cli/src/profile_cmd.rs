@@ -2952,6 +2952,10 @@ fn resolve_to_manifest(
             profile::InjectMode::UrlPath => manifest::InjectMode::UrlPath,
             profile::InjectMode::QueryParam => manifest::InjectMode::QueryParam,
             profile::InjectMode::BasicAuth => manifest::InjectMode::BasicAuth,
+            // OauthCapture is not representable in the capability-manifest
+            // schema (it has no static credential to declare); skip the
+            // route entirely, consistent with the OAuth2 `None` skip below.
+            profile::InjectMode::OauthCapture { .. } => continue,
         };
 
         let endpoint_rules: Vec<manifest::EndpointRule> = cred

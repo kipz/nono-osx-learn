@@ -40,6 +40,10 @@ fn auth_mechanism_for_inject_mode(mode: &InjectMode) -> nono::undo::NetworkAudit
         }
         InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
         InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+        // OauthCapture is a response-side mode; shouldn't reach request-
+        // path audit mapping. Defensive default until audit hardening
+        // (plan step 17) adds a dedicated audit variant.
+        InjectMode::OauthCapture { .. } => nono::undo::NetworkAuditAuthMechanism::PhantomHeader,
     }
 }
 
@@ -51,6 +55,9 @@ fn audit_injection_mode_for_inject_mode(
         InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
         InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
         InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+        // OauthCapture is response-side; see comment on the auth-mechanism
+        // helper above.
+        InjectMode::OauthCapture { .. } => nono::undo::NetworkAuditInjectionMode::Header,
     }
 }
 
@@ -938,6 +945,16 @@ pub(crate) fn validate_phantom_token_for_mode(
             })?;
             validate_phantom_token_in_query(path, param_name, session_token)
         }
+        InjectMode::OauthCapture { .. } => {
+            // OauthCapture is a TLS-intercept response-side mode and
+            // does not gate reverse-proxy traffic. Reject defensively
+            // so misconfigured routes (OauthCapture used outside the
+            // CONNECT/intercept path) fail loudly instead of silently
+            // letting requests through unauthenticated.
+            Err(ProxyError::HttpParse(
+                "oauth_capture inject_mode is not valid on a reverse-proxy route".to_string(),
+            ))
+        }
     }
 }
 
@@ -1049,6 +1066,9 @@ pub(crate) fn transform_path_for_mode(
             })?;
             transform_query_param(path, param_name, credential)
         }
+        InjectMode::OauthCapture { .. } => Err(ProxyError::HttpParse(
+            "oauth_capture inject_mode is not valid on a reverse-proxy route".to_string(),
+        )),
     }
 }
 
@@ -1204,6 +1224,8 @@ pub(crate) fn strip_proxy_artifacts(
         }
         // Header and BasicAuth modes don't embed artifacts in the URL path.
         InjectMode::Header | InjectMode::BasicAuth => path.to_string(),
+        // OauthCapture is response-only; the request path is unchanged.
+        InjectMode::OauthCapture { .. } => path.to_string(),
     }
 }
 
@@ -1307,6 +1329,11 @@ pub(crate) fn inject_credential_for_mode(cred: &LoadedCredential, request: &mut 
         InjectMode::UrlPath | InjectMode::QueryParam => {
             // Credential is already injected into the URL path/query
             // No header injection needed
+        }
+        InjectMode::OauthCapture { .. } => {
+            // OauthCapture has no static credential to inject — the
+            // body rewriter on the response side handles capture, and
+            // there is no inbound nonce to swap to a real token here.
         }
     }
 }
