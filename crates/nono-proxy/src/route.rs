@@ -41,6 +41,13 @@ pub struct LoadedRoute {
     /// Built once at startup from the route's `tls_ca` certificate file.
     /// When `None`, the shared default connector (webpki roots only) is used.
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
+
+    /// Mirrors `RouteConfig.tls_intercept`. When true, CONNECT requests
+    /// targeting this route's upstream host are TLS-terminated by the
+    /// proxy's session CA (`crate::intercept`) so the proxy can read
+    /// and rewrite plaintext HTTP. Used by the OAuth-capture path
+    /// (Layer 1 of `2026-04-27-capture-anthropic-auth.md`).
+    pub tls_intercept: bool,
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -112,6 +119,7 @@ impl RouteStore {
                     upstream_host_port,
                     endpoint_rules,
                     tls_connector,
+                    tls_intercept: route.tls_intercept,
                 },
             );
         }
@@ -156,6 +164,22 @@ impl RouteStore {
                 .upstream_host_port
                 .as_ref()
                 .is_some_and(|hp| *hp == normalised)
+        })
+    }
+
+    /// Check whether `host_port` matches the upstream of a route that
+    /// has `tls_intercept: true`. Used by the CONNECT dispatcher to
+    /// branch into the TLS-intercept path instead of opening a
+    /// transparent tunnel.
+    #[must_use]
+    pub fn is_intercept_upstream(&self, host_port: &str) -> bool {
+        let normalised = host_port.to_lowercase();
+        self.routes.values().any(|route| {
+            route.tls_intercept
+                && route
+                    .upstream_host_port
+                    .as_ref()
+                    .is_some_and(|hp| *hp == normalised)
         })
     }
 
@@ -522,6 +546,98 @@ mod tests {
     }
 
     #[test]
+    fn test_is_intercept_upstream_only_matches_intercept_routes() {
+        // Two routes with the same prefix shape — one with
+        // tls_intercept: true, one with the default (false). Only the
+        // first should be reported as an intercept upstream.
+        let routes = vec![
+            RouteConfig {
+                prefix: "claude-oauth".to_string(),
+                upstream: "https://claude.ai".to_string(),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                tls_intercept: true,
+            },
+            RouteConfig {
+                prefix: "openai".to_string(),
+                upstream: "https://api.openai.com".to_string(),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                tls_intercept: false,
+            },
+        ];
+
+        let store = RouteStore::load(&routes).unwrap();
+
+        // Both upstreams are recognised as routes.
+        assert!(store.is_route_upstream("claude.ai:443"));
+        assert!(store.is_route_upstream("api.openai.com:443"));
+
+        // Only the intercept-flagged route is an intercept upstream.
+        assert!(store.is_intercept_upstream("claude.ai:443"));
+        assert!(!store.is_intercept_upstream("api.openai.com:443"));
+
+        // Unknown hosts are not intercept upstreams either.
+        assert!(!store.is_intercept_upstream("github.com:443"));
+
+        // Case-insensitive, mirroring is_route_upstream.
+        assert!(store.is_intercept_upstream("CLAUDE.AI:443"));
+    }
+
+    #[test]
+    fn test_loaded_route_carries_tls_intercept_flag() {
+        let routes = vec![RouteConfig {
+            prefix: "claude-oauth".to_string(),
+            upstream: "https://claude.ai".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            tls_intercept: true,
+        }];
+
+        let store = RouteStore::load(&routes).unwrap();
+        let route = store
+            .get("claude-oauth")
+            .expect("route should be loaded by normalised prefix");
+        assert!(route.tls_intercept);
+    }
+
+    #[test]
     fn test_extract_host_port_https() {
         assert_eq!(
             extract_host_port("https://api.openai.com"),
@@ -560,6 +676,7 @@ mod tests {
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             tls_connector: None,
+            tls_intercept: false,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));

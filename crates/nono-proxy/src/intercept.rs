@@ -11,12 +11,15 @@
 //! certificate is materialized to disk.
 //!
 //! Layer 1 of the OAuth-capture design (see
-//! `2026-04-27-capture-anthropic-auth.md`). This module is self-contained
-//! and not yet wired into [`crate::connect`]; that wiring is Layer 1.2.
+//! `2026-04-27-capture-anthropic-auth.md`). [`InterceptCa`] is the
+//! per-session CA + leaf factory; [`handle_intercept`] is the per-CONNECT
+//! dispatch entry point that the [`crate::connect`] module hands off to
+//! when a target host matches a `tls_intercept: true` route.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -26,10 +29,15 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::ServerConfig;
-use tracing::debug;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tracing::{debug, warn};
 
+use crate::audit;
+use crate::connect;
 use crate::error::{ProxyError, Result};
 
 /// CA validity window. Far longer than any reasonable session, and a
@@ -218,6 +226,110 @@ impl InterceptCa {
     }
 }
 
+/// Handle a CONNECT request whose target host is configured for TLS
+/// interception.
+///
+/// The handshake-shaped sequence is:
+///
+/// 1. Open a TCP connection to one of the pre-resolved upstream IPs
+///    (no DNS rebinding — addresses are validated by the caller). If
+///    this fails the client never sees a 200, matching `connect.rs`'s
+///    transparent-tunnel behaviour.
+/// 2. Reply `HTTP/1.1 200 Connection Established` so the client begins
+///    its TLS handshake against us.
+/// 3. Look up (or mint and cache) a leaf certificate for `host` from
+///    `ca` and use it to TLS-accept the client.
+/// 4. TLS-connect to the upstream IP using `upstream_tls`, with the
+///    original hostname as SNI / cert-validation target.
+/// 5. Bidirectionally relay plaintext HTTP between the two TLS streams.
+///
+/// This commit ships steps 1–5 only; the response-body capture/rewrite
+/// path that turns this into an actual OAuth-token vacuum is Layer 1.4
+/// and lands in a follow-up.
+///
+/// On client-side TLS-accept failure (e.g. the sandboxed agent does
+/// not trust our CA), we audit-log the rejection and return `Ok(())`
+/// — closing the connection is the right move and not a proxy fault.
+/// Upstream-side failures bubble up as `ProxyError::UpstreamConnect`.
+pub async fn handle_intercept(
+    mut client_stream: TcpStream,
+    host: &str,
+    port: u16,
+    resolved_addrs: &[SocketAddr],
+    ca: Arc<InterceptCa>,
+    upstream_tls: TlsConnector,
+    audit_log: Option<&audit::SharedAuditLog>,
+) -> Result<()> {
+    debug!("intercept: dispatching CONNECT to {}:{}", host, port);
+
+    // 1. Open the upstream TCP first. If we cannot reach it, we don't
+    //    want to mislead the client with a 200.
+    let upstream_tcp = connect::connect_to_resolved(resolved_addrs, host).await?;
+
+    // 2. Tell the client to start its TLS handshake.
+    static OK_LINE: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+    client_stream.write_all(OK_LINE).await?;
+    client_stream.flush().await?;
+
+    // 3. Get a leaf cert / `ServerConfig` for this hostname.
+    let server_config = ca.server_config_for(host)?;
+
+    // 4a. TLS-accept the client side using our session CA's leaf.
+    let acceptor = TlsAcceptor::from(server_config);
+    let mut client_tls = match acceptor.accept(client_stream).await {
+        Ok(tls) => tls,
+        Err(e) => {
+            warn!(
+                "intercept: client-side TLS accept failed for {}:{}: {}",
+                host, port, e
+            );
+            audit::log_denied(
+                audit_log,
+                audit::ProxyMode::Connect,
+                host,
+                port,
+                &format!("intercept TLS accept: {e}"),
+            );
+            return Ok(());
+        }
+    };
+
+    // 4b. TLS-connect to the upstream with its real cert chain.
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|e| ProxyError::UpstreamConnect {
+            host: host.to_string(),
+            reason: format!("invalid SNI for upstream: {e}"),
+        })?;
+    let mut upstream_tls_stream = upstream_tls
+        .connect(server_name, upstream_tcp)
+        .await
+        .map_err(|e| ProxyError::UpstreamConnect {
+            host: host.to_string(),
+            reason: format!("upstream-side TLS connect failed: {e}"),
+        })?;
+
+    audit::log_allowed(
+        audit_log,
+        audit::ProxyMode::Connect,
+        host,
+        port,
+        "INTERCEPT",
+    );
+
+    // 5. Plaintext HTTP relay. Step 4 (next commit) wraps the response
+    //    side with a body rewriter; for now the path is byte-for-byte
+    //    transparent so handshake regressions surface before any
+    //    application-layer change.
+    let copy_result =
+        tokio::io::copy_bidirectional(&mut client_tls, &mut upstream_tls_stream).await;
+    debug!(
+        "intercept: tunnel closed for {}:{}: {:?}",
+        host, port, copy_result
+    );
+
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -355,6 +467,159 @@ mod tests {
         assert!(
             Arc::strong_count(&cfg) >= 2,
             "leaf cache must hold its own strong reference"
+        );
+    }
+
+    /// Build a `TlsConnector` that trusts the system roots. Used only
+    /// as a placeholder argument in `handle_intercept_*` tests where
+    /// the upstream TLS leg never gets exercised (because the test
+    /// closes the client before completing the client-side handshake).
+    fn unused_upstream_connector() -> TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        TlsConnector::from(Arc::new(cfg))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_intercept_sends_200_after_upstream_tcp_succeeds() {
+        // Validates the dispatcher's externally observable contract:
+        //   1. open upstream TCP first;
+        //   2. then send HTTP/1.1 200 to the client.
+        //
+        // We don't drive the TLS handshake to completion here — the
+        // test closes the client right after reading the 200, which
+        // makes the client-side TLS-accept fail and `handle_intercept`
+        // exits via the audit-and-Ok branch. That is intentional: the
+        // full handshake is exercised by the body-rewriter test in the
+        // next commit, where there is something to assert about the
+        // payload.
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        // "Upstream" — a plain TCP listener at 127.0.0.1 on a random
+        // port. Accepts and discards bytes. The proxy's upstream TCP
+        // open succeeds against this; the upstream TLS leg is never
+        // reached because the client closes first.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = upstream.accept().await {
+                let _ = tokio::io::copy(&mut s, &mut tokio::io::sink()).await;
+            }
+        });
+
+        // "Proxy" — a listener that hands its accepted stream to
+        // `handle_intercept`.
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let ca = Arc::new(InterceptCa::new().unwrap());
+        let upstream_tls = unused_upstream_connector();
+
+        let proxy_task = tokio::spawn({
+            let ca = Arc::clone(&ca);
+            async move {
+                let (server_stream, _) = proxy.accept().await.unwrap();
+                handle_intercept(
+                    server_stream,
+                    "localhost",
+                    upstream_addr.port(),
+                    &[upstream_addr],
+                    ca,
+                    upstream_tls,
+                    None,
+                )
+                .await
+            }
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        let response = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 Connection Established"),
+            "expected 200 line, got: {:?}",
+            response
+        );
+
+        // Closing the client triggers the client-side TLS-accept to
+        // fail; the handler should exit cleanly (Ok), not error.
+        drop(client);
+        let result = proxy_task.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "handle_intercept must return Ok when the client closes mid-handshake, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_intercept_fails_when_upstream_unreachable() {
+        // No 200 should be written if we cannot reach the upstream,
+        // matching the transparent-tunnel handler in `connect.rs`.
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Pick a port likely to refuse connections by binding it then
+        // dropping the listener — the OS may take a moment to release,
+        // but a TCP connect to it usually fails immediately on Linux/
+        // macOS (ECONNREFUSED) once the socket is closed.
+        let unused_addr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let ca = Arc::new(InterceptCa::new().unwrap());
+        let upstream_tls = unused_upstream_connector();
+
+        let proxy_task = tokio::spawn({
+            let ca = Arc::clone(&ca);
+            async move {
+                let (server_stream, _) = proxy.accept().await.unwrap();
+                handle_intercept(
+                    server_stream,
+                    "localhost",
+                    unused_addr.port(),
+                    &[unused_addr],
+                    ca,
+                    upstream_tls,
+                    None,
+                )
+                .await
+            }
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 64];
+
+        // Read should observe EOF (n == 0) without ever seeing a 200,
+        // because handle_intercept errors out before writing the
+        // status line.
+        let n = client.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(
+            n,
+            0,
+            "client must not see any bytes when upstream is unreachable, got: {:?}",
+            std::str::from_utf8(&buf[..n])
+        );
+
+        let result = proxy_task.await.unwrap();
+        assert!(
+            result.is_err(),
+            "handle_intercept must return Err when upstream is unreachable"
         );
     }
 }

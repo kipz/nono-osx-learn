@@ -87,7 +87,10 @@ pub async fn handle_connect(
 ///
 /// Tries each address in order until one succeeds. This connects to the
 /// IP directly (not re-resolving the hostname), preventing DNS rebinding.
-async fn connect_to_resolved(addrs: &[SocketAddr], host: &str) -> Result<TcpStream> {
+///
+/// Visible to sibling modules (e.g. [`crate::intercept`]) so the
+/// TLS-intercept path can reuse the same DNS-rebind-safe connect logic.
+pub(crate) async fn connect_to_resolved(addrs: &[SocketAddr], host: &str) -> Result<TcpStream> {
     let mut last_err = None;
     for addr in addrs {
         match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
