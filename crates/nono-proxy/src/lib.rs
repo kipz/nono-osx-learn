@@ -18,6 +18,7 @@
 //! child can only reach `localhost:<port>` via `NetworkMode::ProxyOnly`.
 
 pub mod audit;
+pub mod broker;
 pub mod config;
 pub mod connect;
 pub mod credential;
@@ -31,6 +32,7 @@ pub mod route;
 pub mod server;
 pub mod token;
 
+pub use broker::TokenResolver;
 pub use config::ProxyConfig;
 pub use error::{ProxyError, Result};
-pub use server::{start, ProxyHandle};
+pub use server::{start, start_with_runtime, ProxyHandle, ProxyRuntime};

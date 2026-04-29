@@ -8,6 +8,7 @@
 //! Other methods  -> [`reverse`] handler (credential injection)
 
 use crate::audit;
+use crate::broker::TokenResolver;
 use crate::config::ProxyConfig;
 use crate::connect;
 use crate::credential::CredentialStore;
@@ -163,6 +164,21 @@ impl ProxyHandle {
     }
 }
 
+/// Runtime-only inputs to [`start_with_runtime`] that are not part of
+/// the JSON-serializable [`ProxyConfig`].
+///
+/// New seams (token broker, future shared resources) live here so the
+/// on-disk config schema stays untouched and `ProxyConfig` can keep its
+/// `Serialize` / `Deserialize` derives.
+#[derive(Default, Clone)]
+pub struct ProxyRuntime {
+    /// Optional credential broker the proxy can call into. Populated by
+    /// the CLI from its in-process `TokenBroker` when OAuth capture is
+    /// enabled (Layer 1 of `2026-04-27-capture-anthropic-auth.md`).
+    /// `None` means OAuth-capture features are inert.
+    pub token_resolver: Option<Arc<dyn TokenResolver>>,
+}
+
 /// Shared state for the proxy server.
 struct ProxyState {
     filter: ProxyFilter,
@@ -182,16 +198,32 @@ struct ProxyState {
     /// Matcher for hosts that bypass the external proxy and route direct.
     /// Built once at startup from `ExternalProxyConfig.bypass_hosts`.
     bypass_matcher: external::BypassMatcher,
+    /// Shared credential broker. `None` when OAuth capture is not in
+    /// use; the TLS-intercept dispatcher (Layer 1.2) checks this before
+    /// activating the capture path.
+    #[allow(dead_code)]
+    token_resolver: Option<Arc<dyn TokenResolver>>,
 }
 
-/// Start the proxy server.
+/// Start the proxy server with default runtime inputs (no token
+/// broker, etc.). Equivalent to
+/// `start_with_runtime(config, ProxyRuntime::default())`.
+pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
+    start_with_runtime(config, ProxyRuntime::default()).await
+}
+
+/// Start the proxy server with explicit runtime inputs.
 ///
 /// Binds to `config.bind_addr:config.bind_port` (port 0 = OS-assigned),
 /// generates a session token, and begins accepting connections.
 ///
+/// `runtime` carries non-config handles (e.g. a shared
+/// [`TokenResolver`]) that cannot live in the JSON-serializable
+/// [`ProxyConfig`].
+///
 /// Returns a `ProxyHandle` with the assigned port and session token.
 /// The server runs until the handle is dropped or `shutdown()` is called.
-pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
+pub async fn start_with_runtime(config: ProxyConfig, runtime: ProxyRuntime) -> Result<ProxyHandle> {
     // Generate session token
     let session_token = token::generate_session_token()?;
 
@@ -324,6 +356,7 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
         active_connections: AtomicUsize::new(0),
         audit_log: Arc::clone(&audit_log),
         bypass_matcher,
+        token_resolver: runtime.token_resolver,
     });
 
     // Spawn accept loop as a task within the current runtime.
