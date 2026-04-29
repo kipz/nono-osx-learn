@@ -12,6 +12,7 @@ use crate::audit_session::{
 use crate::cli::{
     AuditArgs, AuditCleanupArgs, AuditCommands, AuditListArgs, AuditShowArgs, AuditVerifyArgs,
 };
+use crate::command_display::{format_command_line, truncate_command};
 use crate::theme;
 use colored::Colorize;
 use nono::undo::SnapshotManager;
@@ -269,7 +270,7 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
     eprintln!(
         "  Command:  {}",
         theme::fg(
-            &session.metadata.command.join(" "),
+            &format_command_line(&session.metadata.command),
             theme::current().subtext
         )
     );
@@ -586,7 +587,7 @@ fn cmd_cleanup(args: AuditCleanupArgs) -> Result<()> {
             eprintln!(
                 "  {} {} ({})",
                 s.metadata.session_id,
-                s.metadata.command.join(" ").truecolor(
+                format_command_line(&s.metadata.command).truecolor(
                     theme::current().subtext.0,
                     theme::current().subtext.1,
                     theme::current().subtext.2
@@ -731,15 +732,6 @@ fn shorten_home(path: &Path) -> String {
         }
     }
     s
-}
-
-fn truncate_command(cmd: &[String], max_len: usize) -> String {
-    let full = cmd.join(" ");
-    if full.len() <= max_len {
-        full
-    } else {
-        format!("{}...", &full[..max_len.saturating_sub(3)])
-    }
 }
 
 fn change_symbol(ct: &nono::undo::ChangeType) -> colored::ColoredString {
