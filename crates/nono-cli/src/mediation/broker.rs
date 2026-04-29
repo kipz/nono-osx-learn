@@ -54,6 +54,24 @@ impl TokenBroker {
     }
 }
 
+/// Implements the `nono-proxy` `TokenResolver` seam so the proxy can
+/// hold an `Arc<dyn TokenResolver>` backed by the same broker the
+/// mediation server uses for command-mediation phantom tokens.
+///
+/// Layer 1.2 of the OAuth-capture design (see
+/// `2026-04-27-capture-anthropic-auth.md`): the proxy's TLS-intercept
+/// path calls `issue` on captured OAuth tokens and `resolve` to swap
+/// nonces back to real values at egress.
+impl nono_proxy::TokenResolver for TokenBroker {
+    fn issue(&self, secret: Zeroizing<String>) -> String {
+        TokenBroker::issue(self, secret)
+    }
+
+    fn resolve(&self, nonce: &str) -> Option<Zeroizing<String>> {
+        TokenBroker::resolve(self, nonce)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +111,29 @@ mod tests {
         let n1 = broker.issue(Zeroizing::new("val1".to_string()));
         let n2 = broker.issue(Zeroizing::new("val2".to_string()));
         assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn token_resolver_trait_object_round_trips() {
+        // The proxy holds the broker as `Arc<dyn nono_proxy::TokenResolver>`.
+        // Issue + resolve through the trait object must return the same
+        // value the concrete broker does, proving the seam is wired and
+        // the trait is object-safe in our usage.
+        use nono_proxy::TokenResolver;
+        use std::sync::Arc;
+
+        let resolver: Arc<dyn TokenResolver> = Arc::new(TokenBroker::new());
+        let nonce = resolver.issue(Zeroizing::new("real_value".to_string()));
+        assert!(nonce.starts_with("nono_"));
+
+        let resolved = resolver
+            .resolve(&nonce)
+            .expect("nonce issued via trait should resolve via trait");
+        assert_eq!(resolved.as_str(), "real_value");
+
+        assert!(
+            resolver.resolve("nono_unknown_nonce").is_none(),
+            "unknown nonces must resolve to None silently"
+        );
     }
 }
