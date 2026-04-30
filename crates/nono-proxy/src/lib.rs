@@ -18,6 +18,7 @@
 //! child can only reach `localhost:<port>` via `NetworkMode::ProxyOnly`.
 
 pub mod audit;
+pub mod cache;
 pub mod config;
 pub mod connect;
 pub mod credential;

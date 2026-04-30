@@ -6,35 +6,31 @@
 //! configured TTL elapses. Designed for the reverse-proxy credential
 //! injection flow where the agent never sees the real bearer.
 //!
+//! The cache lifecycle (TTL gating, write-lock dance, graceful degradation,
+//! force-refresh cooldown) lives in [`crate::cache::TtlCache`]; this module
+//! just supplies the fetcher closure that runs the configured command and
+//! validates its stdout.
+//!
 //! ## Design
 //!
-//! - **No background tasks.** Token validity is checked on each use via
-//!   [`ExecTokenCache::get_or_refresh()`]. Refresh attempts kick in once the
-//!   cached value is within `EXPIRY_BUFFER_SECS` of the configured TTL.
-//! - **Graceful degradation.** If a refresh attempt fails but a stale token
-//!   exists, the stale token is returned with a warning log — same trade-off
-//!   as the OAuth2 path. A transient command failure should not turn a
-//!   single bad refresh into request failures.
 //! - **Absolute-path argv.** `command[0]` must be an absolute path. PATH
 //!   lookup is refused so a sibling on PATH cannot shadow the configured
 //!   binary.
 //! - **Trimmed stdout.** A single trailing newline (Unix or Windows) is
 //!   stripped, matching how `nono::keystore::load_secret_file` treats
 //!   file-backed secrets.
+//! - **No CR/LF/NUL in the credential.** A trailing newline is stripped,
+//!   but any embedded control character is rejected — without this, a
+//!   helper that emits `"tok\r\nX-Admin: yes"` would let a malicious
+//!   helper splice arbitrary headers via `credential_format`.
 
+use crate::cache::{FetcherFn, FetcherFuture, TtlCache};
 use crate::config::ExecConfig;
 use crate::error::{ProxyError, Result};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use std::time::Duration;
 use zeroize::Zeroizing;
-
-/// Buffer subtracted from the configured TTL so we refresh before the upstream
-/// would actually reject the credential. Matches the OAuth2 buffer.
-const EXPIRY_BUFFER_SECS: u64 = 30;
 
 /// Default timeout for a single fetch invocation when the route does not
 /// specify `timeout_secs`. Generous enough for commands that prompt for
@@ -45,6 +41,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard upper bound on accepted stdout size (1 MiB). Prevents a misbehaving
 /// helper from exhausting memory before we trim and zeroize.
 const MAX_STDOUT_BYTES: usize = 1024 * 1024;
+
+/// Cooldown between successive `force_refresh` attempts. Stops a
+/// 401-flapping upstream from causing the helper to be re-run on every
+/// request — at most one re-issuance per cooldown window.
+const FORCE_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Resolved configuration for an exec-based credential, ready to invoke.
 #[derive(Clone)]
@@ -118,144 +119,83 @@ impl ExecResolvedConfig {
     }
 }
 
-/// Thread-safe TTL-bounded cache for a credential produced by an external
-/// command. Mirrors the shape of [`crate::oauth2::TokenCache`].
+/// TTL-bounded cache for a credential produced by an external command.
+///
+/// A thin wrapper over [`TtlCache`] that knows how to build the fetcher
+/// closure from an [`ExecResolvedConfig`].
+#[derive(Debug)]
 pub struct ExecTokenCache {
-    token: Arc<RwLock<CachedToken>>,
-    config: ExecResolvedConfig,
+    inner: TtlCache,
 }
 
-impl std::fmt::Debug for ExecTokenCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExecTokenCache")
-            .field("config", &self.config)
-            .finish()
-    }
+/// Build the fetcher closure that runs the configured command and returns
+/// `(stdout, ttl)`. Cloning `config` once per call keeps the closure
+/// `Send + Sync` without any locking.
+fn build_fetcher(config: ExecResolvedConfig) -> FetcherFn {
+    Box::new(move || -> FetcherFuture {
+        let cfg = config.clone();
+        Box::pin(async move {
+            let value = run_command(&cfg).await?;
+            Ok((value, cfg.ttl))
+        })
+    })
 }
 
-struct CachedToken {
-    value: Zeroizing<String>,
-    expires_at: Instant,
+fn label_for(config: &ExecResolvedConfig) -> String {
+    format!(
+        "exec:{}",
+        config
+            .command
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<unknown>")
+    )
 }
 
 impl ExecTokenCache {
-    /// Build a new cache by running the command synchronously and caching the
-    /// result. Bridges into async via `tokio::task::block_in_place` so this
-    /// can be called from within `CredentialStore::load`.
+    /// Build a new cache by running the command and caching the result.
+    /// Bridges into async via `tokio::task::block_in_place` so this can be
+    /// called from within the synchronous `CredentialStore::load`.
     ///
     /// # Errors
     ///
     /// Returns [`ProxyError::ExecFetch`] if the initial fetch fails (timeout,
-    /// non-zero exit, empty stdout). The caller is expected to skip the route
-    /// on failure so the proxy can still start for other routes.
+    /// non-zero exit, empty stdout, control characters, oversized stdout).
+    /// The caller is expected to skip the route on failure so the proxy can
+    /// still start for other routes.
     pub fn new(config: ExecResolvedConfig) -> Result<Self> {
-        let value = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(run_command(&config))
+        let label = label_for(&config);
+        let fetcher = build_fetcher(config);
+        let inner = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(TtlCache::new(
+                label,
+                FORCE_REFRESH_COOLDOWN,
+                fetcher,
+            ))
         })?;
-
-        let expires_at = Instant::now() + config.ttl;
-        debug!(
-            "Exec credential acquired from {}, ttl {}s",
-            config
-                .command
-                .first()
-                .map(String::as_str)
-                .unwrap_or("<unknown>"),
-            config.ttl.as_secs()
-        );
-
-        Ok(Self {
-            token: Arc::new(RwLock::new(CachedToken { value, expires_at })),
-            config,
-        })
+        Ok(Self { inner })
     }
 
     /// Construct a cache with a pre-populated value. Used by tests that do
     /// not want to run an external command.
     #[cfg(test)]
     pub(crate) fn new_from_parts(config: ExecResolvedConfig, value: &str, ttl: Duration) -> Self {
-        Self {
-            token: Arc::new(RwLock::new(CachedToken {
-                value: Zeroizing::new(value.to_string()),
-                expires_at: Instant::now() + ttl,
-            })),
-            config,
-        }
+        let label = label_for(&config);
+        let fetcher = build_fetcher(config);
+        let inner = TtlCache::new_from_parts(label, FORCE_REFRESH_COOLDOWN, fetcher, value, ttl);
+        Self { inner }
     }
 
-    /// Force a refresh, ignoring the cached value's remaining TTL. Used by
-    /// the reverse-proxy 401-retry path: an upstream that rejects a token we
-    /// believe is still valid may have rotated or revoked the credential
-    /// before our configured TTL elapsed.
-    ///
-    /// Like [`get_or_refresh`], on refresh failure the stale value is
-    /// returned with a warning so a transient issuer outage does not turn a
-    /// recovery attempt into a hard failure. The caller can decide whether
-    /// to forward the (probably still-401) upstream response.
-    ///
-    /// [`get_or_refresh`]: Self::get_or_refresh
-    pub async fn force_refresh(&self) -> Zeroizing<String> {
-        let mut guard = self.token.write().await;
-
-        match run_command(&self.config).await {
-            Ok(new_value) => {
-                debug!(
-                    "Exec credential force-refreshed, ttl {}s",
-                    self.config.ttl.as_secs()
-                );
-                guard.value = new_value;
-                guard.expires_at = Instant::now() + self.config.ttl;
-                guard.value.clone()
-            }
-            Err(e) => {
-                warn!(
-                    "Exec credential force-refresh failed, returning stale value: {}",
-                    e
-                );
-                guard.value.clone()
-            }
-        }
-    }
-
-    /// Return a valid cached value, refreshing if it is within
-    /// `EXPIRY_BUFFER_SECS` of expiry. On refresh failure, returns the stale
-    /// value with a warning rather than failing the request.
+    /// Return the cached value, refreshing if within the expiry buffer. See
+    /// [`TtlCache::get_or_refresh`].
     pub async fn get_or_refresh(&self) -> Zeroizing<String> {
-        // Fast path — value still fresh.
-        {
-            let guard = self.token.read().await;
-            if Instant::now() + Duration::from_secs(EXPIRY_BUFFER_SECS) < guard.expires_at {
-                return guard.value.clone();
-            }
-        }
+        self.inner.get_or_refresh().await
+    }
 
-        // Slow path — refresh under the write lock.
-        let mut guard = self.token.write().await;
-
-        // Double-check after acquiring the write lock — another task may have
-        // refreshed while we were queued.
-        if Instant::now() + Duration::from_secs(EXPIRY_BUFFER_SECS) < guard.expires_at {
-            return guard.value.clone();
-        }
-
-        match run_command(&self.config).await {
-            Ok(new_value) => {
-                debug!(
-                    "Exec credential refreshed, ttl {}s",
-                    self.config.ttl.as_secs()
-                );
-                guard.value = new_value;
-                guard.expires_at = Instant::now() + self.config.ttl;
-                guard.value.clone()
-            }
-            Err(e) => {
-                warn!(
-                    "Exec credential refresh failed, returning stale value: {}",
-                    e
-                );
-                guard.value.clone()
-            }
-        }
+    /// Force a refresh, ignoring TTL. Subject to the configured cooldown —
+    /// see [`TtlCache::force_refresh`].
+    pub async fn force_refresh(&self) -> Zeroizing<String> {
+        self.inner.force_refresh().await
     }
 }
 
@@ -337,6 +277,16 @@ async fn run_command(config: &ExecResolvedConfig) -> Result<Zeroizing<String>> {
         )));
     }
 
+    // Reject any embedded CR/LF/NUL — these would let a helper splice
+    // arbitrary headers into the upstream request when the value is spliced
+    // into `credential_format` and written to the wire by build_exec_request.
+    if value.contains('\r') || value.contains('\n') || value.contains('\0') {
+        return Err(ProxyError::ExecFetch(format!(
+            "command stdout contains a control character (CR/LF/NUL): {}",
+            bin
+        )));
+    }
+
     Ok(value)
 }
 
@@ -411,6 +361,55 @@ mod tests {
                 .unwrap();
         let value = run_command(&resolved).await.unwrap();
         assert_eq!(value.as_str(), "fresh");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_command_accepts_valid_token() {
+        let resolved = ExecResolvedConfig::from_config(&cfg(
+            vec!["/bin/echo", "-n", "valid-token"],
+            60,
+            Some(5),
+        ))
+        .unwrap();
+        let value = run_command(&resolved).await.unwrap();
+        assert_eq!(value.as_str(), "valid-token");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_command_rejects_embedded_crlf() {
+        // printf so we can splice raw \r\n bytes into stdout. The trailing
+        // newline strip removes only the final \n, leaving the embedded CR/LF
+        // pair to be caught by the control-character check.
+        let resolved = ExecResolvedConfig::from_config(&cfg(
+            vec!["/usr/bin/printf", "tok\r\nX-Injected: bad\n"],
+            60,
+            Some(5),
+        ))
+        .unwrap();
+        let err = run_command(&resolved).await.unwrap_err();
+        match err {
+            ProxyError::ExecFetch(msg) => {
+                assert!(msg.contains("control character"), "got: {}", msg)
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_command_rejects_embedded_nul() {
+        let resolved = ExecResolvedConfig::from_config(&cfg(
+            vec!["/usr/bin/printf", "tok\\0bad"],
+            60,
+            Some(5),
+        ))
+        .unwrap();
+        let err = run_command(&resolved).await.unwrap_err();
+        match err {
+            ProxyError::ExecFetch(msg) => {
+                assert!(msg.contains("control character"), "got: {}", msg)
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

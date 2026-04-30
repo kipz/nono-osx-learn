@@ -35,6 +35,16 @@ const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 /// Timeout for upstream TCP connect.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-read timeout while draining a failed upstream attempt before retry.
+/// Bounds each individual `read` so a slow-loris upstream cannot stall the
+/// retry path.
+const DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Total time budget for [`ExecAttempt::drain`]. Even if individual reads
+/// keep returning bytes, we'll close the connection after this long — drain
+/// is best-effort, and the retry is more important than draining cleanly.
+const DRAIN_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Handle a non-CONNECT HTTP request (reverse proxy mode).
 ///
 /// Reads the full HTTP request from the client, matches path prefix to
@@ -602,7 +612,7 @@ async fn handle_exec_credential(
     // First attempt: use whatever the cache hands back (either still-fresh
     // or refreshed because we crossed the TTL buffer).
     let credential = exec_route.cache.get_or_refresh().await;
-    let request = build_exec_request(
+    let request = match build_exec_request(
         &credential,
         &exec_route.header_name,
         &exec_route.credential_format,
@@ -612,7 +622,21 @@ async fn handle_exec_credential(
         &upstream_authority,
         &filtered_headers,
         &body,
-    );
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("{}", e);
+            send_error(stream, 502, "Bad Gateway").await?;
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::Reverse,
+                service,
+                0,
+                &e.to_string(),
+            );
+            return Ok(());
+        }
+    };
 
     let attempt_outcome = run_exec_attempt(
         upstream_scheme,
@@ -663,7 +687,7 @@ async fn handle_exec_credential(
         drop(attempt);
 
         let new_credential = exec_route.cache.force_refresh().await;
-        let retry_request = build_exec_request(
+        let retry_request = match build_exec_request(
             &new_credential,
             &exec_route.header_name,
             &exec_route.credential_format,
@@ -673,7 +697,21 @@ async fn handle_exec_credential(
             &upstream_authority,
             &filtered_headers,
             &body,
-        );
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("{}", e);
+                send_error(stream, 502, "Bad Gateway").await?;
+                audit::log_denied(
+                    ctx.audit_log,
+                    audit::ProxyMode::Reverse,
+                    service,
+                    0,
+                    &e.to_string(),
+                );
+                return Ok(());
+            }
+        };
 
         match run_exec_attempt(
             upstream_scheme,
@@ -712,9 +750,22 @@ async fn handle_exec_credential(
     Ok(())
 }
 
+/// True iff `s` contains a CR, LF, or NUL byte. Used to ensure no
+/// caller-supplied string can splice arbitrary headers into a request line.
+fn contains_request_control_char(s: &str) -> bool {
+    s.contains('\r') || s.contains('\n') || s.contains('\0')
+}
+
 /// Build a fully-formed HTTP request line + headers for an exec-credential
 /// route, with the configured `inject_header` set to `credential_format`
 /// applied to `credential`.
+///
+/// Returns `Err(ProxyError::HttpParse)` if any of the inputs that get
+/// spliced into the request line/headers contain CR/LF/NUL. The CLI
+/// profile validator already rejects these at config time; this is a
+/// defence-in-depth check for callers that bypass the validator (e.g. a
+/// direct library consumer of `nono-proxy` constructing `RouteConfig` by
+/// hand) — the credential itself is already screened by [`crate::exec`].
 #[allow(clippy::too_many_arguments)]
 fn build_exec_request(
     credential: &str,
@@ -726,7 +777,23 @@ fn build_exec_request(
     upstream_authority: &str,
     filtered_headers: &[(String, String)],
     body: &[u8],
-) -> Zeroizing<String> {
+) -> Result<Zeroizing<String>> {
+    for (label, value) in [
+        ("inject_header", header_name),
+        ("credential_format", credential_format),
+        ("method", method),
+        ("path", upstream_path_full),
+        ("version", version),
+        ("host", upstream_authority),
+    ] {
+        if contains_request_control_char(value) {
+            return Err(ProxyError::HttpParse(format!(
+                "refusing to build upstream request: {} contains CR/LF/NUL",
+                label
+            )));
+        }
+    }
+
     let mut request = Zeroizing::new(format!(
         "{} {} {}\r\nHost: {}\r\n",
         method, upstream_path_full, version, upstream_authority
@@ -752,7 +819,7 @@ fn build_exec_request(
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     request.push_str("\r\n");
-    request
+    Ok(request)
 }
 
 /// Connection + first response chunk + status, captured so the caller can
@@ -785,21 +852,35 @@ impl ExecAttempt {
     /// failed attempt that we plan to retry — we don't want to forward the
     /// 401 body to the client, but we do want the upstream to see a clean
     /// close before we open a fresh connection.
+    ///
+    /// Each read is bounded by [`DRAIN_READ_TIMEOUT`] so a slow-loris or
+    /// hung upstream cannot pin the retry indefinitely. The total drain is
+    /// also capped by [`DRAIN_TOTAL_TIMEOUT`] in case the upstream is
+    /// streaming garbage at sub-timeout intervals.
     async fn drain(&mut self) {
         let mut buf = [0u8; 8192];
+        let deadline = tokio::time::Instant::now() + DRAIN_TOTAL_TIMEOUT;
+        macro_rules! drain_loop {
+            ($stream:expr) => {
+                loop {
+                    if tokio::time::Instant::now() >= deadline {
+                        debug!("Drain hit total timeout; closing connection");
+                        break;
+                    }
+                    match tokio::time::timeout(DRAIN_READ_TIMEOUT, $stream.read(&mut buf)).await {
+                        Ok(Ok(0)) | Ok(Err(_)) => break,
+                        Ok(Ok(_)) => continue,
+                        Err(_) => {
+                            debug!("Drain read timed out; closing connection");
+                            break;
+                        }
+                    }
+                }
+            };
+        }
         match self {
-            Self::Tls { stream, .. } => loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => continue,
-                }
-            },
-            Self::Tcp { stream, .. } => loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => continue,
-                }
-            },
+            Self::Tls { stream, .. } => drain_loop!(stream),
+            Self::Tcp { stream, .. } => drain_loop!(stream),
         }
     }
 
@@ -1027,29 +1108,30 @@ fn validate_phantom_token(
     session_token: &Zeroizing<String>,
 ) -> Result<()> {
     let header_str = std::str::from_utf8(header_bytes).map_err(|_| ProxyError::InvalidToken)?;
-    let header_name_lower = header_name.to_lowercase();
 
     for line in header_str.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with(&format!("{}:", header_name_lower)) {
-            let value = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
-
-            // Handle "Bearer <token>" format (strip "Bearer " prefix if present)
-            // Use case-insensitive check, then slice original value by length
-            let value_lower = value.to_lowercase();
-            let token_value = if value_lower.starts_with("bearer ") {
-                // "bearer ".len() == 7
-                value[7..].trim()
-            } else {
-                value
-            };
-
-            if token::constant_time_eq(token_value.as_bytes(), session_token.as_bytes()) {
-                return Ok(());
-            }
-            warn!("Invalid phantom token in {} header", header_name);
-            return Err(ProxyError::InvalidToken);
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case(header_name) {
+            continue;
         }
+
+        // Strip an optional case-insensitive "Bearer " prefix per RFC 6750.
+        // Use byte-bounded `get` so a value shorter than the prefix can never
+        // panic, and `eq_ignore_ascii_case` so we don't allocate a lowercased
+        // copy of every header value.
+        let value = value.trim();
+        let token_value = match value.get(..7) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("Bearer ") => value[7..].trim(),
+            _ => value,
+        };
+
+        if token::constant_time_eq(token_value.as_bytes(), session_token.as_bytes()) {
+            return Ok(());
+        }
+        warn!("Invalid phantom token in {} header", header_name);
+        return Err(ProxyError::InvalidToken);
     }
 
     warn!(
@@ -1838,6 +1920,83 @@ mod tests {
         let token = Zeroizing::new("secret123".to_string());
         let header = b"AUTHORIZATION: Bearer secret123\r\n\r\n";
         assert!(validate_phantom_token(header, "Authorization", &token).is_ok());
+    }
+
+    #[test]
+    fn test_validate_phantom_token_case_insensitive_bearer_prefix() {
+        // The "Bearer" scheme name is case-insensitive per RFC 6750 §2.1; we
+        // must accept BEARER, bearer, BeArEr, etc.
+        let token = Zeroizing::new("secret123".to_string());
+        for variant in ["Bearer", "BEARER", "bearer", "BeArEr"] {
+            let header_str = format!("Authorization: {} secret123\r\n\r\n", variant);
+            assert!(
+                validate_phantom_token(header_str.as_bytes(), "Authorization", &token).is_ok(),
+                "variant {} should be accepted",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_phantom_token_short_value_no_panic() {
+        // A header with a value shorter than "Bearer " (7 bytes) must not
+        // panic when we try to test the prefix.
+        let token = Zeroizing::new("longer-than-six-chars".to_string());
+        let header = b"Authorization: short\r\n\r\n";
+        assert!(validate_phantom_token(header, "Authorization", &token).is_err());
+    }
+
+    #[test]
+    fn test_build_exec_request_rejects_crlf_in_inject_header() {
+        let err = build_exec_request(
+            "tok",
+            "Authorization\r\nX-Smuggle: bad",
+            "Bearer {}",
+            "GET",
+            "/v1/messages",
+            "HTTP/1.1",
+            "api.example.com",
+            &[],
+            b"",
+        )
+        .expect_err("CRLF in header_name must be rejected");
+        assert!(matches!(err, ProxyError::HttpParse(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_build_exec_request_rejects_crlf_in_credential_format() {
+        let err = build_exec_request(
+            "tok",
+            "Authorization",
+            "Bearer {}\r\nX-Smuggle: bad",
+            "GET",
+            "/v1/messages",
+            "HTTP/1.1",
+            "api.example.com",
+            &[],
+            b"",
+        )
+        .expect_err("CRLF in credential_format must be rejected");
+        assert!(matches!(err, ProxyError::HttpParse(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_build_exec_request_accepts_clean_inputs() {
+        let request = build_exec_request(
+            "tok",
+            "Authorization",
+            "Bearer {}",
+            "GET",
+            "/v1/messages",
+            "HTTP/1.1",
+            "api.example.com",
+            &[],
+            b"",
+        )
+        .expect("clean inputs should build successfully");
+        let s = request.as_str();
+        assert!(s.contains("Authorization: Bearer tok\r\n"));
+        assert!(s.starts_with("GET /v1/messages HTTP/1.1\r\n"));
     }
 
     #[test]

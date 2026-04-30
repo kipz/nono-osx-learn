@@ -408,9 +408,13 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     // Validate upstream URL (HTTPS required, HTTP only for loopback)
     validate_upstream_url(&cred.upstream, name)?;
 
-    // Mode-specific validation (only applies to credential_key-based routes,
-    // not OAuth2 routes which always inject as Bearer header)
-    if cred.credential_key.is_some() {
+    // Mode-specific validation. OAuth2 routes hardcode the Authorization:
+    // Bearer header in handle_oauth2_credential, so they don't need
+    // header-mode validation. Both credential_key and exec routes go through
+    // the configured inject_header / credential_format and must be
+    // CRLF-clean. Exec routes are constrained to Header mode above; the
+    // other arms are unreachable for exec but kept for structural parity.
+    if cred.credential_key.is_some() || cred.exec.is_some() {
         match cred.inject_mode {
             InjectMode::Header => {
                 validate_header_mode(name, cred)?;
@@ -4026,6 +4030,37 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_validate_exec_rejects_crlf_in_inject_header() {
+        let mut cred = exec_cred_builder();
+        cred.inject_header = "Authorization\r\nX-Smuggle: bad".to_string();
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec route with CRLF in inject_header should be rejected");
+        assert!(
+            err.to_string().contains("invalid characters"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_exec_rejects_crlf_in_credential_format() {
+        let mut cred = exec_cred_builder();
+        cred.credential_format = "Bearer {}\r\nX-Smuggle: bad".to_string();
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec route with CRLF in credential_format should be rejected");
+        assert!(err.to_string().contains("CRLF"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_accepts_valid_header_values() {
+        let mut cred = exec_cred_builder();
+        cred.inject_header = "X-Api-Key".to_string();
+        cred.credential_format = "Token {}".to_string();
+        validate_custom_credential("ai-gateway", &cred)
+            .expect("exec route with valid header values should be accepted");
     }
 
     #[test]

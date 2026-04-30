@@ -5,6 +5,10 @@
 //! proxy credential injection flow where the agent never sees the real
 //! client_id/client_secret.
 //!
+//! Cache lifecycle (TTL gating, write-lock dance, graceful degradation) is
+//! delegated to [`crate::cache::TtlCache`]; this module just supplies the
+//! fetcher closure that performs the OAuth2 token exchange.
+//!
 //! ## Design
 //!
 //! - **No background tasks**: Token validity is checked on each use via
@@ -16,19 +20,14 @@
 //! - **TLS via rustls**: Uses the same `webpki-roots` + `tokio-rustls` stack
 //!   as the rest of the proxy. No additional HTTP client dependencies.
 
+use crate::cache::{FetcherFn, FetcherFuture, TtlCache};
 use crate::error::{ProxyError, Result};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, warn};
 use zeroize::Zeroizing;
-
-/// Buffer subtracted from `expires_in` to refresh before the token actually
-/// expires. Avoids edge cases where a token expires between check and use.
-const EXPIRY_BUFFER_SECS: u64 = 30;
 
 /// Default TTL when the token endpoint omits `expires_in`.
 const DEFAULT_EXPIRES_IN_SECS: u64 = 3600;
@@ -65,33 +64,24 @@ impl std::fmt::Debug for OAuth2ExchangeConfig {
     }
 }
 
-/// Thread-safe OAuth2 access-token cache with on-demand refresh.
+/// OAuth2 access-token cache with on-demand refresh.
+///
+/// A thin wrapper over [`TtlCache`] that knows how to build the fetcher
+/// closure from an [`OAuth2ExchangeConfig`] + [`TlsConnector`].
+#[derive(Debug)]
 pub struct TokenCache {
-    token: Arc<RwLock<CachedToken>>,
-    config: OAuth2ExchangeConfig,
-    tls_connector: TlsConnector,
+    inner: TtlCache,
 }
 
-impl std::fmt::Debug for TokenCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TokenCache")
-            .field("config", &self.config)
-            .finish()
-    }
+/// Build the fetcher closure that performs an OAuth2 token exchange and
+/// returns `(access_token, expires_in)`.
+fn build_fetcher(config: Arc<OAuth2ExchangeConfig>, tls_connector: TlsConnector) -> FetcherFn {
+    Box::new(move || -> FetcherFuture {
+        let config = config.clone();
+        let tls = tls_connector.clone();
+        Box::pin(async move { exchange_token(&config, &tls).await })
+    })
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Internal types
-// ────────────────────────────────────────────────────────────────────────────
-
-struct CachedToken {
-    access_token: Zeroizing<String>,
-    expires_at: Instant,
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// TokenCache implementation
-// ────────────────────────────────────────────────────────────────────────────
 
 impl TokenCache {
     /// Create a new cache and perform the **initial** token exchange.
@@ -106,27 +96,18 @@ impl TokenCache {
     /// (DNS, TCP, TLS, non-200, malformed JSON). The calling code skips the
     /// route so the proxy can still start for other routes.
     pub fn new(config: OAuth2ExchangeConfig, tls_connector: TlsConnector) -> Result<Self> {
-        // Use block_in_place to avoid panicking when called from within an
-        // async context (e.g., server::start() which is async). This moves
-        // the blocking work off the async worker thread.
-        let (access_token, expires_in) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(exchange_token(&config, &tls_connector))
+        let label = format!("oauth2:{}", config.token_url);
+        let fetcher = build_fetcher(Arc::new(config), tls_connector);
+        // OAuth2 has no force_refresh callers today, so the cooldown is moot;
+        // ZERO keeps semantics unchanged if one is added later.
+        let inner = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(TtlCache::new(
+                label,
+                Duration::ZERO,
+                fetcher,
+            ))
         })?;
-
-        let expires_at = Instant::now() + expires_in;
-        debug!(
-            "OAuth2 initial token acquired, expires in {}s",
-            expires_in.as_secs()
-        );
-
-        Ok(Self {
-            token: Arc::new(RwLock::new(CachedToken {
-                access_token,
-                expires_at,
-            })),
-            config,
-            tls_connector,
-        })
+        Ok(Self { inner })
     }
 
     /// Create a `TokenCache` with a pre-populated token (for testing).
@@ -140,14 +121,10 @@ impl TokenCache {
         token: &str,
         ttl: Duration,
     ) -> Self {
-        Self {
-            token: Arc::new(RwLock::new(CachedToken {
-                access_token: Zeroizing::new(token.to_string()),
-                expires_at: Instant::now() + ttl,
-            })),
-            config,
-            tls_connector,
-        }
+        let label = format!("oauth2:{}", config.token_url);
+        let fetcher = build_fetcher(Arc::new(config), tls_connector);
+        let inner = TtlCache::new_from_parts(label, Duration::ZERO, fetcher, token, ttl);
+        Self { inner }
     }
 
     /// Return a valid access token, refreshing if needed.
@@ -159,37 +136,7 @@ impl TokenCache {
     /// token with a warning — better to try a possibly-expired token than to
     /// fail the request outright.
     pub async fn get_or_refresh(&self) -> Zeroizing<String> {
-        // Fast path — token still valid.
-        {
-            let guard = self.token.read().await;
-            if Instant::now() + Duration::from_secs(EXPIRY_BUFFER_SECS) < guard.expires_at {
-                return guard.access_token.clone();
-            }
-        }
-
-        // Slow path — need to refresh.
-        let mut guard = self.token.write().await;
-
-        // Double-check after acquiring write lock (another task may have refreshed).
-        if Instant::now() + Duration::from_secs(EXPIRY_BUFFER_SECS) < guard.expires_at {
-            return guard.access_token.clone();
-        }
-
-        match exchange_token(&self.config, &self.tls_connector).await {
-            Ok((new_token, expires_in)) => {
-                debug!(
-                    "OAuth2 token refreshed, expires in {}s",
-                    expires_in.as_secs()
-                );
-                guard.access_token = new_token;
-                guard.expires_at = Instant::now() + expires_in;
-                guard.access_token.clone()
-            }
-            Err(e) => {
-                warn!("OAuth2 token refresh failed, returning stale token: {}", e);
-                guard.access_token.clone()
-            }
-        }
+        self.inner.get_or_refresh().await
     }
 }
 
@@ -514,16 +461,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_cache_detects_expiry() {
-        // Token that "expired" 10 seconds ago. Because exchange_token will
-        // fail (no real server), the stale token is returned.
-        let cache = make_test_cache("stale_token", Duration::from_secs(0));
-        // Manually set expires_at to the past.
-        {
-            let mut guard = cache.token.write().await;
-            guard.expires_at = Instant::now() - Duration::from_secs(10);
-        }
+        // Token whose TTL is already zero. The fetcher (pointing at a
+        // non-routable address) will fail, so graceful degradation should
+        // hand back the stale token.
+        let cache = make_test_cache("stale_token", Duration::ZERO);
+        // Sleep briefly so the pre-populated TTL is unambiguously past.
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let token = cache.get_or_refresh().await;
-        // Should still get the stale token (graceful degradation).
         assert_eq!(token.as_str(), "stale_token");
     }
 
