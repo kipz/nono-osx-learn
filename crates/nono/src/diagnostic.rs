@@ -15,6 +15,7 @@
 //! - **Library code**: No process management, no CLI assumptions
 
 use crate::capability::{AccessMode, CapabilitySet, CapabilitySource};
+use crate::path::try_canonicalize;
 use std::path::{Path, PathBuf};
 
 /// Why a path access was denied during a supervised session.
@@ -1175,7 +1176,7 @@ impl<'a> DiagnosticFormatter<'a> {
         &self,
         path: &Path,
     ) -> Option<&crate::capability::FsCapability> {
-        let canonical = canonicalize_query_path(path);
+        let canonical = try_canonicalize(path);
         let mut best_covering: Option<&crate::capability::FsCapability> = None;
         let mut best_covering_score = 0usize;
 
@@ -1614,25 +1615,6 @@ fn merge_access_modes(existing: AccessMode, new: AccessMode) -> AccessMode {
     }
 }
 
-fn canonicalize_query_path(path: &Path) -> PathBuf {
-    if path.exists() {
-        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-    } else if let Some(parent) = path.parent() {
-        if parent.exists() {
-            match parent.canonicalize() {
-                Ok(parent_canonical) => match path.file_name() {
-                    Some(name) => parent_canonical.join(name),
-                    None => path.to_path_buf(),
-                },
-                Err(_) => path.to_path_buf(),
-            }
-        } else {
-            path.to_path_buf()
-        }
-    } else {
-        path.to_path_buf()
-    }
-}
 
 fn suggested_flag_for_path(path: &Path, requested: AccessMode) -> String {
     let (flag, target) = suggested_flag_parts(path, requested);
