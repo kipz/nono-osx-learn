@@ -48,6 +48,36 @@ pub struct LoadedRoute {
     /// and rewrite plaintext HTTP. Used by the OAuth-capture path
     /// (Layer 1 of `2026-04-27-capture-anthropic-auth.md`).
     pub tls_intercept: bool,
+
+    /// OAuth-capture URL match patterns, present when this route's
+    /// `inject_mode` is [`crate::config::InjectMode::OauthCapture`].
+    /// `None` for any other inject mode. The TLS-intercept body
+    /// rewriter consults these to decide whether to buffer + rewrite
+    /// a response or pass it through.
+    pub oauth_capture: Option<OauthCaptureMatch>,
+}
+
+/// Per-route OAuth-capture configuration resolved at proxy startup.
+///
+/// Both fields are exact-match URL paths (case-sensitive, matched
+/// against the request's path component only — query string excluded).
+/// Identical strings are valid, since most OAuth providers serve both
+/// initial authorization-code exchange and refresh-token exchange at
+/// the same endpoint, distinguished only by `grant_type` in the
+/// request body.
+#[derive(Debug, Clone)]
+pub struct OauthCaptureMatch {
+    pub token_url_match: String,
+    pub refresh_url_match: String,
+}
+
+impl OauthCaptureMatch {
+    /// Returns true iff `path` matches either the token-issuance or
+    /// refresh URL exactly.
+    #[must_use]
+    pub fn matches(&self, path: &str) -> bool {
+        path == self.token_url_match || path == self.refresh_url_match
+    }
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -57,6 +87,8 @@ impl std::fmt::Debug for LoadedRoute {
             .field("upstream_host_port", &self.upstream_host_port)
             .field("endpoint_rules", &self.endpoint_rules)
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
+            .field("tls_intercept", &self.tls_intercept)
+            .field("oauth_capture", &self.oauth_capture)
             .finish()
     }
 }
@@ -112,6 +144,17 @@ impl RouteStore {
 
             let upstream_host_port = extract_host_port(&route.upstream);
 
+            let oauth_capture = match &route.inject_mode {
+                crate::config::InjectMode::OauthCapture {
+                    token_url_match,
+                    refresh_url_match,
+                } => Some(OauthCaptureMatch {
+                    token_url_match: token_url_match.clone(),
+                    refresh_url_match: refresh_url_match.clone(),
+                }),
+                _ => None,
+            };
+
             loaded.insert(
                 normalized_prefix,
                 LoadedRoute {
@@ -120,6 +163,7 @@ impl RouteStore {
                     endpoint_rules,
                     tls_connector,
                     tls_intercept: route.tls_intercept,
+                    oauth_capture,
                 },
             );
         }
@@ -180,6 +224,31 @@ impl RouteStore {
                     .upstream_host_port
                     .as_ref()
                     .is_some_and(|hp| *hp == normalised)
+        })
+    }
+
+    /// Look up the OAuth-capture match config for an intercepted host.
+    ///
+    /// Returns `Some` only when the matched route has both
+    /// `tls_intercept: true` *and* `inject_mode: OauthCapture`. The
+    /// body rewriter consults this to decide whether to buffer + parse
+    /// a response or stream it through unchanged.
+    #[must_use]
+    pub fn oauth_capture_for(&self, host_port: &str) -> Option<&OauthCaptureMatch> {
+        let normalised = host_port.to_lowercase();
+        self.routes.values().find_map(|route| {
+            if !route.tls_intercept {
+                return None;
+            }
+            if route
+                .upstream_host_port
+                .as_ref()
+                .is_some_and(|hp| *hp == normalised)
+            {
+                route.oauth_capture.as_ref()
+            } else {
+                None
+            }
         })
     }
 
@@ -638,6 +707,77 @@ mod tests {
     }
 
     #[test]
+    fn test_oauth_capture_match_resolved_for_intercept_route() {
+        let routes = vec![RouteConfig {
+            prefix: "claude-oauth".to_string(),
+            upstream: "https://claude.ai".to_string(),
+            credential_key: None,
+            inject_mode: crate::config::InjectMode::OauthCapture {
+                token_url_match: "/api/oauth/token".to_string(),
+                refresh_url_match: "/api/oauth/refresh".to_string(),
+            },
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            tls_intercept: true,
+        }];
+
+        let store = RouteStore::load(&routes).unwrap();
+        let oauth = store
+            .oauth_capture_for("claude.ai:443")
+            .expect("intercept route with OauthCapture mode should resolve");
+        assert_eq!(oauth.token_url_match, "/api/oauth/token");
+        assert_eq!(oauth.refresh_url_match, "/api/oauth/refresh");
+
+        // matches() honours both URL fields and rejects everything else.
+        assert!(oauth.matches("/api/oauth/token"));
+        assert!(oauth.matches("/api/oauth/refresh"));
+        assert!(!oauth.matches("/api/oauth/authorize"));
+        assert!(!oauth.matches("/api/oauth/token/extra"));
+    }
+
+    #[test]
+    fn test_oauth_capture_for_returns_none_when_intercept_disabled() {
+        // Even with OauthCapture inject_mode, a route without
+        // tls_intercept does not enter the capture path — the rewriter
+        // is only safe to run on intercepted (TLS-terminated) traffic.
+        let routes = vec![RouteConfig {
+            prefix: "claude-oauth".to_string(),
+            upstream: "https://claude.ai".to_string(),
+            credential_key: None,
+            inject_mode: crate::config::InjectMode::OauthCapture {
+                token_url_match: "/api/oauth/token".to_string(),
+                refresh_url_match: "/api/oauth/token".to_string(),
+            },
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            tls_intercept: false,
+        }];
+
+        let store = RouteStore::load(&routes).unwrap();
+        assert!(store.oauth_capture_for("claude.ai:443").is_none());
+    }
+
+    #[test]
     fn test_extract_host_port_https() {
         assert_eq!(
             extract_host_port("https://api.openai.com"),
@@ -677,6 +817,7 @@ mod tests {
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             tls_connector: None,
             tls_intercept: false,
+            oauth_capture: None,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));

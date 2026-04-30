@@ -17,6 +17,7 @@
 //! when a target host matches a `tls_intercept: true` route.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -25,6 +26,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
@@ -35,10 +42,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 use crate::audit;
+use crate::broker::TokenResolver;
 use crate::connect;
 use crate::error::{ProxyError, Result};
+use crate::route::OauthCaptureMatch;
 
 /// CA validity window. Far longer than any reasonable session, and a
 /// fresh CA is regenerated on every proxy startup.
@@ -215,42 +225,53 @@ impl InterceptCa {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key_der));
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = ServerConfig::builder_with_provider(provider)
+        let mut config = ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| ProxyError::Config(format!("rustls protocol versions: {e}")))?
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)
             .map_err(|e| ProxyError::Config(format!("rustls server cert: {e}")))?;
 
+        // Advertise only HTTP/1.1 via ALPN. Our intercept dispatcher
+        // uses `hyper::server::conn::http1` and would refuse an HTTP/2
+        // upgrade; without setting ALPN the client could try to
+        // negotiate h2 and stall.
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
         Ok(config)
     }
 }
 
+/// Type-erased response body used by the per-request forwarder.
+type RewrittenBody = BoxBody<Bytes, hyper::Error>;
+
 /// Handle a CONNECT request whose target host is configured for TLS
 /// interception.
 ///
-/// The handshake-shaped sequence is:
-///
 /// 1. Open a TCP connection to one of the pre-resolved upstream IPs
-///    (no DNS rebinding — addresses are validated by the caller). If
-///    this fails the client never sees a 200, matching `connect.rs`'s
-///    transparent-tunnel behaviour.
+///    as a reachability probe. If it fails, the client never sees a
+///    200, matching `connect.rs`'s transparent-tunnel behaviour. The
+///    probed connection is then dropped — per-request upstream
+///    connections are opened fresh inside the service.
 /// 2. Reply `HTTP/1.1 200 Connection Established` so the client begins
 ///    its TLS handshake against us.
 /// 3. Look up (or mint and cache) a leaf certificate for `host` from
-///    `ca` and use it to TLS-accept the client.
-/// 4. TLS-connect to the upstream IP using `upstream_tls`, with the
-///    original hostname as SNI / cert-validation target.
-/// 5. Bidirectionally relay plaintext HTTP between the two TLS streams.
-///
-/// This commit ships steps 1–5 only; the response-body capture/rewrite
-/// path that turns this into an actual OAuth-token vacuum is Layer 1.4
-/// and lands in a follow-up.
+///    `ca` and use it to TLS-accept the client. Our leaf advertises
+///    only `http/1.1` via ALPN.
+/// 4. Run a `hyper::server::conn::http1` connection on the decrypted
+///    client stream. For each request, [`forward_request`] opens a
+///    fresh upstream TLS connection, forwards the request, and either
+///    streams the response through unchanged or — when the route is
+///    [`InjectMode::OauthCapture`] and the request URL matches —
+///    buffers the JSON body, mints nonces via `token_resolver`, and
+///    returns a rewritten response.
 ///
 /// On client-side TLS-accept failure (e.g. the sandboxed agent does
 /// not trust our CA), we audit-log the rejection and return `Ok(())`
 /// — closing the connection is the right move and not a proxy fault.
-/// Upstream-side failures bubble up as `ProxyError::UpstreamConnect`.
+/// Upstream-reachability failures bubble up as
+/// `ProxyError::UpstreamConnect`.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_intercept(
     mut client_stream: TcpStream,
     host: &str,
@@ -258,25 +279,29 @@ pub async fn handle_intercept(
     resolved_addrs: &[SocketAddr],
     ca: Arc<InterceptCa>,
     upstream_tls: TlsConnector,
+    oauth_capture: Option<&OauthCaptureMatch>,
+    token_resolver: Option<Arc<dyn TokenResolver>>,
     audit_log: Option<&audit::SharedAuditLog>,
 ) -> Result<()> {
     debug!("intercept: dispatching CONNECT to {}:{}", host, port);
 
-    // 1. Open the upstream TCP first. If we cannot reach it, we don't
-    //    want to mislead the client with a 200.
-    let upstream_tcp = connect::connect_to_resolved(resolved_addrs, host).await?;
+    // 1. Reachability probe (TCP only — TLS handshake to the upstream
+    //    happens per-request inside the service). The probe is dropped
+    //    immediately; we just want a clean 502/connection-close path
+    //    when the upstream is unreachable, before we mislead the
+    //    client with a 200.
+    drop(connect::connect_to_resolved(resolved_addrs, host).await?);
 
     // 2. Tell the client to start its TLS handshake.
     static OK_LINE: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
     client_stream.write_all(OK_LINE).await?;
     client_stream.flush().await?;
 
-    // 3. Get a leaf cert / `ServerConfig` for this hostname.
+    // 3. Get a leaf cert / `ServerConfig` for this hostname and TLS-
+    //    accept the client.
     let server_config = ca.server_config_for(host)?;
-
-    // 4a. TLS-accept the client side using our session CA's leaf.
     let acceptor = TlsAcceptor::from(server_config);
-    let mut client_tls = match acceptor.accept(client_stream).await {
+    let client_tls = match acceptor.accept(client_stream).await {
         Ok(tls) => tls,
         Err(e) => {
             warn!(
@@ -294,20 +319,6 @@ pub async fn handle_intercept(
         }
     };
 
-    // 4b. TLS-connect to the upstream with its real cert chain.
-    let server_name =
-        ServerName::try_from(host.to_string()).map_err(|e| ProxyError::UpstreamConnect {
-            host: host.to_string(),
-            reason: format!("invalid SNI for upstream: {e}"),
-        })?;
-    let mut upstream_tls_stream = upstream_tls
-        .connect(server_name, upstream_tcp)
-        .await
-        .map_err(|e| ProxyError::UpstreamConnect {
-            host: host.to_string(),
-            reason: format!("upstream-side TLS connect failed: {e}"),
-        })?;
-
     audit::log_allowed(
         audit_log,
         audit::ProxyMode::Connect,
@@ -316,18 +327,239 @@ pub async fn handle_intercept(
         "INTERCEPT",
     );
 
-    // 5. Plaintext HTTP relay. Step 4 (next commit) wraps the response
-    //    side with a body rewriter; for now the path is byte-for-byte
-    //    transparent so handshake regressions surface before any
-    //    application-layer change.
-    let copy_result =
-        tokio::io::copy_bidirectional(&mut client_tls, &mut upstream_tls_stream).await;
-    debug!(
-        "intercept: tunnel closed for {}:{}: {:?}",
-        host, port, copy_result
-    );
+    // 4. Per-request forwarding via hyper. Captured values are cloned
+    //    on each invocation of the service (one HTTP request → one
+    //    fresh upstream TLS handshake; cheap for the OAuth flow which
+    //    is at most a handful of requests).
+    let host_owned = host.to_string();
+    let resolved_addrs_owned = resolved_addrs.to_vec();
+    let oauth_capture_owned = oauth_capture.cloned();
+
+    let service = service_fn(move |req: Request<Incoming>| {
+        let host = host_owned.clone();
+        let resolved_addrs = resolved_addrs_owned.clone();
+        let upstream_tls = upstream_tls.clone();
+        let oauth_capture = oauth_capture_owned.clone();
+        let token_resolver = token_resolver.clone();
+        async move {
+            forward_request(
+                req,
+                &host,
+                &resolved_addrs,
+                upstream_tls,
+                oauth_capture.as_ref(),
+                token_resolver,
+            )
+            .await
+        }
+    });
+
+    if let Err(e) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(client_tls), service)
+        .await
+    {
+        debug!("intercept: client connection ended: {e}");
+    }
 
     Ok(())
+}
+
+/// Forward a single intercepted request to the upstream and return a
+/// possibly-rewritten response. Always returns `Ok` at the service
+/// level — internal failures become 502 responses so the connection
+/// stays open for any subsequent requests.
+async fn forward_request(
+    req: Request<Incoming>,
+    host: &str,
+    resolved_addrs: &[SocketAddr],
+    upstream_tls: TlsConnector,
+    oauth_capture: Option<&OauthCaptureMatch>,
+    token_resolver: Option<Arc<dyn TokenResolver>>,
+) -> std::result::Result<Response<RewrittenBody>, Infallible> {
+    match try_forward(
+        req,
+        host,
+        resolved_addrs,
+        upstream_tls,
+        oauth_capture,
+        token_resolver,
+    )
+    .await
+    {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            warn!("intercept: forwarding failed for {host}: {e}");
+            Ok(make_502(format!("intercept upstream error: {e}")))
+        }
+    }
+}
+
+async fn try_forward(
+    mut req: Request<Incoming>,
+    host: &str,
+    resolved_addrs: &[SocketAddr],
+    upstream_tls: TlsConnector,
+    oauth_capture: Option<&OauthCaptureMatch>,
+    token_resolver: Option<Arc<dyn TokenResolver>>,
+) -> Result<Response<RewrittenBody>> {
+    let req_path = req.uri().path().to_string();
+
+    // Open a fresh upstream connection for this request.
+    let upstream_tcp = connect::connect_to_resolved(resolved_addrs, host).await?;
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|e| ProxyError::UpstreamConnect {
+            host: host.to_string(),
+            reason: format!("invalid SNI for upstream: {e}"),
+        })?;
+    let upstream_stream = upstream_tls
+        .connect(server_name, upstream_tcp)
+        .await
+        .map_err(|e| ProxyError::UpstreamConnect {
+            host: host.to_string(),
+            reason: format!("upstream-side TLS connect failed: {e}"),
+        })?;
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(upstream_stream))
+        .await
+        .map_err(|e| ProxyError::UpstreamConnect {
+            host: host.to_string(),
+            reason: format!("upstream-side HTTP/1 handshake failed: {e}"),
+        })?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!("intercept: upstream connection task ended: {e}");
+        }
+    });
+
+    // For routes that capture OAuth responses we must be able to read
+    // the response body; strip Accept-Encoding so the upstream returns
+    // identity-encoded JSON. Negligible bandwidth cost — OAuth token
+    // responses are a few hundred bytes — and avoids decompression
+    // edge cases in the rewriter.
+    let should_capture =
+        oauth_capture.is_some_and(|m| m.matches(&req_path)) && token_resolver.is_some();
+    if should_capture {
+        req.headers_mut().remove(hyper::header::ACCEPT_ENCODING);
+    }
+
+    // Box the request body to a uniform type before sending.
+    let (parts, body) = req.into_parts();
+    let req: Request<RewrittenBody> = Request::from_parts(parts, body.boxed());
+
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|e| ProxyError::UpstreamConnect {
+            host: host.to_string(),
+            reason: format!("upstream send_request: {e}"),
+        })?;
+
+    if should_capture {
+        let resolver = token_resolver.expect("checked by should_capture");
+        rewrite_oauth_response(resp, resolver.as_ref()).await
+    } else {
+        let (parts, body) = resp.into_parts();
+        Ok(Response::from_parts(parts, body.boxed()))
+    }
+}
+
+/// Buffer an upstream OAuth response, mint nonces for any `access_token`
+/// / `refresh_token` fields via `resolver`, and return a rewritten
+/// response with substituted nonces.
+///
+/// On any error short of resolver failure (which cannot happen — the
+/// trait API is infallible), the original response body is forwarded
+/// unchanged. This keeps `/login` working even when upstream returns
+/// something unexpected.
+async fn rewrite_oauth_response(
+    resp: Response<Incoming>,
+    resolver: &(dyn TokenResolver + 'static),
+) -> Result<Response<RewrittenBody>> {
+    let (mut parts, body) = resp.into_parts();
+
+    let body_bytes = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            warn!("oauth-capture: collecting response body failed: {e}; substituting empty");
+            // Body already partially consumed; cannot replay. Return
+            // an empty body with a clear status — conservative and
+            // visible.
+            return Ok(make_502(format!("oauth-capture body read failed: {e}")));
+        }
+    };
+
+    let mut value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("oauth-capture: response is not JSON ({e}); passing through unmodified");
+            return Ok(Response::from_parts(parts, full_body(body_bytes)));
+        }
+    };
+
+    let mut substituted: u32 = 0;
+    if let Some(obj) = value.as_object_mut() {
+        for key in &["access_token", "refresh_token"] {
+            if let Some(serde_json::Value::String(s)) = obj.get(*key) {
+                let real = Zeroizing::new(s.clone());
+                let nonce = resolver.issue(real);
+                obj.insert((*key).to_string(), serde_json::Value::String(nonce));
+                substituted = substituted.saturating_add(1);
+            }
+        }
+    }
+
+    if substituted == 0 {
+        debug!(
+            "oauth-capture: matched URL but no access_token/refresh_token in JSON; passing through"
+        );
+        return Ok(Response::from_parts(parts, full_body(body_bytes)));
+    }
+
+    let new_body_bytes = match serde_json::to_vec(&value) {
+        Ok(b) => Bytes::from(b),
+        Err(e) => {
+            warn!("oauth-capture: re-serializing JSON failed: {e}; passing through");
+            return Ok(Response::from_parts(parts, full_body(body_bytes)));
+        }
+    };
+
+    debug!(
+        "oauth-capture: substituted {} token field(s); response body re-serialized",
+        substituted
+    );
+
+    // The original body framing no longer applies — hyper will set a
+    // fresh Content-Length from our `Full<Bytes>`.
+    parts.headers.remove(hyper::header::CONTENT_LENGTH);
+    parts.headers.remove(hyper::header::TRANSFER_ENCODING);
+    // Defensive: even though we asked for identity, scrub
+    // Content-Encoding so a misconfigured upstream cannot trick the
+    // client into decompressing our plaintext bytes.
+    parts.headers.remove(hyper::header::CONTENT_ENCODING);
+
+    Ok(Response::from_parts(parts, full_body(new_body_bytes)))
+}
+
+/// Wrap concrete bytes in our type-erased response body.
+fn full_body(bytes: Bytes) -> RewrittenBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
+}
+
+/// Build a 502 with a plaintext reason. Falls back to an empty 502 if
+/// the builder somehow rejects the body type (it should not).
+fn make_502(reason: String) -> Response<RewrittenBody> {
+    Response::builder()
+        .status(hyper::StatusCode::BAD_GATEWAY)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full_body(Bytes::from(reason)))
+        .unwrap_or_else(|_| {
+            // SAFETY: this branch is unreachable for well-typed bodies.
+            // We construct an empty 502 directly to avoid relying on
+            // `unwrap` while still satisfying the return type.
+            let mut empty = Response::new(full_body(Bytes::new()));
+            *empty.status_mut() = hyper::StatusCode::BAD_GATEWAY;
+            empty
+        })
 }
 
 #[cfg(test)]
@@ -535,6 +767,8 @@ mod tests {
                     ca,
                     upstream_tls,
                     None,
+                    None,
+                    None,
                 )
                 .await
             }
@@ -596,6 +830,8 @@ mod tests {
                     &[unused_addr],
                     ca,
                     upstream_tls,
+                    None,
+                    None,
                     None,
                 )
                 .await

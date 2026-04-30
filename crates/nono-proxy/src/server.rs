@@ -207,9 +207,8 @@ struct ProxyState {
     /// Built once at startup from `ExternalProxyConfig.bypass_hosts`.
     bypass_matcher: external::BypassMatcher,
     /// Shared credential broker. `None` when OAuth capture is not in
-    /// use; the body-rewriter path (next commit) checks this before
-    /// activating the capture path.
-    #[allow(dead_code)]
+    /// use; the TLS-intercept dispatcher checks this before activating
+    /// the body-rewriter path.
     token_resolver: Option<Arc<dyn TokenResolver>>,
     /// Per-session TLS-interception CA. When `Some` *and* a CONNECT
     /// target matches a route with `tls_intercept: true`, the
@@ -529,6 +528,13 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 stream.write_all(response.as_bytes()).await?;
                                 return Ok(());
                             }
+                            // Look up the OAuth-capture match config
+                            // (if any) and clone the resolver handle so
+                            // they can be moved into the per-request
+                            // forwarder closure.
+                            let oauth_capture =
+                                state.route_store.oauth_capture_for(&host_port).cloned();
+                            let token_resolver = state.token_resolver.clone();
                             return intercept::handle_intercept(
                                 stream,
                                 host,
@@ -536,6 +542,8 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 &check.resolved_addrs,
                                 ca,
                                 state.tls_connector.clone(),
+                                oauth_capture.as_ref(),
+                                token_resolver,
                                 Some(&state.audit_log),
                             )
                             .await;
