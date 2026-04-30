@@ -388,6 +388,18 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
                 // No additional required fields for basic_auth mode
                 // Credential value is expected to be "username:password" format
             }
+            InjectMode::OauthCapture { .. } => {
+                // OauthCapture is a *response*-side mode used by the
+                // TLS-intercept body rewriter — it has no static
+                // credential to load. A custom credential entry
+                // declaring it is a misconfiguration.
+                return Err(NonoError::ProfileParse(format!(
+                    "custom credential '{}' uses inject_mode=oauth_capture; \
+                     OauthCapture is only valid on built-in tls_intercept routes, \
+                     not on credential_key-based custom credentials",
+                    name
+                )));
+            }
         }
     }
 
@@ -508,6 +520,13 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
                     param_name, name
                 )));
             }
+        }
+        InjectMode::OauthCapture { .. } => {
+            return Err(NonoError::ProfileParse(format!(
+                "proxy.inject_mode=oauth_capture is not valid on a custom credential '{}'; \
+                 OauthCapture is only valid on built-in tls_intercept routes",
+                name
+            )));
         }
     }
 

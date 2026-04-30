@@ -2486,6 +2486,17 @@ fn resolve_to_manifest(
             profile::InjectMode::UrlPath => manifest::InjectMode::UrlPath,
             profile::InjectMode::QueryParam => manifest::InjectMode::QueryParam,
             profile::InjectMode::BasicAuth => manifest::InjectMode::BasicAuth,
+            profile::InjectMode::OauthCapture { .. } => {
+                // OauthCapture is only valid on built-in tls_intercept
+                // routes (Layer 1 of the OAuth-capture design); custom
+                // credentials in user profiles cannot use it. The
+                // profile validator already rejects this combination,
+                // so reaching this branch indicates corrupted state.
+                return Err(NonoError::ConfigParse(format!(
+                    "custom credential '{}' has unsupported inject_mode=oauth_capture",
+                    name
+                )));
+            }
         };
 
         let endpoint_rules: Vec<manifest::EndpointRule> = cred

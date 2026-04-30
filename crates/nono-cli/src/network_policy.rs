@@ -256,6 +256,7 @@ pub fn resolve_credentials(
                     .map(|p| crate::profile::expand_str(p, workdir))
                     .transpose()?,
                 oauth2,
+                tls_intercept: false,
             });
         } else if let Some(cred) = policy.credentials.get(name) {
             // Validate env_var against dangerous variable blocklist
@@ -287,6 +288,7 @@ pub fn resolve_credentials(
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             });
         }
         // We already validated existence above, so this else branch won't be hit

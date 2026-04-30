@@ -1,10 +1,30 @@
 use crate::cli::SandboxArgs;
 use crate::launch_runtime::ProxyLaunchOptions;
+use crate::mediation::broker::TokenBroker;
 use crate::network_policy;
 use crate::sandbox_prepare::{validate_external_proxy_bypass, PreparedSandbox};
-use nono::{CapabilitySet, NonoError, Result};
+use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 use tracing::warn;
+
+/// Env var that opts in to the OAuth-capture path
+/// (Layer 1 of `2026-04-27-capture-anthropic-auth.md`).
+///
+/// When unset (the default), proxy startup behaves exactly as before:
+/// no `InterceptCa`, no token broker on the proxy side, no
+/// `NODE_EXTRA_CA_CERTS` injection. Set to `1`/`true`/`yes`/`on` to
+/// enable.
+const OAUTH_CAPTURE_ENV: &str = "NONO_OAUTH_CAPTURE";
+
+fn oauth_capture_enabled() -> bool {
+    matches!(
+        std::env::var(OAUTH_CAPTURE_ENV).ok().as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
 
 pub(crate) struct ActiveProxyRuntime {
     pub(crate) env_vars: Vec<(String, String)>,
@@ -195,13 +215,27 @@ pub(crate) fn start_proxy_runtime(
 
     let mut proxy_config = build_proxy_config_from_flags(proxy, workdir)?;
     proxy_config.direct_connect_ports = caps.tcp_connect_ports().to_vec();
+
+    // OAuth-capture wiring (Layer 1 of 2026-04-27-capture-anthropic-auth.md).
+    // Opt-in via NONO_OAUTH_CAPTURE so the live test surfaces a regression
+    // with a single env-var toggle, and the default path stays identical
+    // to today's behaviour.
+    let (proxy_runtime, oauth_ca_path) = if oauth_capture_enabled() {
+        let (rt, path) = build_oauth_capture_runtime(&mut proxy_config, caps)?;
+        (rt, Some(path))
+    } else {
+        (nono_proxy::ProxyRuntime::default(), None)
+    };
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy runtime: {}", e)))?;
     let handle = rt
-        .block_on(async { nono_proxy::server::start(proxy_config.clone()).await })
+        .block_on(async {
+            nono_proxy::server::start_with_runtime(proxy_config.clone(), proxy_runtime).await
+        })
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy: {}", e)))?;
 
     let port = handle.port;
@@ -227,10 +261,137 @@ pub(crate) fn start_proxy_runtime(
         env_vars.push((key, value));
     }
 
+    // Push the trust-store env vars only after the proxy is up so a
+    // failure in the OAuth-capture wiring (CA gen, file write) does not
+    // leave the child trusting a CA that no proxy is presenting.
+    if let Some(path) = oauth_ca_path {
+        let path_str = path.display().to_string();
+        env_vars.push(("NODE_EXTRA_CA_CERTS".to_string(), path_str.clone()));
+        // Defensive companion knob: under the Bun-compiled Claude Code
+        // 2.1.x binary, the app-level CA loader early-returns if both
+        // env vars are unset. Setting CLAUDE_CODE_CERT_STORE forces it
+        // to run regardless. See verification section in the design
+        // doc.
+        env_vars.push((
+            "CLAUDE_CODE_CERT_STORE".to_string(),
+            "bundled,system".to_string(),
+        ));
+        info!(
+            "OAuth capture: child will trust session CA via NODE_EXTRA_CA_CERTS={}",
+            path_str
+        );
+    }
+
     std::mem::forget(rt);
 
     Ok(ActiveProxyRuntime {
         env_vars,
         handle: Some(handle),
     })
+}
+
+/// Build the [`nono_proxy::ProxyRuntime`] for the OAuth-capture path:
+/// generate a session CA, materialize the public PEM under
+/// `$TMPDIR/nono-pid-<pid>/`, mount it as readable in the child's
+/// capability set, and inject the `claude-oauth` route into the proxy
+/// config so the dispatcher TLS-terminates `claude.ai:443`.
+///
+/// Returns the runtime plus the absolute path to the CA PEM so the
+/// caller can export it via `NODE_EXTRA_CA_CERTS`.
+fn build_oauth_capture_runtime(
+    proxy_config: &mut nono_proxy::config::ProxyConfig,
+    caps: &mut CapabilitySet,
+) -> Result<(nono_proxy::ProxyRuntime, PathBuf)> {
+    // Ensure the route is present even if no profile contributed it.
+    // Idempotent: skip if a route with the same prefix is already
+    // configured (operator may have wired this declaratively).
+    if !proxy_config
+        .routes
+        .iter()
+        .any(|r| r.prefix == "claude-oauth")
+    {
+        proxy_config.routes.push(make_oauth_capture_route());
+    }
+
+    let ca = Arc::new(
+        nono_proxy::intercept::InterceptCa::new()
+            .map_err(|e| NonoError::SandboxInit(format!("OAuth-capture CA generation: {e}")))?,
+    );
+
+    let ca_dir = ensure_session_ca_dir()?;
+    let ca_path = ca_dir.join("ca.pem");
+    ca.write_ca_pem(&ca_path).map_err(|e| {
+        NonoError::SandboxInit(format!("write CA PEM to {}: {e}", ca_path.display()))
+    })?;
+
+    caps.add_fs(FsCapability::new_file(&ca_path, AccessMode::Read)?);
+
+    // Session-scoped vault. Layer 2 of the design will make this the
+    // same instance the mediation server holds for command-mediation
+    // phantom tokens; for now the proxy owns its own.
+    let resolver: Arc<dyn nono_proxy::TokenResolver> = Arc::new(TokenBroker::new());
+
+    Ok((
+        nono_proxy::ProxyRuntime {
+            intercept_ca: Some(ca),
+            token_resolver: Some(resolver),
+        },
+        ca_path,
+    ))
+}
+
+/// Per-process directory that holds the materialized session CA PEM.
+/// Created with mode 0700 the first time this runs; the PEM file
+/// itself is mode 0644 (set by `InterceptCa::write_ca_pem`) — the cert
+/// is public information and the directory mode is what gates other
+/// local users from reading it.
+fn ensure_session_ca_dir() -> Result<PathBuf> {
+    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = std::path::Path::new(&tmpdir).join(format!("nono-pid-{}", std::process::id()));
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "failed to create OAuth-capture CA dir {}: {e}",
+                dir.display()
+            ))
+        })?;
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "failed to set OAuth-capture CA dir mode to 0700 {}: {e}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
+/// The `claude-oauth` route definition the dispatcher consults when a
+/// CONNECT for `claude.ai:443` arrives. Both URL match patterns point
+/// at the same endpoint because Anthropic's OAuth endpoint serves both
+/// initial-token-issuance and refresh exchanges from one path,
+/// distinguished only by `grant_type` in the body.
+fn make_oauth_capture_route() -> nono_proxy::config::RouteConfig {
+    use nono_proxy::config::{InjectMode, RouteConfig};
+    RouteConfig {
+        prefix: "claude-oauth".to_string(),
+        upstream: "https://claude.ai".to_string(),
+        credential_key: None,
+        inject_mode: InjectMode::OauthCapture {
+            token_url_match: "/api/oauth/token".to_string(),
+            refresh_url_match: "/api/oauth/token".to_string(),
+        },
+        inject_header: "Authorization".to_string(),
+        credential_format: "Bearer {}".to_string(),
+        path_pattern: None,
+        path_replacement: None,
+        query_param_name: None,
+        proxy: None,
+        env_var: None,
+        endpoint_rules: vec![],
+        tls_ca: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        oauth2: None,
+        tls_intercept: true,
+    }
 }
