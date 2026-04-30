@@ -1178,7 +1178,7 @@ pub fn find_denied_user_grants(
                 return false;
             }
             if cap.is_file {
-                cap.resolved == *deny_path
+                cap.resolved.starts_with(deny_path)
             } else {
                 deny_path.starts_with(&cap.resolved)
             }
