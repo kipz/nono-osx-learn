@@ -156,46 +156,130 @@ pub async fn apply(
         .env
         .get("NONO_SANDBOX_CONTEXT")
         .and_then(|nonce| broker.resolve(nonce));
-    match &caller_parent {
+    // Decide whether the caller-policy gate rejects this caller and, if so,
+    // whether to hard-deny or consult `approve_with_save_option`.
+    //
+    // The `parent_name` slot ("agent" or the resolved parent command name) is
+    // also the value persisted in the `(cmd, parent, argv)` allowlist key, so
+    // a future invocation with the same caller bypasses the gate.
+    enum CallerPolicyGate {
+        Pass,
+        HardDeny { stderr: String },
+        Consult { parent_name: String, reason: String },
+    }
+    let gate_decision = match &caller_parent {
         None => {
-            if !cmd.caller_policy.agent_allowed {
+            if cmd.caller_policy.agent_allowed {
+                CallerPolicyGate::Pass
+            } else if cmd.caller_policy.deny_agent_strict {
                 warn!(
-                    "mediation: rejecting '{}' from primary sandbox (agent_allowed=false)",
+                    "mediation: hard-denying '{}' from primary sandbox (agent_allowed=false, deny_agent_strict=true)",
                     request.command
                 );
-                return (
-                    ShimResponse {
-                        stdout: String::new(),
-                        stderr: format!(
-                            "nono-mediation: '{}' cannot be invoked from the primary sandbox\n",
-                            request.command
-                        ),
-                        exit_code: 126,
-                    },
-                    "denied",
+                CallerPolicyGate::HardDeny {
+                    stderr: format!(
+                        "nono-mediation: '{}' cannot be invoked from the primary sandbox\n",
+                        request.command
+                    ),
+                }
+            } else {
+                let reason = format!(
+                    "'{}' attempted by agent — caller-policy denies the agent",
+                    request.command
                 );
+                CallerPolicyGate::Consult {
+                    parent_name: "agent".to_string(),
+                    reason,
+                }
             }
         }
         Some(parent) => {
-            if let Some(allowed) = &cmd.caller_policy.allowed_parents {
-                let parent_name: &str = parent;
-                if !allowed.iter().any(|p| p == parent_name) {
-                    warn!(
-                        "mediation: rejecting '{}' invoked from '{}' (not in allowed_parents)",
-                        request.command, parent_name
+            let parent_name: &str = parent;
+            match &cmd.caller_policy.allowed_parents {
+                Some(allowed) if !allowed.iter().any(|p| p == parent_name) => {
+                    let reason = format!(
+                        "'{}' invoked from unexpected parent '{}' — only {:?} are allowed",
+                        request.command, parent_name, allowed
                     );
-                    return (
-                        ShimResponse {
-                            stdout: String::new(),
-                            stderr: format!(
-                                "nono-mediation: '{}' cannot be invoked from '{}'\n",
-                                request.command, parent_name
-                            ),
-                            exit_code: 126,
-                        },
-                        "denied",
-                    );
+                    CallerPolicyGate::Consult {
+                        parent_name: parent_name.to_string(),
+                        reason,
+                    }
                 }
+                _ => CallerPolicyGate::Pass,
+            }
+        }
+    };
+    match gate_decision {
+        CallerPolicyGate::Pass => {}
+        CallerPolicyGate::HardDeny { stderr } => {
+            drop(stdin_fd);
+            drop(stdout_fd);
+            drop(stderr_fd);
+            return (
+                ShimResponse {
+                    stdout: String::new(),
+                    stderr,
+                    exit_code: 126,
+                },
+                "denied",
+            );
+        }
+        CallerPolicyGate::Consult { parent_name, reason } => {
+            let key = super::allowlist::AllowlistKey {
+                kind: super::allowlist::AllowlistKind::CallerPolicy,
+                payload: serde_json::json!({
+                    "cmd": &cmd.name,
+                    "parent": &parent_name,
+                    "argv": &request.args,
+                }),
+            };
+            if !allowlist.is_approved(&key) {
+                let cmd_name = cmd.name.clone();
+                let cmd_args = request.args.clone();
+                let approval_clone = Arc::clone(&approval);
+                let verdict = tokio::task::spawn_blocking(move || {
+                    approval_clone.approve_with_save_option(&cmd_name, &cmd_args, &reason)
+                })
+                .await
+                .unwrap_or(super::approval::ApprovalVerdict::Deny);
+                match verdict {
+                    super::approval::ApprovalVerdict::AllowOnce => {}
+                    super::approval::ApprovalVerdict::AllowAlways => {
+                        if let Err(e) = allowlist.record(&key) {
+                            warn!(
+                                "mediation: allowlist record failed for caller-policy '{}': {}",
+                                request.command, e
+                            );
+                            // Treat as Allow-once on persistence failure.
+                        }
+                    }
+                    super::approval::ApprovalVerdict::Deny => {
+                        warn!(
+                            "mediation: caller-policy gate denied '{}' (parent={})",
+                            request.command, parent_name
+                        );
+                        drop(stdin_fd);
+                        drop(stdout_fd);
+                        drop(stderr_fd);
+                        return (
+                            ShimResponse {
+                                stdout: String::new(),
+                                stderr: format!(
+                                    "nono-mediation: '{}' caller-policy denied by user\n",
+                                    request.command
+                                ),
+                                exit_code: 126,
+                            },
+                            "denied",
+                        );
+                    }
+                }
+            } else {
+                debug!(
+                    "mediation: caller-policy gate allowlisted '{}' (parent={})",
+                    request.command, parent_name
+                );
             }
         }
     }
@@ -1562,8 +1646,9 @@ mod tests {
         assert_eq!(resp.stdout, "ok\n");
     }
 
-    /// `agent_allowed: false` rejects a call from the primary sandbox
-    /// (no NONO_SANDBOX_CONTEXT) with exit 126.
+    /// `agent_allowed: false` consults the approval gate; on `Deny` the call
+    /// is rejected with exit 126. `always_deny()` simulates the user choosing
+    /// "deny" at the prompt.
     #[tokio::test]
     async fn test_caller_policy_rejects_agent_when_agent_allowed_false() {
         let mut cmd = make_cmd(vec![]);
@@ -1581,12 +1666,12 @@ mod tests {
             ..Default::default()
         };
         let (resp, action) =
-            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_deny()).await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
         assert!(
-            resp.stderr.contains("primary sandbox"),
-            "stderr should mention primary sandbox: {}",
+            resp.stderr.contains("caller-policy denied"),
+            "stderr should mention caller-policy denial: {}",
             resp.stderr
         );
     }
@@ -1631,7 +1716,8 @@ mod tests {
         assert_eq!(resp.stdout, "from_git\n");
     }
 
-    /// A parent not in `allowed_parents` is rejected with exit 126.
+    /// A parent not in `allowed_parents` consults the gate; on `Deny` the
+    /// call is rejected with exit 126.
     #[tokio::test]
     async fn test_caller_policy_rejects_unlisted_parent() {
         let mut cmd = make_cmd(vec![]);
@@ -1656,19 +1742,20 @@ mod tests {
             pid: 0,
             cwd: None,
         };
-        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_deny()).await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
         assert!(
-            resp.stderr.contains("kubectl"),
-            "stderr should name the rejected parent: {}",
+            resp.stderr.contains("caller-policy denied"),
+            "stderr should mention caller-policy denial: {}",
             resp.stderr
         );
     }
 
     /// `allowed_parents: Some(vec![])` (explicit empty list) blocks every
     /// mediated parent. With `agent_allowed: true` the command is still
-    /// reachable from the agent — useful for "agent-only" tools.
+    /// reachable from the agent — useful for "agent-only" tools. The gate
+    /// still mediates: `always_deny()` here simulates the user denying.
     #[tokio::test]
     async fn test_caller_policy_empty_allowed_parents_blocks_all_parents() {
         let mut cmd = make_cmd(vec![]);
@@ -1692,7 +1779,7 @@ mod tests {
             pid: 0,
             cwd: None,
         };
-        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_deny()).await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
     }
@@ -2202,9 +2289,9 @@ mod tests {
     }
 
     /// Cross-plan smoke test: the caller-policy gate returns exit 126 for an
-    /// agent caller when `agent_allowed: false`, even though `apply` now
-    /// receives an additional `allowlist` parameter. This is the regression
-    /// test required by the cross-plan deliverable.
+    /// agent caller when `agent_allowed: false` and the user denies, even
+    /// though `apply` now receives an additional `allowlist` parameter and
+    /// the gate is consulted instead of hard-denied (plan 4.1 task 3.5).
     #[tokio::test]
     async fn test_apply_caller_policy_gate_unchanged_with_allowlist_param() {
         let mut cmd = make_cmd(vec![]);
@@ -2227,15 +2314,15 @@ mod tests {
             &[cmd],
             make_broker(),
             &ctx(),
-            always_allow(),
+            always_deny(),
             allowlist,
         )
         .await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
         assert!(
-            resp.stderr.contains("primary sandbox"),
-            "stderr should mention primary sandbox: {}",
+            resp.stderr.contains("caller-policy denied"),
+            "stderr should mention caller-policy denial: {}",
             resp.stderr
         );
     }
@@ -3918,5 +4005,377 @@ mod tests {
             "agent caller should use default sandbox, expected HTTPS_PROXY, got: {}",
             resp.stdout
         );
+    }
+
+    // --- caller-policy gate prompt-on-deny (plan 4.1 task 3.5) ---
+
+    use crate::mediation::allowlist::{AllowlistKey, AllowlistKind, AllowlistStore};
+    use crate::mediation::approval::ApprovalVerdict;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Test double for the caller-policy gate dispatch tests.
+    ///
+    /// Records a fixed `ApprovalVerdict` and counts how many times
+    /// `approve_with_save_option` is invoked. Cloneable via the inner `Arc`,
+    /// so a test can hand a clone to `apply` and still observe the call
+    /// counter afterwards.
+    #[derive(Clone)]
+    struct MockApprovalGate {
+        verdict: ApprovalVerdict,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockApprovalGate {
+        fn deny() -> Arc<Self> {
+            Arc::new(Self {
+                verdict: ApprovalVerdict::Deny,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+        fn allow_once() -> Arc<Self> {
+            Arc::new(Self {
+                verdict: ApprovalVerdict::AllowOnce,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+        fn allow_always() -> Arc<Self> {
+            Arc::new(Self {
+                verdict: ApprovalVerdict::AllowAlways,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ApprovalGate for MockApprovalGate {
+        fn approve(&self, _command: &str, _args: &[String]) -> bool {
+            // Fallback used by callers that haven't migrated to the 3-way
+            // form. The caller-policy gate uses approve_with_save_option, so
+            // this branch is unused in these tests.
+            !matches!(self.verdict, ApprovalVerdict::Deny)
+        }
+        fn approve_with_save_option(
+            &self,
+            _command: &str,
+            _args: &[String],
+            _reason: &str,
+        ) -> ApprovalVerdict {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.verdict
+        }
+    }
+
+    /// Thin newtype around a tempdir-backed `AllowlistStore` for tests that
+    /// need to share the allowlist across multiple `apply` invocations and
+    /// poke at its state directly.
+    #[derive(Clone)]
+    struct TestAllowlistStore {
+        inner: Arc<AllowlistStore>,
+    }
+
+    impl TestAllowlistStore {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("argv-allowlist.json");
+            std::mem::forget(dir);
+            Self {
+                inner: Arc::new(
+                    AllowlistStore::open_at(path).expect("open allowlist"),
+                ),
+            }
+        }
+        fn is_approved(&self, key: &AllowlistKey) -> bool {
+            self.inner.is_approved(key)
+        }
+    }
+
+    impl From<TestAllowlistStore> for Arc<AllowlistStore> {
+        fn from(t: TestAllowlistStore) -> Self {
+            t.inner
+        }
+    }
+
+    /// Default `CommandSandbox` for caller-policy gate tests. Inert (no
+    /// network, no fs allowances) — the gate decision is what's under test,
+    /// not sandbox enforcement.
+    fn default_sandbox() -> super::super::CommandSandbox {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+        CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec![],
+            },
+            fs_read: vec![],
+            fs_read_file: vec![],
+            fs_write: vec![],
+            fs_write_file: vec![],
+            allow_commands: vec![],
+            keychain_access: false,
+        }
+    }
+
+    /// (a) agent_allowed:false + deny_agent_strict:true → exit 126,
+    /// gate not consulted at all.
+    #[tokio::test]
+    async fn caller_policy_gate_strict_hard_denies_without_consulting_gate() {
+        let cmd = ResolvedCommand {
+            name: "ssh".to_string(),
+            real_path: PathBuf::from("/usr/bin/ssh"),
+            intercepts: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: Some(vec!["git".to_string()]),
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: true,
+            },
+        };
+        let req = ShimRequest {
+            command: "ssh".to_string(),
+            args: vec!["example.com".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+        };
+        let gate = MockApprovalGate::deny(); // would deny if asked, but must not be asked
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+        )
+        .await;
+        assert_eq!(resp.exit_code, 126);
+        assert_eq!(gate.call_count(), 0, "strict path must not consult gate");
+    }
+
+    /// (b) agent_allowed:false + deny_agent_strict:false + gate denies → exit 126.
+    #[tokio::test]
+    async fn caller_policy_gate_consults_gate_then_denies() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/git"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: Some(vec!["gh".to_string()]),
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        let req = ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(), // agent
+            pid: 0,
+        };
+        let gate = MockApprovalGate::deny();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+        )
+        .await;
+        assert_eq!(resp.exit_code, 126);
+        assert_eq!(gate.call_count(), 1);
+    }
+
+    /// (c) gate returns AllowOnce → request proceeds (passthrough), no
+    /// allowlist entry persisted.
+    #[tokio::test]
+    async fn caller_policy_gate_allow_once_proceeds_without_persisting() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: None,
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        let req = ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+        };
+        let gate = MockApprovalGate::allow_once();
+        let allowlist = TestAllowlistStore::new();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (_resp, action) = apply_capture_with_allowlist(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(action, "passthrough");
+        let key = AllowlistKey {
+            kind: AllowlistKind::CallerPolicy,
+            payload: serde_json::json!({
+                "cmd": "git", "parent": "agent", "argv": ["status"],
+            }),
+        };
+        assert!(!allowlist.is_approved(&key), "AllowOnce must not persist");
+    }
+
+    /// (d) gate returns AllowAlways → request proceeds AND key persists.
+    #[tokio::test]
+    async fn caller_policy_gate_allow_always_persists_key() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: None,
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        let req = ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+        };
+        let gate = MockApprovalGate::allow_always();
+        let allowlist = TestAllowlistStore::new();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (_resp, action) = apply_capture_with_allowlist(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(action, "passthrough");
+        let key = AllowlistKey {
+            kind: AllowlistKind::CallerPolicy,
+            payload: serde_json::json!({
+                "cmd": "git", "parent": "agent", "argv": ["status"],
+            }),
+        };
+        assert!(allowlist.is_approved(&key), "AllowAlways must persist key");
+    }
+
+    /// (e) Second invocation with the same key auto-bypasses the gate.
+    #[tokio::test]
+    async fn caller_policy_gate_skipped_when_allowlist_has_key() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: None,
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        let req = || ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+        };
+        let gate = MockApprovalGate::allow_always();
+        let allowlist = TestAllowlistStore::new();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        // First call records the key.
+        let _ = apply_capture_with_allowlist(
+            req(),
+            std::slice::from_ref(&cmd),
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(gate.call_count(), 1);
+        // Second call: the gate must NOT be consulted (allowlist hit).
+        let gate_for_apply2: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (_resp, action) = apply_capture_with_allowlist(
+            req(),
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply2,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(action, "passthrough");
+        assert_eq!(gate.call_count(), 1, "second call must not re-consult gate");
+    }
+
+    /// (f) allowed_parents mismatch: parent not in allowed_parents → gate
+    /// consulted; AllowAlways stores key under the actual parent name.
+    #[tokio::test]
+    async fn caller_policy_gate_handles_allowed_parents_mismatch() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: true,
+                allowed_parents: Some(vec!["gh".to_string()]),
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        // Caller is "kubectl" — not in allowed_parents.
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("kubectl".to_string()));
+        let mut env = std::collections::HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+        let req = ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env,
+            pid: 0,
+        };
+        let gate = MockApprovalGate::allow_always();
+        let allowlist = TestAllowlistStore::new();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let _ = apply_capture_with_allowlist(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &ctx(),
+            gate_for_apply,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(gate.call_count(), 1);
+        let key = AllowlistKey {
+            kind: AllowlistKind::CallerPolicy,
+            payload: serde_json::json!({
+                "cmd": "git", "parent": "kubectl", "argv": ["status"],
+            }),
+        };
+        assert!(allowlist.is_approved(&key));
     }
 }
