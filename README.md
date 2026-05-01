@@ -438,6 +438,28 @@ How this works:
 4. The wrapper sets `GH_TOKEN` and calls the real `gh` binary, which hits the GitHub API through the allowlisted proxy.
 5. At the top level, `ddtool auth github token` called directly by the agent still routes through the shim and returns a nonce — credentials are never exposed to the sandbox.
 
+#### Capability-bound nonces (`nonce_scope`)
+
+By default, a captured nonce promotes anywhere — any mediated command that receives it as an env var or argv gets the real credential. To bind a nonce to its intended consumer(s), declare a `nonce_scope` on the intercept rule:
+
+```json
+{
+  "args_prefix": ["auth", "github", "token"],
+  "action": { "type": "capture" },
+  "nonce_scope": { "consumers": ["gh", "git"] }
+}
+```
+
+When the agent later passes the nonce to a non-listed consumer (e.g. `GITHUB_TOKEN=<nonce> kubectl …`), the broker silently drops the env var: the consumer's process does not receive `GITHUB_TOKEN`. There is no agent-visible signal — the agent cannot distinguish "scope mismatch" from "unknown nonce" by probing.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `consumers` | array of string | required when `nonce_scope` is set | Mediated command names allowed to redeem the nonce. |
+
+`nonce_scope` is optional; rules without it produce unscoped nonces (existing behavior). It is only meaningful on `capture` actions; on other actions it is ignored.
+
+Scope mismatches are logged via `tracing::warn!` (target `nono::mediation::scope`) for operator observability. The agent process never sees these events.
+
 #### Example: Full Profile
 
 Combining all capabilities — credential capture, static responses, admin-gated approval, per-command sandboxing, and allowed commands:
