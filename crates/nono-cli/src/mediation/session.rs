@@ -583,6 +583,31 @@ fn resolve_command(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Validate parent_sandbox: keys must be in allowed_parents (if set),
+    // and the command must have a default `sandbox` to fall back to.
+    if !entry.caller_policy.parent_sandbox.is_empty() {
+        if entry.sandbox.is_none() {
+            return Err(NonoError::SandboxInit(format!(
+                "command '{}': caller_policy.parent_sandbox is set but the \
+                 command has no default sandbox to fall back to for parents \
+                 not listed in parent_sandbox",
+                entry.name
+            )));
+        }
+        if let Some(ref allowed) = entry.caller_policy.allowed_parents {
+            for k in entry.caller_policy.parent_sandbox.keys() {
+                if !allowed.iter().any(|p| p == k) {
+                    return Err(NonoError::SandboxInit(format!(
+                        "command '{}': caller_policy.parent_sandbox key '{}' \
+                         is not in caller_policy.allowed_parents — would be \
+                         unreachable",
+                        entry.name, k
+                    )));
+                }
+            }
+        }
+    }
+
     Ok(Some(ResolvedCommand {
         name: entry.name.clone(),
         real_path,
@@ -978,6 +1003,131 @@ mod tests {
             "error must name both fields, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn test_resolve_command_rejects_parent_sandbox_without_default_sandbox() {
+        // A command without a default `sandbox` cannot have parent_sandbox
+        // entries — there is no sensible fallback for parents not listed.
+        use crate::mediation::CommandEntry;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        // Real binary + shim so resolution gets past binary_path / symlink steps.
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let mut policy = CallerPolicy::default();
+        let mut ps = std::collections::HashMap::new();
+        ps.insert("gh".to_string(), CommandSandbox::default());
+        policy.parent_sandbox = ps;
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![],
+            sandbox: None, // <-- key constraint
+            caller_policy: policy,
+        };
+
+        let workdir = tmp.path();
+        let result = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir);
+        let err = match result {
+            Ok(_) => panic!("must reject parent_sandbox without default sandbox"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("parent_sandbox") && msg.contains("default sandbox"),
+            "error must explain the constraint, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_rejects_parent_sandbox_key_not_in_allowed_parents() {
+        // When `allowed_parents` is set, `parent_sandbox` keys must be a subset.
+        use crate::mediation::CommandEntry;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let mut ps = std::collections::HashMap::new();
+        ps.insert("gh".to_string(), CommandSandbox::default());
+        let policy = CallerPolicy {
+            agent_allowed: true,
+            allowed_parents: Some(vec!["git".to_string()]), // gh not allowed
+            parent_sandbox: ps,
+            deny_agent_strict: false,
+        };
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![],
+            sandbox: Some(CommandSandbox::default()),
+            caller_policy: policy,
+        };
+
+        let workdir = tmp.path();
+        let result = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir);
+        let err = match result {
+            Ok(_) => panic!("must reject parent_sandbox key not in allowed_parents"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("parent_sandbox") && msg.contains("gh") && msg.contains("allowed_parents"),
+            "error must name 'gh' and 'allowed_parents', got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_accepts_parent_sandbox_with_no_allowed_parents_constraint() {
+        // When `allowed_parents` is None (any parent), parent_sandbox keys
+        // are unrestricted (the keys define which parents get an override;
+        // any parent name is permissible).
+        use crate::mediation::CommandEntry;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let mut ps = std::collections::HashMap::new();
+        ps.insert("gh".to_string(), CommandSandbox::default());
+        let policy = CallerPolicy {
+            agent_allowed: true,
+            allowed_parents: None,
+            parent_sandbox: ps,
+            deny_agent_strict: false,
+        };
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![],
+            sandbox: Some(CommandSandbox::default()),
+            caller_policy: policy,
+        };
+
+        let workdir = tmp.path();
+        let resolved = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir)
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(resolved.caller_policy.parent_sandbox.len(), 1);
     }
 
     #[test]
