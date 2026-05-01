@@ -489,6 +489,74 @@ Combining all capabilities — credential capture, static responses, admin-gated
 }
 ```
 
+### `argv_shape` — strict flag-aware matcher
+
+Where `args_prefix` strips flags and matches a positional prefix only,
+`argv_shape` matches the *shape* of argv. Use it for rules that pivot on
+flag values — e.g. an `approve` rule that should fire only for a specific
+`-a $USER -s "Claude Code-credentials"` invocation and reject the bypass
+where the agent appends a duplicate `-s evil-service`.
+
+```json
+{
+  "argv_shape": {
+    "subcommand": "find-generic-password",
+    "flags": {
+      "-a": { "value": "$USER" },
+      "-s": { "value": "Claude Code-credentials" },
+      "-w": { "type": "boolean" }
+    },
+    "extras": "deny",
+    "on_mismatch": "approve"
+  },
+  "action": { "type": "approve" }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `subcommand` | string | required | First positional arg that must be present. |
+| `flags` | map | `{}` | Flags that must appear in argv. Key is the flag literal (`-s`, `--service`). Value is `{ "value": "..." }` for flags with required values, or `{ "type": "boolean" }` for flags that take no value. Each declared flag must appear *exactly once*. |
+| `extras` | `"deny"` \| `"allow"` | `"deny"` | What to do with unknown flags or extra positionals. `"deny"` (default) rejects the match. `"allow"` tolerates them — only use when migrating an existing `args_prefix` rule and you want strictness incrementally. |
+| `on_mismatch` | `"deny"` \| `"approve"` | `"deny"` | What to do when the strict match fails. `"deny"` (default) falls through to the next rule (or to passthrough). `"approve"` triggers an interactive approval dialog (Allow-once / Allow-always / Deny). On Allow-always, an `argv_shape` entry carrying the exact `(cmd, argv)` is recorded in `~/.nono/argv-allowlist.json` and future-session invocations of the same argv auto-approve without re-prompting. |
+
+A rule may set `args_prefix` OR `argv_shape`, not both. A rule with neither matches every invocation.
+
+`$VAR` tokens in flag values are expanded at profile-load time, the same as in `args_prefix`.
+
+#### Allowlist file (`~/.nono/argv-allowlist.json`)
+
+When a user picks Allow-always, an entry is appended here. The file uses a tagged-union schema shared across mediation features (the same store will host caller-policy and config-scan entries from sibling plans):
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "kind": "argv_shape",
+      "payload": {
+        "cmd": "security",
+        "argv": ["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials", "-s", "evil-service", "-w"]
+      },
+      "approved_at": "2026-05-01T09:14:33Z"
+    }
+  ]
+}
+```
+
+The match is **exact-payload**: a single byte differing in the canonical JSON of `payload` causes a re-prompt. The file is owned by the unsandboxed mediation server and is not reachable from the agent's sandbox.
+
+> **User-facing UX.** When `on_mismatch=approve` triggers and there is no allowlist hit, nono prompts via `CliApprovalGate` over `/dev/tty`:
+>
+> ```
+>   Approval required for: security
+>   Argv: find-generic-password -a kipz -s Claude Code-credentials -s evil-service -w
+>   Reason: argv shape mismatch on rule for 'security': flag '-s' appears more than once
+>   [a]llow once / [r]emember / [d]eny:
+> ```
+>
+> All three verdicts are reachable today. A graphical 3-button dialog in `nono-approve` is a follow-up; when it ships, `NativeApprovalGate::approve_with_save_option` will swap from delegating to `CliApprovalGate` to invoking `nono-approve --with-save-option` directly. Headless sessions will continue to fall back to the CLI gate.
+
 ### Audit Trail
 
 Every supervised session automatically records command, timing, exit code, network events, and cryptographic snapshot commitments as structured JSON. Opt out with `--no-audit`.
