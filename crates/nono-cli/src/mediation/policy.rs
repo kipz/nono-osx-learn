@@ -483,7 +483,10 @@ pub async fn apply(
                     if result.exit_code != 0 {
                         return (result, "capture");
                     }
-                    let nonce = broker.issue(Zeroizing::new(result.stdout.trim().to_string()));
+                    let nonce = broker.issue_with_scope(
+                        Zeroizing::new(result.stdout.trim().to_string()),
+                        rule.nonce_scope.clone(),
+                    );
                     (
                         ShimResponse {
                             stdout: format!("{}\n", nonce),
@@ -773,7 +776,11 @@ async fn exec_script(
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
 ) -> ShimResponse {
-    let env = build_exec_env(sandbox_env, broker);
+    // Capture scripts are not in any consumer scope: scoped nonces must NOT
+    // be promoted into a capture script's environment (they would leak the
+    // very credential the capture is producing). Pass "" so `resolve_for`
+    // rejects every scoped nonce; unscoped nonces still resolve.
+    let env = build_exec_env(sandbox_env, broker, "");
     let script = script.to_string();
 
     let result = tokio::task::spawn_blocking(move || -> Result<ShimResponse> {
@@ -855,7 +862,7 @@ async fn exec_passthrough(
     stdio_fds: Option<(OwnedFd, OwnedFd, OwnedFd)>,
     request_cwd: Option<&str>,
 ) -> ShimResponse {
-    let mut env = build_exec_env(sandbox_env, broker);
+    let mut env = build_exec_env(sandbox_env, broker, &cmd.name);
 
     // Build the effective shim directory and PATH.
     // When allow_commands is set, create a filtered shim dir that excludes allowed
@@ -1401,9 +1408,20 @@ fn add_sandbox_file(
 ///
 /// Starts from the trusted parent env, then promotes nonce-bearing sandbox vars.
 /// Non-nonce sandbox vars and dangerous var names are silently discarded.
+///
+/// `consumer` is the command name about to be exec'd (e.g. "gh", "kubectl").
+/// Nonces are resolved via `broker.resolve_for(value, consumer)` so that
+/// scope-bound nonces only promote into commands listed in the issuing rule's
+/// `nonce_scope.consumers`. A scope mismatch silently drops the env var and
+/// emits a `tracing::warn!` audit event (the existing `AuditEvent` schema does
+/// not yet model scope-mismatch drops; promoting that to a structured audit
+/// event is a follow-up). Pass `""` as the consumer to disable scoped-nonce
+/// promotion entirely (used by capture scripts: scoped nonces must not leak
+/// into a capture script's environment).
 fn build_exec_env(
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
+    consumer: &str,
 ) -> HashMap<String, String> {
     // Start from parent (trusted) env
     let mut env: HashMap<String, String> = std::env::vars().collect();
@@ -1425,10 +1443,26 @@ fn build_exec_env(
             continue;
         }
         if value.starts_with("nono_") {
-            if let Some(real) = broker.resolve(value) {
-                env.insert(key.clone(), real.as_str().to_string());
+            match broker.resolve_for(value, consumer) {
+                Some(real) => {
+                    env.insert(key.clone(), real.as_str().to_string());
+                }
+                None => {
+                    // Either an unknown nonce or a scope mismatch (the nonce
+                    // exists but `consumer` is not in its allowed list). In
+                    // both cases silently drop the env var so the sandbox
+                    // cannot probe broker contents. We cannot distinguish
+                    // the two cases here without exposing scope from the
+                    // broker, but the warn-log records enough context to
+                    // diagnose scope mismatches in practice.
+                    warn!(
+                        target: "nono::mediation::scope",
+                        consumer_cmd = consumer,
+                        env_key = key.as_str(),
+                        "mediation: dropped scoped/unknown nonce for env var",
+                    );
+                }
             }
-            // Unknown nonce: silently discard — don't let sandbox probe broker contents.
         } else {
             env.insert(key.clone(), value.clone());
         }
@@ -2903,6 +2937,139 @@ mod tests {
         assert_eq!(resolved.as_str(), "my_secret_token");
     }
 
+    /// End-to-end check that nonces issued by a `Capture` rule with
+    /// `nonce_scope = ["gh"]` only promote into in-scope consumers.
+    ///
+    /// Flow:
+    /// 1. A "ddtool auth github token" rule captures stdout into a scoped
+    ///    nonce (consumers = ["gh"]).
+    /// 2. The agent passes the nonce as `GITHUB_TOKEN` when invoking
+    ///    `kubectl` (NOT in scope). The promotion path must NOT resolve
+    ///    the nonce; the env var is dropped silently.
+    /// 3. The agent invokes `gh` with `GITHUB_TOKEN=<nonce>`. The
+    ///    promotion path resolves it; gh's env contains the real value.
+    ///
+    /// This test relies on `/usr/bin/env` being a real binary that prints
+    /// its environment to stdout when invoked with no arguments — the
+    /// passthrough exec path in `apply` then surfaces that stdout via the
+    /// streaming socketpair harness used by `apply_capture`.
+    #[tokio::test]
+    async fn test_apply_scoped_nonce_only_promotes_for_listed_consumer() {
+        // Step 1: capture rule with scope=["gh"]. Use a "ddtool" command
+        // configured to pretend to be a credential issuer.
+        let issuer = ResolvedCommand {
+            name: "ddtool".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+            intercepts: vec![ResolvedIntercept {
+                args_prefix: vec!["auth".to_string(), "github".to_string(), "token".to_string()],
+                argv_shape: None,
+                action: ResolvedAction::Capture {
+                    script: Some("echo ghp_real".to_string()),
+                },
+                exit_code: 0,
+                admin: false,
+                nonce_scope: Some(vec!["gh".to_string()]),
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        // Step 2: a "consumer" command that just prints its env.
+        let gh = ResolvedCommand {
+            name: "gh".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+        let kubectl = ResolvedCommand {
+            name: "kubectl".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let broker = make_broker();
+
+        // Issue: invoke ddtool auth github token; receive a nonce.
+        let issue_req = ShimRequest {
+            command: "ddtool".to_string(),
+            args: vec!["auth".to_string(), "github".to_string(), "token".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (issue_resp, action) = apply_capture(
+            issue_req,
+            &[issuer.clone(), gh.clone(), kubectl.clone()],
+            Arc::clone(&broker),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_eq!(action, "capture");
+        let nonce = issue_resp.stdout.trim().to_string();
+        assert!(nonce.starts_with("nono_"), "got: {}", nonce);
+
+        // Promote into kubectl (NOT in scope). Pass GITHUB_TOKEN=<nonce>
+        // in the request env. The build_exec_env path should drop it.
+        let mut env_kc = std::collections::HashMap::new();
+        env_kc.insert("GITHUB_TOKEN".to_string(), nonce.clone());
+        let kc_req = ShimRequest {
+            command: "kubectl".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env: env_kc,
+            pid: 0,
+        };
+        let (kc_resp, _) = apply_capture(
+            kc_req,
+            &[issuer.clone(), gh.clone(), kubectl.clone()],
+            Arc::clone(&broker),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_eq!(kc_resp.exit_code, 0);
+        // env was printed by /usr/bin/env to stdout. GITHUB_TOKEN must
+        // either be absent or NOT equal to the real value.
+        let kc_lines: Vec<&str> = kc_resp.stdout.lines().collect();
+        let kc_gh_token = kc_lines
+            .iter()
+            .find(|l| l.starts_with("GITHUB_TOKEN="))
+            .map(|l| l.trim_start_matches("GITHUB_TOKEN="));
+        assert!(
+            kc_gh_token != Some("ghp_real"),
+            "scope mismatch: nonce must NOT promote into kubectl, got: {:?}",
+            kc_gh_token
+        );
+
+        // Promote into gh (IN scope). Real value must appear.
+        let mut env_gh = std::collections::HashMap::new();
+        env_gh.insert("GITHUB_TOKEN".to_string(), nonce.clone());
+        let gh_req = ShimRequest {
+            command: "gh".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env: env_gh,
+            pid: 0,
+        };
+        let (gh_resp, _) = apply_capture(
+            gh_req,
+            &[issuer, gh, kubectl],
+            Arc::clone(&broker),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_eq!(gh_resp.exit_code, 0);
+        assert!(
+            gh_resp.stdout.contains("GITHUB_TOKEN=ghp_real"),
+            "in-scope consumer must see real value, got: {}",
+            gh_resp.stdout
+        );
+    }
+
     // --- Env filtering tests ---
 
     #[test]
@@ -2919,7 +3086,7 @@ mod tests {
             "context_value".to_string(),
         );
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
 
         // Dangerous vars must not be injected from sandbox.
         assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil"));
@@ -2939,10 +3106,65 @@ mod tests {
         let mut sandbox_env = HashMap::new();
         sandbox_env.insert("GH_TOKEN".to_string(), nonce.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
         assert_eq!(
             env.get("GH_TOKEN").map(|s| s.as_str()),
             Some("real_credential")
+        );
+    }
+
+    /// A scoped nonce must NOT promote into an out-of-scope consumer.
+    /// `build_exec_env` resolves via `broker.resolve_for(value, consumer)`;
+    /// when the nonce's `consumers` list does not include `consumer`, the
+    /// var is silently dropped (no insert, no probing leak). The audit
+    /// path emits a `tracing::warn!` event for diagnostics — verifying
+    /// that emit is currently a follow-up since the env-only assertion
+    /// already covers the security-critical behaviour.
+    #[test]
+    fn test_build_exec_env_drops_scoped_nonce_for_out_of_scope_consumer() {
+        let broker = make_broker();
+        // Issue a nonce scoped to "gh" only.
+        let nonce = broker.issue_with_scope(
+            Zeroizing::new("real_credential".to_string()),
+            Some(vec!["gh".to_string()]),
+        );
+
+        let mut sandbox_env = HashMap::new();
+        sandbox_env.insert("GH_TOKEN".to_string(), nonce.clone());
+
+        // Consumer "kubectl" is NOT in the scope — the env var must be
+        // dropped. It must contain neither the real value nor the nonce.
+        let env = build_exec_env(&sandbox_env, &broker, "kubectl");
+        let actual = env.get("GH_TOKEN").map(|s| s.as_str());
+        assert_ne!(
+            actual,
+            Some("real_credential"),
+            "scoped nonce must NOT promote for out-of-scope consumer",
+        );
+        assert_ne!(
+            actual,
+            Some(nonce.as_str()),
+            "scoped nonce value must not leak through unresolved either",
+        );
+    }
+
+    /// Companion to the scope-mismatch drop test: an in-scope consumer
+    /// resolves the same nonce as expected.
+    #[test]
+    fn test_build_exec_env_promotes_scoped_nonce_for_in_scope_consumer() {
+        let broker = make_broker();
+        let nonce = broker.issue_with_scope(
+            Zeroizing::new("real_credential".to_string()),
+            Some(vec!["gh".to_string(), "git".to_string()]),
+        );
+
+        let mut sandbox_env = HashMap::new();
+        sandbox_env.insert("GH_TOKEN".to_string(), nonce);
+
+        let env = build_exec_env(&sandbox_env, &broker, "gh");
+        assert_eq!(
+            env.get("GH_TOKEN").map(|s| s.as_str()),
+            Some("real_credential"),
         );
     }
 
@@ -2955,7 +3177,7 @@ mod tests {
         sandbox_env.insert("PATH".to_string(), nonce.clone());
         sandbox_env.insert("LD_PRELOAD".to_string(), nonce.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
         // PATH from sandbox must not be the injected value (parent PATH is used instead)
         assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil/path"));
         // LD_PRELOAD should not have been injected
@@ -2975,7 +3197,7 @@ mod tests {
             "nono_0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         );
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
         // Unknown nonce: var should not be set to any nonce value
         assert_ne!(
             env.get("MY_TOKEN").map(|s| s.as_str()),
@@ -3005,7 +3227,7 @@ mod tests {
             "preserved".to_string(),
         );
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
 
         // The sandbox-supplied NONO_GATE_* values must never overwrite/inject.
         assert_ne!(
