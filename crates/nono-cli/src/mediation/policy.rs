@@ -453,7 +453,7 @@ pub async fn apply(
         &request.args,
         &request.env,
         &broker,
-        cmd.sandbox.clone(),
+        effective_sandbox(cmd, caller_parent.as_deref().map(|s| s.as_str())),
         ctx,
         commands,
         Some((stdin_fd, stdout_fd, stderr_fd)),
@@ -660,6 +660,24 @@ pub fn argv_shape_matches(
         }
     }
     Ok(())
+}
+
+/// Pick the per-command sandbox to apply to a passthrough exec.
+///
+/// If the request comes from a mediated parent listed in `parent_sandbox`,
+/// return that override. Otherwise fall back to the command's default
+/// sandbox (which may itself be `None`). Agent callers (no parent) always
+/// receive the default sandbox.
+fn effective_sandbox(
+    cmd: &ResolvedCommand,
+    caller_parent: Option<&str>,
+) -> Option<super::CommandSandbox> {
+    if let Some(parent) = caller_parent {
+        if let Some(sb) = cmd.caller_policy.parent_sandbox.get(parent) {
+            return Some(sb.clone());
+        }
+    }
+    cmd.sandbox.clone()
 }
 
 /// Execute a shell script and collect its output.
@@ -3663,6 +3681,7 @@ mod tests {
                 workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
+            make_allowlist(),
             OwnedFd::from(child_in),
             OwnedFd::from(child_out),
             OwnedFd::from(child_err),
@@ -3679,6 +3698,225 @@ mod tests {
             pwd_output.trim_end(),
             caller_cwd,
             "pwd should print the caller's cwd from ShimRequest.cwd"
+        );
+    }
+
+    // --- parent_sandbox override (plan 4.1) ---
+
+    /// When the resolved parent has a `parent_sandbox` entry, the keyed
+    /// CommandSandbox replaces the default for the passthrough exec.
+    /// Verified via the network policy: parent="gh" → block:true → no
+    /// HTTPS_PROXY injected, even though the default sandbox would have
+    /// allowed `github.com` via the proxy.
+    #[tokio::test]
+    async fn test_apply_uses_parent_sandbox_when_caller_matches() {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+
+        let mut parent_sandbox = std::collections::HashMap::new();
+        parent_sandbox.insert(
+            "gh".to_string(),
+            CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+            },
+        );
+
+        let default_sb = CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec!["github.com".to_string()],
+            },
+            fs_read: vec![],
+            fs_read_file: vec![],
+            fs_write: vec![],
+            fs_write_file: vec![],
+            allow_commands: vec![],
+            keychain_access: false,
+        };
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sb),
+            caller_policy: CallerPolicy {
+                agent_allowed: true,
+                allowed_parents: None,
+                parent_sandbox,
+                deny_agent_strict: false,
+            },
+        };
+
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("gh".to_string()));
+        let mut env = std::collections::HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+            ..Default::default()
+        };
+
+        let (resp, action) =
+            apply_capture(req, &[cmd], Arc::clone(&broker), &ctx(), always_allow()).await;
+        assert_eq!(action, "passthrough");
+        assert!(
+            !resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "parent_sandbox should have applied network.block, but HTTPS_PROXY was injected: {}",
+            resp.stdout
+        );
+    }
+
+    /// When the parent name is not present in `parent_sandbox`, the default
+    /// sandbox is used. Caller is "git", parent_sandbox only has "gh", so the
+    /// default sandbox (allowed_hosts) wins → HTTPS_PROXY is injected.
+    #[tokio::test]
+    async fn test_apply_uses_default_sandbox_when_no_parent_sandbox_match() {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+
+        let mut parent_sandbox = std::collections::HashMap::new();
+        parent_sandbox.insert(
+            "gh".to_string(),
+            CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+            },
+        );
+
+        let default_sb = CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec!["github.com".to_string()],
+            },
+            fs_read: vec![],
+            fs_read_file: vec![],
+            fs_write: vec![],
+            fs_write_file: vec![],
+            allow_commands: vec![],
+            keychain_access: false,
+        };
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sb),
+            caller_policy: CallerPolicy {
+                agent_allowed: true,
+                allowed_parents: None,
+                parent_sandbox,
+                deny_agent_strict: false,
+            },
+        };
+
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("git".to_string()));
+        let mut env = std::collections::HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+            ..Default::default()
+        };
+
+        let (resp, _) =
+            apply_capture(req, &[cmd], Arc::clone(&broker), &ctx(), always_allow()).await;
+        assert!(
+            resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "should have used default sandbox (network.allowed_hosts) for parent not in map, got: {}",
+            resp.stdout
+        );
+    }
+
+    /// When the caller is the agent (no NONO_SANDBOX_CONTEXT), the default
+    /// sandbox is used regardless of `parent_sandbox` contents.
+    #[tokio::test]
+    async fn test_apply_uses_default_sandbox_for_agent_caller() {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+
+        let mut parent_sandbox = std::collections::HashMap::new();
+        parent_sandbox.insert(
+            "gh".to_string(),
+            CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+            },
+        );
+
+        let default_sb = CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec!["github.com".to_string()],
+            },
+            fs_read: vec![],
+            fs_read_file: vec![],
+            fs_write: vec![],
+            fs_write_file: vec![],
+            allow_commands: vec![],
+            keychain_access: false,
+        };
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sb),
+            caller_policy: CallerPolicy {
+                agent_allowed: true,
+                allowed_parents: None,
+                parent_sandbox,
+                deny_agent_strict: false,
+            },
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+            ..Default::default()
+        };
+
+        let broker = make_broker();
+        let (resp, _) =
+            apply_capture(req, &[cmd], Arc::clone(&broker), &ctx(), always_allow()).await;
+        assert!(
+            resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "agent caller should use default sandbox, expected HTTPS_PROXY, got: {}",
+            resp.stdout
         );
     }
 }
