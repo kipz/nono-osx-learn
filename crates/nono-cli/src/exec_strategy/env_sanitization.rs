@@ -50,6 +50,16 @@ pub(crate) fn is_dangerous_env_var(key: &str) -> bool {
         || key == "OP_CONNECT_TOKEN"
         || key == "OP_CONNECT_HOST"
         || key.starts_with("OP_SESSION_")
+        // NONO_GATE_* test-only knobs (e.g. NONO_GATE_FORCE_DENY) force the
+        // approval gate into known verdicts. They must never leak into a
+        // sandboxed child — otherwise the sandboxed agent could set
+        // NONO_GATE_FORCE_DENY=0 in its own env and bypass the gate when nono
+        // spawns mediated commands. Filter as a prefix so future NONO_GATE_*
+        // vars are covered without code changes. The wider NONO_ prefix is
+        // intentionally NOT filtered: nono itself sets NONO_SESSION_TOKEN,
+        // NONO_MEDIATION_SOCKET, NONO_BROKER_SOCKET, NONO_CALLER, etc. for
+        // sandboxed children, and those must pass through.
+        || key.starts_with("NONO_GATE_")
 }
 
 /// Returns true if an environment variable matches the allow-list.
@@ -165,6 +175,45 @@ mod tests {
         assert!(is_dangerous_env_var("NODE_OPTIONS"));
         assert!(is_dangerous_env_var("PYTHONPATH"));
         assert!(is_dangerous_env_var("RUBYOPT"));
+    }
+
+    // ============================================================================
+    // NONO_GATE_* test-knob blocklist — security-critical regression tests.
+    //
+    // NONO_GATE_FORCE_DENY (and similar) force the approval gate into known
+    // verdicts in tests. They must never reach a sandboxed agent — otherwise
+    // the agent could set NONO_GATE_FORCE_DENY=0 in its own env and bypass
+    // the gate when nono spawns mediated commands. The wider NONO_ prefix
+    // is intentionally NOT filtered: nono itself sets NONO_SESSION_TOKEN,
+    // NONO_MEDIATION_SOCKET, NONO_BROKER_SOCKET, and NONO_CALLER for
+    // sandboxed children.
+    // ============================================================================
+
+    #[test]
+    fn test_blocks_nono_gate_force_deny() {
+        assert!(is_dangerous_env_var("NONO_GATE_FORCE_DENY"));
+    }
+
+    #[test]
+    fn test_blocks_nono_gate_prefix() {
+        // Any future NONO_GATE_* knob must be filtered.
+        assert!(is_dangerous_env_var("NONO_GATE_FORCE_ALLOW"));
+        assert!(is_dangerous_env_var("NONO_GATE_"));
+        assert!(is_dangerous_env_var("NONO_GATE_ANY_NEW_KNOB"));
+    }
+
+    #[test]
+    fn test_does_not_block_other_nono_vars() {
+        // Vars set BY nono FOR sandboxed children must pass through.
+        assert!(!is_dangerous_env_var("NONO_SESSION_TOKEN"));
+        assert!(!is_dangerous_env_var("NONO_MEDIATION_SOCKET"));
+        assert!(!is_dangerous_env_var("NONO_BROKER_SOCKET"));
+        assert!(!is_dangerous_env_var("NONO_CALLER"));
+        assert!(!is_dangerous_env_var("NONO_SANDBOX_CONTEXT"));
+        assert!(!is_dangerous_env_var("NONO_CAP_FILE"));
+        // Plausibly named vars that should not collide with the gate prefix.
+        assert!(!is_dangerous_env_var("NONO_GATE")); // no trailing underscore
+        assert!(!is_dangerous_env_var("NONO"));
     }
 
     // ============================================================================

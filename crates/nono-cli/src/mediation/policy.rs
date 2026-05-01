@@ -87,6 +87,17 @@ static DANGEROUS_ENV_VAR_NAMES: &[&str] = &[
     "NONO_SANDBOX_CONTEXT",
 ];
 
+/// Returns true if a sandbox-supplied env var name is a NONO_GATE_* test-knob
+/// that must never be forwarded into a mediated child. NONO_GATE_FORCE_DENY
+/// (and similar) force the approval gate into known verdicts; an agent that
+/// could smuggle them via `request.env` would bypass the gate. The wider
+/// NONO_ prefix is intentionally NOT filtered: nono itself sets
+/// NONO_SESSION_TOKEN, NONO_MEDIATION_SOCKET, NONO_BROKER_SOCKET, and
+/// NONO_CALLER for sandboxed children.
+fn is_nono_gate_var(key: &str) -> bool {
+    key.starts_with("NONO_GATE_")
+}
+
 /// Apply policy to a shim request and produce a response.
 ///
 /// - If the command is unknown: returns an error response (not found).
@@ -1302,6 +1313,13 @@ fn build_exec_env(
     for (key, value) in sandbox_env {
         if DANGEROUS_ENV_VAR_NAMES.contains(&key.as_str()) {
             warn!("mediation: blocked dangerous var {} from sandbox env", key);
+            continue;
+        }
+        if is_nono_gate_var(key) {
+            warn!(
+                "mediation: blocked NONO_GATE_* test-knob {} from sandbox env",
+                key
+            );
             continue;
         }
         if value.starts_with("nono_") {
@@ -2829,6 +2847,50 @@ mod tests {
         assert_ne!(
             env.get("MY_TOKEN").map(|s| s.as_str()),
             Some("nono_0000000000000000000000000000000000000000000000000000000000000000")
+        );
+    }
+
+    /// An agent must not be able to smuggle NONO_GATE_* test-knobs into a
+    /// mediated child via `sandbox_env`. NONO_GATE_FORCE_DENY (and any other
+    /// NONO_GATE_* var) forces the approval gate into a known verdict; a
+    /// sandboxed agent that could set it would bypass the gate.
+    #[test]
+    fn test_build_exec_env_strips_nono_gate_prefix_from_sandbox_env() {
+        let broker = make_broker();
+        let mut sandbox_env = HashMap::new();
+        sandbox_env.insert(
+            "NONO_GATE_FORCE_DENY".to_string(),
+            "from-agent-sandbox".to_string(),
+        );
+        sandbox_env.insert(
+            "NONO_GATE_FUTURE_KNOB".to_string(),
+            "from-agent-sandbox".to_string(),
+        );
+        // Sanity: a non-NONO_GATE_* var with a similar shape still flows.
+        sandbox_env.insert(
+            "NONO_TEST_PASSTHROUGH_98765".to_string(),
+            "preserved".to_string(),
+        );
+
+        let env = build_exec_env(&sandbox_env, &broker);
+
+        // The sandbox-supplied NONO_GATE_* values must never overwrite/inject.
+        assert_ne!(
+            env.get("NONO_GATE_FORCE_DENY").map(|s| s.as_str()),
+            Some("from-agent-sandbox"),
+            "NONO_GATE_FORCE_DENY from agent sandbox env must be stripped"
+        );
+        assert_ne!(
+            env.get("NONO_GATE_FUTURE_KNOB").map(|s| s.as_str()),
+            Some("from-agent-sandbox"),
+            "NONO_GATE_* prefix-strip must cover future test knobs without code change"
+        );
+        // Unrelated vars still flow through (the strip is an exact prefix, not
+        // wholesale "NONO_*" — nono itself sets NONO_SESSION_TOKEN etc. for
+        // sandboxed children).
+        assert_eq!(
+            env.get("NONO_TEST_PASSTHROUGH_98765").map(|s| s.as_str()),
+            Some("preserved")
         );
     }
 
