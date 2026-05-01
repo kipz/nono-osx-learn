@@ -142,6 +142,26 @@ pub struct InterceptRule {
     pub admin: bool,
     /// What to do when this rule matches.
     pub action: InterceptAction,
+    /// Optional capability scope for nonces issued by this rule's
+    /// `Capture` action. Absent = unscoped (any consumer may redeem).
+    #[serde(default)]
+    pub nonce_scope: Option<NonceScope>,
+}
+
+/// Capability-scope binding for a captured nonce.
+///
+/// When attached to an intercept rule whose action is `Capture`, the broker
+/// records this scope alongside the issued nonce. At promotion time
+/// (`build_exec_env`), only consumers in `consumers` may redeem the nonce.
+/// On a scope mismatch the env var carrying the nonce is silently discarded
+/// (the agent gets no signal — same UX as an unknown nonce).
+///
+/// Absent on a rule = unscoped (any consumer may redeem).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NonceScope {
+    /// Allowed consumer command names. The redeeming process must have
+    /// `command == one_of(consumers)` for the broker to return the value.
+    pub consumers: Vec<String>,
 }
 
 /// Strict, flag-aware matcher for an intercept rule.
@@ -671,5 +691,28 @@ mod tests {
         let p3: CallerPolicy = serde_json::from_str(r#"{"deny_agent_strict": true}"#)
             .expect("deserialize");
         assert!(p3.deny_agent_strict);
+    }
+
+    #[test]
+    fn test_intercept_rule_nonce_scope_deserializes() {
+        let json = r#"{
+            "args_prefix": ["auth", "github", "token"],
+            "action": { "type": "capture" },
+            "nonce_scope": { "consumers": ["gh", "git"] }
+        }"#;
+        let rule: InterceptRule = serde_json::from_str(json).expect("deserialize");
+        let scope = rule.nonce_scope.expect("present");
+        assert_eq!(scope.consumers, vec!["gh".to_string(), "git".to_string()]);
+    }
+
+    #[test]
+    fn test_intercept_rule_nonce_scope_optional() {
+        // Existing rules without nonce_scope continue to deserialize.
+        let json = r#"{
+            "args_prefix": ["foo"],
+            "action": { "type": "capture" }
+        }"#;
+        let rule: InterceptRule = serde_json::from_str(json).expect("deserialize");
+        assert!(rule.nonce_scope.is_none());
     }
 }
