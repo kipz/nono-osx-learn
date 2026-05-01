@@ -1552,6 +1552,8 @@ mod tests {
         cmd.caller_policy = CallerPolicy {
             agent_allowed: false,
             allowed_parents: Some(vec!["git".to_string()]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         };
 
         let req = ShimRequest {
@@ -1588,6 +1590,8 @@ mod tests {
         cmd.caller_policy = CallerPolicy {
             agent_allowed: false,
             allowed_parents: Some(vec!["git".to_string()]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         };
 
         let broker = make_broker();
@@ -1616,6 +1620,8 @@ mod tests {
         cmd.caller_policy = CallerPolicy {
             agent_allowed: true,
             allowed_parents: Some(vec!["git".to_string()]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         };
 
         let broker = make_broker();
@@ -1651,6 +1657,8 @@ mod tests {
         cmd.caller_policy = CallerPolicy {
             agent_allowed: true,
             allowed_parents: Some(vec![]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         };
 
         let broker = make_broker();
@@ -2185,6 +2193,8 @@ mod tests {
         cmd.caller_policy = CallerPolicy {
             agent_allowed: false,
             allowed_parents: Some(vec!["git".to_string()]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         };
         let req = ShimRequest {
             command: "testcmd".to_string(),

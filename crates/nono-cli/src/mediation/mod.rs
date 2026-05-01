@@ -88,6 +88,18 @@ pub struct CallerPolicy {
     /// - `Some(vec!["git"])`: only the listed parents allowed.
     #[serde(default)]
     pub allowed_parents: Option<Vec<String>>,
+    /// Per-parent sandbox override. When the resolved parent name is a key
+    /// in this map, exec_passthrough uses the keyed CommandSandbox instead
+    /// of the command's default sandbox. Parents not listed (and the agent
+    /// caller) use the default sandbox. Defaults to empty map.
+    #[serde(default)]
+    pub parent_sandbox: std::collections::HashMap<String, CommandSandbox>,
+    /// When true, agent_allowed:false rejections hard-deny without consulting
+    /// the approval gate. Used for security-critical commands where AllowAlways
+    /// would re-open known regressions (e.g. ssh's role in §3a core.sshCommand
+    /// exfil through git's sandbox).
+    #[serde(default)]
+    pub deny_agent_strict: bool,
 }
 
 impl Default for CallerPolicy {
@@ -95,6 +107,8 @@ impl Default for CallerPolicy {
         Self {
             agent_allowed: true,
             allowed_parents: None,
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         }
     }
 }
@@ -614,5 +628,48 @@ mod tests {
         // (Task 4) will reject.
         let rule = res.expect("schema-level deserialize must succeed");
         assert!(!rule.args_prefix.is_empty() && rule.argv_shape.is_some());
+    }
+
+    #[test]
+    fn test_caller_policy_parent_sandbox_deserializes() {
+        let json = r#"{
+            "agent_allowed": true,
+            "allowed_parents": ["gh", "git"],
+            "parent_sandbox": {
+                "gh": {
+                    "fs_read": ["."],
+                    "network": { "block": true }
+                }
+            }
+        }"#;
+        let p: CallerPolicy = serde_json::from_str(json).expect("deserialize");
+        assert!(p.agent_allowed);
+        assert_eq!(p.parent_sandbox.len(), 1);
+        let gh_sb = p.parent_sandbox.get("gh").expect("gh entry present");
+        assert_eq!(gh_sb.fs_read, vec!["."]);
+        assert!(gh_sb.network.block);
+    }
+
+    #[test]
+    fn test_caller_policy_parent_sandbox_default_empty() {
+        let p: CallerPolicy = serde_json::from_str(r#"{}"#).expect("deserialize");
+        assert!(p.parent_sandbox.is_empty(), "default must be empty map");
+    }
+
+    #[test]
+    fn test_caller_policy_default_has_empty_parent_sandbox() {
+        let p = CallerPolicy::default();
+        assert!(p.parent_sandbox.is_empty());
+    }
+
+    #[test]
+    fn test_caller_policy_deny_agent_strict_defaults_false() {
+        let p: CallerPolicy = serde_json::from_str(r#"{}"#).expect("deserialize");
+        assert!(!p.deny_agent_strict);
+        let p2 = CallerPolicy::default();
+        assert!(!p2.deny_agent_strict);
+        let p3: CallerPolicy = serde_json::from_str(r#"{"deny_agent_strict": true}"#)
+            .expect("deserialize");
+        assert!(p3.deny_agent_strict);
     }
 }
