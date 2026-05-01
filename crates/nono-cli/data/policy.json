@@ -484,7 +484,6 @@
     },
     "nix_runtime": {
       "description": "Nix package manager runtime paths",
-      "platform": "linux",
       "allow": {
         "read": [
           "~/.nix-profile",
