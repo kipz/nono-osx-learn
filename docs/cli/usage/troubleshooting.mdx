@@ -37,7 +37,7 @@ Command fails with "Permission denied" or "Operation not permitted" errors.
 | Cause | Solution |
 |-------|----------|
 | Path not in allowed list | Add path with `--allow`, `--read`, or `--write` |
-| Sensitive path blocked | Use `--override-deny` with your grant (see below) |
+| Sensitive path blocked | Use `--bypass-protection` with your grant (see below) |
 | Relative path resolved differently | Use absolute paths |
 | Symlink target outside sandbox | Grant access to the symlink target |
 
@@ -58,13 +58,13 @@ These paths are blocked by default, even if a parent directory is allowed:
 If you grant one of these paths with `--allow`, nono will warn you on macOS:
 
 ```
-WARN '~/.gnupg' is blocked by 'deny_credentials'; use --override-deny ~/.gnupg to allow access
+WARN '~/.gnupg' is blocked by 'deny_credentials'; use --bypass-protection ~/.gnupg to allow access
 ```
 
-To intentionally access a blocked path, use `--override-deny` alongside your grant:
+To intentionally access a blocked path, use `--bypass-protection` alongside your grant:
 
 ```bash
-nono run --allow ~/.gnupg --override-deny ~/.gnupg -- gpg --list-keys
+nono run --allow ~/.gnupg --bypass-protection ~/.gnupg -- gpg --list-keys
 ```
 
 ---

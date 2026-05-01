@@ -165,14 +165,14 @@ cat > ~/.config/nono/profiles/my-profile.json << 'EOF'
 {
   "meta": { "name": "my-profile" },
   "filesystem": { "allow": ["/tmp"] },
-  "security": { "allowed_commands": ["rm"] }
+  "commands": { "allow": ["rm"] }
 }
 EOF
 nono run --profile my-profile -- rm /tmp/old-file.txt
 ```
 
 Prefer resource-based controls instead: narrower filesystem grants,
-`add_deny_access`, `unlink_protection`, and network policy.
+`filesystem.deny`, `unlink_protection`, and network policy.
 
 ## Documentation
 

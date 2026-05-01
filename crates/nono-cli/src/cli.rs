@@ -822,6 +822,13 @@ pub struct ProfileValidateArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+    /// Treat deprecated schema warnings as errors (exit code 2 if any are found).
+    ///
+    /// Use this in CI to block profiles that still rely on the pre-#594
+    /// legacy schema keys. A canonical profile with zero deprecation
+    /// warnings passes as usual.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -895,8 +902,14 @@ pub struct SandboxArgs {
     pub allow_unix_socket_dir_bind: Vec<PathBuf>,
 
     /// Override a deny rule for a path. Pair with --allow/--read/--write grant
-    #[arg(long, value_name = "PATH", help_heading = "FILESYSTEM")]
-    pub override_deny: Vec<PathBuf>,
+    /// ALIAS(canonical="--bypass-protection", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
+    #[arg(
+        long = "bypass-protection",
+        alias = "override-deny",
+        value_name = "PATH",
+        help_heading = "FILESYSTEM"
+    )]
+    pub bypass_protection: Vec<PathBuf>,
 
     /// Allow CWD access without prompting (level set by profile, defaults to read-only)
     #[arg(long, help_heading = "FILESYSTEM")]
@@ -908,6 +921,7 @@ pub struct SandboxArgs {
 
     // ── Network ──────────────────────────────────────────────────────────
     /// Block outbound network access (allowed by default)
+    /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(
         long = "block-net",
         alias = "net-block",
@@ -920,6 +934,7 @@ pub struct SandboxArgs {
     pub block_net: bool,
 
     /// Deprecated compatibility flag. Network is unrestricted by default.
+    /// ALIAS(canonical="--allow-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(
         long = "allow-net",
         alias = "net-allow",
@@ -950,6 +965,7 @@ pub struct SandboxArgs {
     pub network_profile: Option<String>,
 
     /// Add a domain to the proxy allowlist (repeatable)
+    /// ALIAS(canonical="--allow-domain", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "allow-domain",
         alias = "allow-proxy",
@@ -961,6 +977,7 @@ pub struct SandboxArgs {
     pub allow_proxy: Vec<String>,
 
     /// Allow the sandboxed child to listen on a TCP port (repeatable)
+    /// ALIAS(canonical="--listen-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "listen-port",
         alias = "allow-bind",
@@ -970,6 +987,7 @@ pub struct SandboxArgs {
     pub allow_bind: Vec<u16>,
 
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
+    /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "open-port",
         alias = "allow-port",
@@ -987,6 +1005,7 @@ pub struct SandboxArgs {
     pub allow_connect_port: Vec<u16>,
 
     /// Chain outbound traffic through an upstream proxy (host:port)
+    /// ALIAS(canonical="--upstream-proxy", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-proxy",
         alias = "external-proxy",
@@ -997,6 +1016,7 @@ pub struct SandboxArgs {
     pub external_proxy: Option<String>,
 
     /// Route these domains direct instead of through the upstream proxy
+    /// ALIAS(canonical="--upstream-bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-bypass",
         alias = "external-proxy-bypass",
@@ -1013,6 +1033,7 @@ pub struct SandboxArgs {
 
     // ── Credentials ──────────────────────────────────────────────────────
     /// Inject credentials via reverse proxy for a service (repeatable)
+    /// ALIAS(canonical="--credential", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[arg(
         long = "credential",
         alias = "proxy-credential",
@@ -1090,7 +1111,7 @@ pub struct SandboxArgs {
             "allow", "read", "write", "allow_file", "read_file", "write_file",
             "allow_unix_socket", "allow_unix_socket_bind",
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
-            "profile", "override_deny", "allow_cwd",
+            "profile", "bypass_protection", "allow_cwd",
             "block_net", "allow_net", "network_profile", "allow_proxy",
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
@@ -1178,8 +1199,14 @@ pub struct WrapSandboxArgs {
     pub allow_unix_socket_dir_bind: Vec<PathBuf>,
 
     /// Override a deny rule for a path. Pair with --allow/--read/--write grant
-    #[arg(long, value_name = "PATH", help_heading = "FILESYSTEM")]
-    pub override_deny: Vec<PathBuf>,
+    /// ALIAS(canonical="--bypass-protection", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
+    #[arg(
+        long = "bypass-protection",
+        alias = "override-deny",
+        value_name = "PATH",
+        help_heading = "FILESYSTEM"
+    )]
+    pub bypass_protection: Vec<PathBuf>,
 
     /// Allow CWD access without prompting (level set by profile, defaults to read-only)
     #[arg(long, help_heading = "FILESYSTEM")]
@@ -1191,6 +1218,7 @@ pub struct WrapSandboxArgs {
 
     // ── Network ──────────────────────────────────────────────────────────
     /// Block outbound network access (allowed by default)
+    /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(
         long = "block-net",
         alias = "net-block",
@@ -1202,6 +1230,7 @@ pub struct WrapSandboxArgs {
     pub block_net: bool,
 
     /// Allow the sandboxed child to listen on a TCP port (repeatable)
+    /// ALIAS(canonical="--listen-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "listen-port",
         alias = "allow-bind",
@@ -1211,6 +1240,7 @@ pub struct WrapSandboxArgs {
     pub allow_bind: Vec<u16>,
 
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
+    /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "open-port",
         alias = "allow-port",
@@ -1285,7 +1315,7 @@ pub struct WrapSandboxArgs {
             "allow", "read", "write", "allow_file", "read_file", "write_file",
             "allow_unix_socket", "allow_unix_socket_bind",
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
-            "profile", "override_deny", "allow_cwd",
+            "profile", "bypass_protection", "allow_cwd",
             "block_net", "allow_bind", "allow_port", "allow_connect_port",
             "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
@@ -1316,7 +1346,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_unix_socket_bind: args.allow_unix_socket_bind,
             allow_unix_socket_dir: args.allow_unix_socket_dir,
             allow_unix_socket_dir_bind: args.allow_unix_socket_dir_bind,
-            override_deny: args.override_deny,
+            bypass_protection: args.bypass_protection,
             allow_cwd: args.allow_cwd,
             workdir: args.workdir,
             block_net: args.block_net,
@@ -1570,6 +1600,7 @@ pub struct WhyArgs {
     pub write_file: Vec<PathBuf>,
 
     /// Block network access (for query context)
+    /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(long = "block-net", alias = "net-block", help_heading = "CONTEXT")]
     pub block_net: bool,
 
@@ -2998,11 +3029,11 @@ mod tests {
     }
 
     #[test]
-    fn test_override_deny_single() {
+    fn test_bypass_protection_single() {
         let cli = Cli::parse_from([
             "nono",
             "run",
-            "--override-deny",
+            "--bypass-protection",
             "/tmp/test",
             "--allow",
             "/tmp/test",
@@ -3011,21 +3042,24 @@ mod tests {
         ]);
         match cli.command {
             Commands::Run(args) => {
-                assert_eq!(args.sandbox.override_deny.len(), 1);
-                assert_eq!(args.sandbox.override_deny[0], PathBuf::from("/tmp/test"));
+                assert_eq!(args.sandbox.bypass_protection.len(), 1);
+                assert_eq!(
+                    args.sandbox.bypass_protection[0],
+                    PathBuf::from("/tmp/test")
+                );
             }
             _ => panic!("Expected Run command"),
         }
     }
 
     #[test]
-    fn test_override_deny_multiple() {
+    fn test_bypass_protection_multiple() {
         let cli = Cli::parse_from([
             "nono",
             "run",
-            "--override-deny",
+            "--bypass-protection",
             "/tmp/a",
-            "--override-deny",
+            "--bypass-protection",
             "/tmp/b",
             "--allow",
             ".",
@@ -3033,9 +3067,35 @@ mod tests {
         ]);
         match cli.command {
             Commands::Run(args) => {
-                assert_eq!(args.sandbox.override_deny.len(), 2);
-                assert_eq!(args.sandbox.override_deny[0], PathBuf::from("/tmp/a"));
-                assert_eq!(args.sandbox.override_deny[1], PathBuf::from("/tmp/b"));
+                assert_eq!(args.sandbox.bypass_protection.len(), 2);
+                assert_eq!(args.sandbox.bypass_protection[0], PathBuf::from("/tmp/a"));
+                assert_eq!(args.sandbox.bypass_protection[1], PathBuf::from("/tmp/b"));
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_override_deny_alias_populates_bypass_protection() {
+        // The legacy `--override-deny` flag is retained as a clap alias for
+        // `--bypass-protection`. This test locks in that parsing behavior so
+        // removing the alias in the v1.0.0 cleanup is deliberate, not accidental.
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--override-deny",
+            "/tmp/test",
+            "--allow",
+            "/tmp/test",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.sandbox.bypass_protection.len(), 1);
+                assert_eq!(
+                    args.sandbox.bypass_protection[0],
+                    PathBuf::from("/tmp/test")
+                );
             }
             _ => panic!("Expected Run command"),
         }

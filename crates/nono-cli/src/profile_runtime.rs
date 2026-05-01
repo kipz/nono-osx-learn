@@ -24,7 +24,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) allow_launch_services: bool,
     pub(crate) allow_gpu: bool,
     pub(crate) allow_parent_of_protected: bool,
-    pub(crate) override_deny_paths: Vec<PathBuf>,
+    pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
 }
 
@@ -215,7 +215,7 @@ fn verify_stored_bundles(
     Ok(())
 }
 
-fn expand_override_deny_path(path: &Path, workdir: &Path) -> PathBuf {
+fn expand_bypass_protection_path(path: &Path, workdir: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
     let expanded = profile::expand_vars(&path_str, workdir).unwrap_or_else(|_| path.to_path_buf());
     if expanded.exists() {
@@ -225,16 +225,16 @@ fn expand_override_deny_path(path: &Path, workdir: &Path) -> PathBuf {
     }
 }
 
-fn collect_override_deny_paths(
+fn collect_bypass_protection_paths(
     loaded_profile: Option<&profile::Profile>,
-    cli_override_deny: &[PathBuf],
+    cli_bypass_protection: &[PathBuf],
     workdir: &Path,
 ) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = loaded_profile
         .map(|profile| {
             profile
-                .policy
-                .override_deny
+                .filesystem
+                .bypass_protection
                 .iter()
                 .filter_map(|template| {
                     profile::expand_vars(template, workdir)
@@ -251,8 +251,8 @@ fn collect_override_deny_paths(
         })
         .unwrap_or_default();
 
-    for path in cli_override_deny {
-        let canonical = expand_override_deny_path(path, workdir);
+    for path in cli_bypass_protection {
+        let canonical = expand_bypass_protection_path(path, workdir);
         if !paths.contains(&canonical) {
             paths.push(canonical);
         }
@@ -372,9 +372,9 @@ fn prepare_profile_with_options(
             .as_ref()
             .and_then(|profile| profile.allow_parent_of_protected)
             .unwrap_or(false),
-        override_deny_paths: collect_override_deny_paths(
+        bypass_protection_paths: collect_bypass_protection_paths(
             loaded_profile.as_ref(),
-            &args.override_deny,
+            &args.bypass_protection,
             workdir,
         ),
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
@@ -450,8 +450,8 @@ mod tests {
                     "upstream_bypass": ["localhost"],
                     "listen_port": [8080]
                 },
-                "policy": {
-                    "override_deny": ["$WORKDIR/.git"]
+                "filesystem": {
+                    "bypass_protection": ["$WORKDIR/.git"]
                 }
             }"#,
         ) {
@@ -460,7 +460,7 @@ mod tests {
 
         let args = SandboxArgs {
             profile: Some(profile_path.to_string_lossy().into_owned()),
-            override_deny: vec![cli_override],
+            bypass_protection: vec![cli_override],
             ..SandboxArgs::default()
         };
 
@@ -502,13 +502,16 @@ mod tests {
             preflight.allow_launch_services
         );
         assert_eq!(runtime.allow_gpu, preflight.allow_gpu);
-        assert_eq!(runtime.override_deny_paths, preflight.override_deny_paths);
+        assert_eq!(
+            runtime.bypass_protection_paths,
+            preflight.bypass_protection_paths
+        );
         assert_eq!(
             runtime.loaded_profile.as_ref().map(|profile| {
                 (
                     profile.meta.name.clone(),
                     profile.extends.clone(),
-                    profile.security.groups.clone(),
+                    profile.groups.include.clone(),
                     profile.workdir.access.clone(),
                     profile.filesystem.allow.clone(),
                 )
@@ -517,7 +520,7 @@ mod tests {
                 (
                     profile.meta.name.clone(),
                     profile.extends.clone(),
-                    profile.security.groups.clone(),
+                    profile.groups.include.clone(),
                     profile.workdir.access.clone(),
                     profile.filesystem.allow.clone(),
                 )
