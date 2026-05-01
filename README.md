@@ -557,6 +557,74 @@ The match is **exact-payload**: a single byte differing in the canonical JSON of
 >
 > All three verdicts are reachable today. A graphical 3-button dialog in `nono-approve` is a follow-up; when it ships, `NativeApprovalGate::approve_with_save_option` will swap from delegating to `CliApprovalGate` to invoking `nono-approve --with-save-option` directly. Headless sessions will continue to fall back to the CLI gate.
 
+#### `/approve` IPC for out-of-process callers
+
+The mediation server publishes a sibling Unix socket — `approve.sock`,
+alongside `mediation.sock` and `control.sock` — that exposes the same
+allowlist-and-approval gate to processes outside the mediation server's
+address space. Sibling-plan shell wrappers (4.1 caller policy, 4.3
+config/env scan) connect here to consult the gate without re-implementing
+it. The in-process `apply` path does NOT use this IPC; it talks to the
+`AllowlistStore` and `ApprovalGate` directly.
+
+**Wire format** matches `mediation.sock` and `control.sock`:
+
+```text
+  Request:  u32 big-endian length || JSON payload
+  Response: u32 big-endian length || JSON payload
+```
+
+Length-prefixed JSON (rather than line-delimited) is used so callers can
+reuse the same framing primitives nono already exports. Each connection
+carries one request and one response.
+
+**Request:**
+
+```json
+{
+  "op": "approve",
+  "session_token": "<NONO_SESSION_TOKEN>",
+  "key": {
+    "kind": "argv_shape",
+    "payload": { "cmd": "security", "argv": ["find-generic-password", "-a", "u"] }
+  }
+}
+```
+
+`key` is a serde-serialized [`AllowlistKey`]. Any `AllowlistKind` variant
+the server already understands is accepted (`argv_shape`, `caller_policy`,
+`scan_config`, `scan_env`, `scan_ssh_opt`, `scan_ssh_identity`).
+
+**Response — exactly one of:**
+
+```json
+{ "verdict": "allow_once" }
+{ "verdict": "allow_always" }
+{ "verdict": "deny" }
+{ "error": "unauthenticated" }
+{ "error": "invalid_request" }
+{ "error": "unknown_op" }
+{ "error": "request_too_large" }
+```
+
+**Authentication.** The same `NONO_SESSION_TOKEN` injected into the
+sandboxed child gates this socket. Validation uses constant-time
+comparison via `subtle::ConstantTimeEq`. On token failure the dispatcher
+writes `{"error":"unauthenticated"}` and closes — it does NOT invoke the
+approval gate or mutate the allowlist.
+
+**Dispatch flow.** The endpoint mirrors `policy::apply`'s on-mismatch
+flow:
+
+1. `AllowlistStore::is_approved(&key)` → on hit, return `allow_once`
+   (without prompting).
+2. On miss, derive `(command, args, reason)` from the key's payload and
+   call `ApprovalGate::approve_with_save_option(...)`.
+3. If the verdict is `AllowAlways`, persist via `AllowlistStore::record`
+   before responding (warn-and-continue on persistence error, same as
+   `apply`).
+4. Return the verdict.
+
 ### Audit Trail
 
 Every supervised session automatically records command, timing, exit code, network events, and cryptographic snapshot commitments as structured JSON. Opt out with `--no-audit`.

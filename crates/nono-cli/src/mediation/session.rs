@@ -164,6 +164,11 @@ pub fn setup(
     let socket_path = session_dir.join("mediation.sock");
     let control_socket_path = session_dir.join("control.sock");
     let audit_socket_path = session_dir.join("audit.sock");
+    // Sibling socket for the cross-process approval IPC. Same length-prefixed
+    // JSON framing, same NONO_SESSION_TOKEN auth as `mediation.sock`. Used
+    // out-of-process by plans 4.1 / 4.3 shell wrappers; plan 4.2 itself does
+    // not consume it (apply uses the in-process AllowlistStore directly).
+    let approve_socket_path = session_dir.join("approve.sock");
 
     std::fs::create_dir_all(&shim_dir).map_err(|e| {
         NonoError::SandboxInit(format!(
@@ -387,6 +392,26 @@ pub fn setup(
             super::control::run_control_server(ctrl_sock, ctrl_token, ctrl_admin, ctrl_sdir).await
         {
             tracing::error!("control server error: {}", e);
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // Start the /approve IPC server (sibling socket for out-of-process callers)
+    // -------------------------------------------------------------------------
+    let approve_sock = approve_socket_path.clone();
+    let approve_token: Arc<str> = Arc::from(session_token.as_str());
+    let approve_allowlist = Arc::clone(&allowlist);
+    let approve_gate = Arc::clone(&approval_gate);
+    runtime.spawn(async move {
+        if let Err(e) = super::approve_ipc::run(
+            approve_sock,
+            approve_token,
+            approve_allowlist,
+            approve_gate,
+        )
+        .await
+        {
+            tracing::error!("approve IPC error: {}", e);
         }
     });
 
