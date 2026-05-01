@@ -41,6 +41,9 @@ pub struct ResolvedIntercept {
     pub exit_code: i32,
     /// If true, requires user authentication before the action executes.
     pub admin: bool,
+    /// Optional capability scope for nonces issued by this rule's
+    /// `Capture` action. Absent = unscoped (any consumer may redeem).
+    pub nonce_scope: Option<Vec<String>>,
 }
 
 /// `ArgvShape` with `$VAR` tokens expanded at profile-load time.
@@ -573,12 +576,14 @@ fn resolve_command(
                     0,
                 ),
             };
+            let nonce_scope = rule.nonce_scope.as_ref().map(|ns| ns.consumers.clone());
             Ok(ResolvedIntercept {
                 args_prefix,
                 argv_shape,
                 action,
                 exit_code,
                 admin: rule.admin,
+                nonce_scope,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1141,5 +1146,50 @@ mod tests {
         // Re-derive using the same logic as setup()
         let derived = session_dir_path().join("control.sock");
         assert_eq!(expected, derived);
+    }
+
+    #[test]
+    fn test_resolve_command_carries_nonce_scope_into_resolved_intercept() {
+        use crate::mediation::{CommandEntry, InterceptAction, InterceptRule, NonceScope};
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+
+        // Real binary + shim so resolution proceeds past binary_path / symlink.
+        let fake_binary = tmp.path().join("ddtool");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let entry = CommandEntry {
+            name: "ddtool".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![InterceptRule {
+                args_prefix: vec![
+                    "auth".to_string(),
+                    "github".to_string(),
+                    "token".to_string(),
+                ],
+                argv_shape: None,
+                admin: false,
+                action: InterceptAction::Capture { script: None },
+                nonce_scope: Some(NonceScope {
+                    consumers: vec!["gh".to_string(), "git".to_string()],
+                }),
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let workdir = tmp.path();
+        let resolved = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir)
+            .expect("resolve")
+            .expect("present");
+        let scope = resolved.intercepts[0]
+            .nonce_scope
+            .as_ref()
+            .expect("scope present");
+        assert_eq!(scope, &vec!["gh".to_string(), "git".to_string()]);
     }
 }

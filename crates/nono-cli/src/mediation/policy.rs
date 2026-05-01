@@ -1627,6 +1627,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
         // Default caller_policy from make_cmd.
         assert!(cmd.caller_policy.agent_allowed);
@@ -1689,6 +1690,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
         cmd.caller_policy = CallerPolicy {
             agent_allowed: false,
@@ -1796,6 +1798,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
         // Confirm default state.
         assert!(cmd.caller_policy.allowed_parents.is_none());
@@ -1833,6 +1836,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -1901,6 +1905,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         };
         let fallback = ResolvedIntercept {
             args_prefix: vec!["find-generic-password".to_string()],
@@ -1910,6 +1915,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         };
         let cmd = ResolvedCommand {
             name: "security".to_string(),
@@ -1991,6 +1997,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         };
         let cmd = ResolvedCommand {
             name: "security".to_string(),
@@ -2059,6 +2066,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         };
         let fallback = ResolvedIntercept {
             args_prefix: vec!["find-generic-password".to_string()],
@@ -2068,6 +2076,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         };
         let cmd = ResolvedCommand {
             name: "security".to_string(),
@@ -2136,6 +2145,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         };
         let cmd = ResolvedCommand {
             name: "security".to_string(),
@@ -2200,6 +2210,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         };
         let cmd = ResolvedCommand {
             name: "security".to_string(),
@@ -2337,6 +2348,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -2372,6 +2384,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -2407,6 +2420,7 @@ mod tests {
             },
             exit_code: 0,
             admin: true,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -2442,6 +2456,7 @@ mod tests {
             },
             exit_code: 0,
             admin: true,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -2478,6 +2493,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -2806,6 +2822,7 @@ mod tests {
             action: ResolvedAction::Capture { script: None },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
         // Use a command that outputs something: `echo hello` → "hello"
         let cmd = ResolvedCommand {
@@ -2856,6 +2873,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -3336,6 +3354,7 @@ mod tests {
                 action: ResolvedAction::Approve { script: None },
                 exit_code: 0,
                 admin: false,
+                nonce_scope: None,
             }],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -3670,6 +3689,7 @@ mod tests {
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let (child_in, _test_in) = UnixStream::pair().expect("pair stdin");
