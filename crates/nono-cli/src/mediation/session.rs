@@ -707,6 +707,7 @@ mod tests {
                     "$NONO_TEST_RESOLVE_CMD_USER".to_string(),
                     "Claude Code-credentials".to_string(),
                 ],
+                argv_shape: None,
                 admin: false,
                 action: InterceptAction::Respond {
                     stdout: String::new(),

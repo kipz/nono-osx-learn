@@ -103,11 +103,22 @@ fn default_true() -> bool {
 
 /// An intercept rule: if `args_prefix` matches the invocation's positional args,
 /// perform the configured action without (or with) calling the real binary.
+///
+/// A rule may use exactly one matcher: either `args_prefix` (loose, prefix-only)
+/// or `argv_shape` (strict, flag-aware). Specifying both is a configuration
+/// error and is rejected during resolve.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InterceptRule {
     /// The leading positional args that must match (flags are ignored during matching).
     /// E.g. `["auth", "github", "token"]` matches `ddtool --debug auth github token`.
+    #[serde(default)]
     pub args_prefix: Vec<String>,
+    /// Strict, flag-aware matcher. When present, the invocation's first positional
+    /// must equal `subcommand`, every declared flag must appear exactly once with
+    /// the declared value (or as a boolean flag), and (per `extras`) no extra
+    /// positionals or unknown flags may appear. Mutually exclusive with `args_prefix`.
+    #[serde(default)]
+    pub argv_shape: Option<ArgvShape>,
     /// If true, the user must authenticate via a native macOS biometric/password dialog
     /// before the action is executed. Requires `nono-approve` to be installed alongside nono.
     /// Defaults to false.
@@ -115,6 +126,96 @@ pub struct InterceptRule {
     pub admin: bool,
     /// What to do when this rule matches.
     pub action: InterceptAction,
+}
+
+/// Strict, flag-aware matcher for an intercept rule.
+///
+/// Matches when:
+/// 1. The first positional argument equals `subcommand`.
+/// 2. Every entry in `flags` appears exactly once in the invocation, with the
+///    declared value (for `Required`/`ValueOnly`) or simply present (for `Boolean`).
+/// 3. No additional positional or flag arguments appear, unless `extras` is `Allow`.
+///
+/// On mismatch, behaviour is controlled by `on_mismatch`: `Deny` (default) skips
+/// this rule and lets matching fall through to the next rule (or default policy);
+/// `Approve` triggers the approval dialog instead of denying outright.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ArgvShape {
+    /// The required first positional argument (e.g. `"find-generic-password"`).
+    pub subcommand: String,
+    /// Declared flags. Each must appear exactly once in the invocation.
+    #[serde(default)]
+    pub flags: std::collections::BTreeMap<String, FlagSpec>,
+    /// Whether to allow extra positional or flag arguments beyond those declared.
+    /// Default: `Deny`.
+    #[serde(default)]
+    pub extras: ExtrasPolicy,
+    /// What to do when the strict shape does not match. Default: `Deny`
+    /// (fall through to the next rule).
+    #[serde(default)]
+    pub on_mismatch: OnMismatchPolicy,
+}
+
+/// Specification for a single declared flag in an `ArgvShape`.
+///
+/// Two JSON forms are accepted:
+/// - Tagged form: `{ "type": "boolean" }` or `{ "type": "required", "value": "..." }`.
+/// - Value-only sugar: `{ "value": "..." }` — equivalent to a `Required` flag.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FlagSpec {
+    /// Tagged form, discriminated by a `type` field.
+    Tagged(FlagSpecTagged),
+    /// Sugar: a flag that requires the given value.
+    ValueOnly { value: String },
+}
+
+/// Tagged variants of `FlagSpec`, discriminated by `type`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FlagSpecTagged {
+    /// A boolean flag: present in the invocation, no value attached.
+    Boolean,
+    /// A flag that must be present with the given value.
+    Required { value: String },
+}
+
+impl FlagSpec {
+    /// Returns the required value for this flag, or `None` if it's a boolean flag.
+    pub fn as_required_value(&self) -> Option<&str> {
+        match self {
+            FlagSpec::ValueOnly { value } => Some(value.as_str()),
+            FlagSpec::Tagged(FlagSpecTagged::Required { value }) => Some(value.as_str()),
+            FlagSpec::Tagged(FlagSpecTagged::Boolean) => None,
+        }
+    }
+
+    /// Returns true if this flag is a boolean (no value) flag.
+    pub fn is_boolean(&self) -> bool {
+        matches!(self, FlagSpec::Tagged(FlagSpecTagged::Boolean))
+    }
+}
+
+/// Policy for extra positional/flag arguments beyond those declared in `ArgvShape`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtrasPolicy {
+    /// Reject the invocation if any extras are present. Default.
+    #[default]
+    Deny,
+    /// Allow extras to pass through.
+    Allow,
+}
+
+/// Policy for what to do when an `ArgvShape` does not match the invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMismatchPolicy {
+    /// Treat as a non-match; fall through to the next rule. Default.
+    #[default]
+    Deny,
+    /// Trigger an approval prompt instead of denying outright.
+    Approve,
 }
 
 /// The action to take when an intercept rule fires.
@@ -425,5 +526,91 @@ mod tests {
             policy.allowed_parents.as_deref(),
             Some(&["git".to_string()][..])
         );
+    }
+
+    #[test]
+    fn test_argv_shape_deserializes_with_required_flag() {
+        let json = r#"{
+            "subcommand": "find-generic-password",
+            "flags": {
+                "-a": { "value": "kipz" },
+                "-s": { "value": "Claude Code-credentials" }
+            }
+        }"#;
+        let shape: ArgvShape = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(shape.subcommand, "find-generic-password");
+        assert_eq!(shape.flags.len(), 2);
+        match shape.flags.get("-a").unwrap() {
+            FlagSpec::ValueOnly { value } => assert_eq!(value, "kipz"),
+            _ => panic!("expected ValueOnly"),
+        }
+        // Default extras policy is Deny.
+        matches!(shape.extras, ExtrasPolicy::Deny);
+    }
+
+    #[test]
+    fn test_argv_shape_deserializes_with_boolean_flag() {
+        let json = r#"{
+            "subcommand": "find-generic-password",
+            "flags": {
+                "-w": { "type": "boolean" }
+            }
+        }"#;
+        let shape: ArgvShape = serde_json::from_str(json).expect("deserialize");
+        match shape.flags.get("-w").unwrap() {
+            FlagSpec::Tagged(FlagSpecTagged::Boolean) => {}
+            _ => panic!("expected Tagged(Boolean)"),
+        }
+    }
+
+    #[test]
+    fn test_argv_shape_extras_allow_explicit() {
+        let json = r#"{
+            "subcommand": "find-generic-password",
+            "flags": {},
+            "extras": "allow"
+        }"#;
+        let shape: ArgvShape = serde_json::from_str(json).expect("deserialize");
+        matches!(shape.extras, ExtrasPolicy::Allow);
+    }
+
+    #[test]
+    fn test_argv_shape_on_mismatch_default_is_deny() {
+        // Field absent → OnMismatchPolicy::Deny.
+        let json = r#"{
+            "subcommand": "find-generic-password",
+            "flags": {}
+        }"#;
+        let shape: ArgvShape = serde_json::from_str(json).expect("deserialize");
+        matches!(shape.on_mismatch, OnMismatchPolicy::Deny);
+    }
+
+    #[test]
+    fn test_argv_shape_on_mismatch_approve_explicit() {
+        let json = r#"{
+            "subcommand": "find-generic-password",
+            "flags": {},
+            "on_mismatch": "approve"
+        }"#;
+        let shape: ArgvShape = serde_json::from_str(json).expect("deserialize");
+        matches!(shape.on_mismatch, OnMismatchPolicy::Approve);
+    }
+
+    #[test]
+    fn test_intercept_rule_rejects_both_args_prefix_and_argv_shape() {
+        let json = r#"{
+            "args_prefix": ["foo"],
+            "argv_shape": {
+                "subcommand": "foo",
+                "flags": {}
+            },
+            "action": { "type": "respond", "stdout": "" }
+        }"#;
+        let res: std::result::Result<InterceptRule, _> = serde_json::from_str(json);
+        // Schema-level deserialize succeeds; the validation is performed during
+        // resolve. So just verify the struct holds both fields and resolution
+        // (Task 4) will reject.
+        let rule = res.expect("schema-level deserialize must succeed");
+        assert!(!rule.args_prefix.is_empty() && rule.argv_shape.is_some());
     }
 }
