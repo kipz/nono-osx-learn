@@ -472,6 +472,94 @@ pub fn subcommand_matches(prefix: &[String], args: &[String]) -> bool {
     prefix.iter().zip(positional.iter()).all(|(p, a)| p == *a)
 }
 
+/// Match an invocation against a strict `ResolvedArgvShape`.
+///
+/// Returns Ok(()) on match, Err(reason) on no-match. The Err carries a short
+/// reason string useful for tracing/audit. Callers should treat any Err the
+/// same way (no match → fall through to the next intercept rule or to
+/// passthrough); the reason is not surfaced to the agent.
+///
+/// Matching semantics (see `ArgvShape` doc):
+/// - args[0] must equal shape.subcommand.
+/// - Each declared flag must appear exactly once with the declared value
+///   (or with no value if Boolean).
+/// - With ExtrasPolicy::Deny, any unknown flag or extra positional after
+///   args[0] causes a no-match.
+/// - With ExtrasPolicy::Allow, extras are tolerated; required-flag rules
+///   still apply.
+pub fn argv_shape_matches(
+    shape: &super::session::ResolvedArgvShape,
+    args: &[String],
+) -> std::result::Result<(), String> {
+    use super::session::ResolvedFlagSpec;
+    use super::ExtrasPolicy;
+
+    if args.is_empty() || args[0] != shape.subcommand {
+        return Err(format!(
+            "subcommand mismatch (want '{}', got args[0]={:?})",
+            shape.subcommand,
+            args.first()
+        ));
+    }
+
+    // Walk the rest of args left-to-right, tracking which declared flags
+    // we have seen (each must appear exactly once).
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut i = 1usize;
+    while i < args.len() {
+        let token = args[i].as_str();
+
+        if let Some(spec) = shape.flags.get(token) {
+            if !seen.insert(token) {
+                return Err(format!("flag '{}' appears more than once", token));
+            }
+            match spec {
+                ResolvedFlagSpec::Required { value } => {
+                    let next = args
+                        .get(i + 1)
+                        .ok_or_else(|| format!("flag '{}' missing required value", token))?;
+                    if next != value {
+                        return Err(format!(
+                            "flag '{}' value mismatch (want '{}', got '{}')",
+                            token, value, next
+                        ));
+                    }
+                    i += 2;
+                }
+                ResolvedFlagSpec::Boolean => {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Token not in declared flags. Either an unknown flag or an extra
+        // positional. Both are governed by `extras`.
+        match shape.extras {
+            ExtrasPolicy::Deny => {
+                return Err(format!("unknown token '{}' (extras=Deny)", token));
+            }
+            ExtrasPolicy::Allow => {
+                // Skip unknown token. If it looks like a flag with a value
+                // (`-X foo`), we cannot know whether it consumes the next
+                // arg. Be conservative: skip just this token. The next iter
+                // will inspect the would-be-value; if it equals one of our
+                // declared flags, we will see it (correct); if it equals
+                // some unknown token, extras=Allow tolerates that too.
+                i += 1;
+            }
+        }
+    }
+
+    // Verify every declared flag was seen.
+    for declared in shape.flags.keys() {
+        if !seen.contains(declared.as_str()) {
+            return Err(format!("required flag '{}' not present", declared));
+        }
+    }
+    Ok(())
+}
+
 /// Execute a shell script and collect its output.
 ///
 /// Uses the same strict env-building as `exec_passthrough`: starts from the
@@ -1780,6 +1868,222 @@ mod tests {
                 "-w".to_string(),
             ]
         ));
+    }
+
+    // --- argv_shape_matches tests ---
+
+    use crate::mediation::session::ResolvedArgvShape;
+    use crate::mediation::session::ResolvedFlagSpec;
+    use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+    fn shape(
+        subcommand: &str,
+        flags: &[(&str, ResolvedFlagSpec)],
+        extras: ExtrasPolicy,
+    ) -> ResolvedArgvShape {
+        ResolvedArgvShape {
+            subcommand: subcommand.to_string(),
+            flags: flags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            extras,
+            on_mismatch: OnMismatchPolicy::Deny,
+        }
+    }
+
+    fn req(value: &str) -> ResolvedFlagSpec {
+        ResolvedFlagSpec::Required {
+            value: value.to_string(),
+        }
+    }
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn test_argv_shape_matches_canonical_security_invocation() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz")), ("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        assert!(argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials", "-w"]),
+        ).is_err()); // "-w" is an extra → Deny → no match
+    }
+
+    #[test]
+    fn test_argv_shape_matches_when_no_extras() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz")), ("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials"]),
+        );
+        assert!(r.is_ok(), "expected match, got: {:?}", r);
+    }
+
+    #[test]
+    fn test_argv_shape_matches_with_boolean_flag() {
+        let shape = shape(
+            "find-generic-password",
+            &[
+                ("-a", req("kipz")),
+                ("-s", req("Claude Code-credentials")),
+                ("-w", ResolvedFlagSpec::Boolean),
+            ],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials", "-w"]),
+        );
+        assert!(r.is_ok(), "expected match, got: {:?}", r);
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_duplicate_required_flag() {
+        // The bypass: agent passes `-s Claude Code-credentials -s evil-service`.
+        // security itself uses the LAST -s value (evil-service) but a prefix
+        // matcher would happily approve based on the FIRST one. The shape
+        // matcher must reject duplicates.
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz")), ("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials", "-s", "evil-service"]),
+        );
+        assert!(r.is_err(), "duplicate -s must reject the match");
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_wrong_flag_value() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-s", "wrong-service"]),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_missing_required_flag() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz")), ("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-s", "Claude Code-credentials"]),
+        );
+        assert!(r.is_err(), "missing -a must reject");
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_unknown_flag_when_extras_deny() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-x", "anything"]),
+        );
+        assert!(r.is_err(), "unknown flag with extras=Deny must reject");
+    }
+
+    #[test]
+    fn test_argv_shape_tolerates_unknown_flag_when_extras_allow() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz"))],
+            ExtrasPolicy::Allow,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-x", "anything"]),
+        );
+        assert!(r.is_ok(), "unknown flag with extras=Allow must match");
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_wrong_subcommand() {
+        let shape = shape("find-generic-password", &[], ExtrasPolicy::Deny);
+        let r = argv_shape_matches(&shape, &s(&["delete-generic-password"]));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_extra_positional_when_extras_deny() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "extra-positional", "-a", "kipz"]),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_argv_shape_boolean_flag_must_not_consume_next_arg() {
+        // -w is boolean; the "kipz" that follows is the value of -a, not -w.
+        let shape = shape(
+            "find-generic-password",
+            &[("-w", ResolvedFlagSpec::Boolean), ("-a", req("kipz"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-w", "-a", "kipz"]),
+        );
+        assert!(r.is_ok(), "-w must not consume -a; got: {:?}", r);
+    }
+
+    /// Boundary test for the documented `extras=Allow` "skip just this token"
+    /// semantic. argv is `["sub", "-x", "-a", "evil"]` with declared `-a $USER`.
+    /// The matcher walks left-to-right: `-x` is unknown — under extras=Allow it
+    /// is skipped (just this token, not the next). The next iter inspects `-a`,
+    /// which IS declared as Required("kipz"). Its value-arg is "evil" (≠ "kipz"),
+    /// so the match fails on the `-a` value mismatch — NOT because `-x` consumed
+    /// `-a`. This pins down the conservative "skip one token" semantic from
+    /// `argv_shape_matches`'s extras=Allow branch (see policy.rs comments). If
+    /// a future refactor changes that branch to also skip the value-arg of an
+    /// unknown flag, this test will start failing — which is the intended
+    /// signal for re-reviewing the security implications.
+    #[test]
+    fn test_argv_shape_extras_allow_skips_only_unknown_token_not_its_value() {
+        let shape = shape(
+            "sub",
+            &[("-a", req("kipz"))],
+            ExtrasPolicy::Allow,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["sub", "-x", "-a", "evil"]),
+        );
+        assert!(
+            r.is_err(),
+            "declared -a must consume 'evil' (the token after -a) and reject the value mismatch; got: {:?}",
+            r
+        );
     }
 
     // --- Capture tests ---
