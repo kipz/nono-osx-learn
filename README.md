@@ -625,6 +625,38 @@ flow:
    `apply`).
 4. Return the verdict.
 
+### `parent_sandbox` — per-parent sandbox override
+
+When a mediated command is invoked from a mediated parent (e.g. `gh` shells out to `git`), the per-command `sandbox` applies regardless of the caller. To express "git invoked from gh has tighter capabilities than git invoked from the agent", declare a `parent_sandbox` map on `caller_policy`:
+
+```json
+{
+  "caller_policy": {
+    "agent_allowed": true,
+    "allowed_parents": ["gh", "git"],
+    "parent_sandbox": {
+      "gh": {
+        "fs_read": ["."],
+        "fs_read_file": ["~/.gitconfig"],
+        "network": { "block": true }
+      }
+    }
+  }
+}
+```
+
+When the resolved parent name matches a key in `parent_sandbox`, the mediation server uses that sandbox at exec instead of the default `sandbox`. Parents not listed (and the agent caller) continue to use the default.
+
+| Constraint | |
+|---|---|
+| Map keys must be in `allowed_parents` (if set) | else the entry is unreachable; rejected at profile-load. |
+| The command must have a default `sandbox` | else there is no fallback for agents and unlisted parents; rejected at profile-load. |
+| The override fully replaces the default for that parent | no merging; copy unchanged fields if needed. |
+
+#### `deny_agent_strict` — opt out of the approval gate
+
+The caller-policy gate (when `agent_allowed: false` or `allowed_parents` is set and the parent doesn't match) consults `ApprovalGate::approve_with_save_option` by default — the user can `[a]llow once`, `[r]emember`, or `[d]eny`. Set `caller_policy.deny_agent_strict: true` to disable the gate for the `agent_allowed:false` rejection branch and preserve the original hard-deny (exit 126) semantic. Used for security-critical commands where AllowAlways would re-open known regressions (e.g. `ssh`, `ssh-keygen`).
+
 ### Audit Trail
 
 Every supervised session automatically records command, timing, exit code, network events, and cryptographic snapshot commitments as structured JSON. Opt out with `--no-audit`.
