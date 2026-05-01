@@ -545,7 +545,7 @@ mod tests {
             _ => panic!("expected ValueOnly"),
         }
         // Default extras policy is Deny.
-        matches!(shape.extras, ExtrasPolicy::Deny);
+        assert!(matches!(shape.extras, ExtrasPolicy::Deny));
     }
 
     #[test]
@@ -571,7 +571,7 @@ mod tests {
             "extras": "allow"
         }"#;
         let shape: ArgvShape = serde_json::from_str(json).expect("deserialize");
-        matches!(shape.extras, ExtrasPolicy::Allow);
+        assert!(matches!(shape.extras, ExtrasPolicy::Allow));
     }
 
     #[test]
@@ -582,7 +582,7 @@ mod tests {
             "flags": {}
         }"#;
         let shape: ArgvShape = serde_json::from_str(json).expect("deserialize");
-        matches!(shape.on_mismatch, OnMismatchPolicy::Deny);
+        assert!(matches!(shape.on_mismatch, OnMismatchPolicy::Deny));
     }
 
     #[test]
@@ -593,7 +593,7 @@ mod tests {
             "on_mismatch": "approve"
         }"#;
         let shape: ArgvShape = serde_json::from_str(json).expect("deserialize");
-        matches!(shape.on_mismatch, OnMismatchPolicy::Approve);
+        assert!(matches!(shape.on_mismatch, OnMismatchPolicy::Approve));
     }
 
     #[test]
