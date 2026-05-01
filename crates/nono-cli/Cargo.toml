@@ -53,6 +53,7 @@ dirs = "6"
 walkdir = "2"
 ignore.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
 
 # Signing key PKCS#8 serialization (already transitive via sigstore-verify)
 aws-lc-rs = "1"

@@ -14,6 +14,7 @@
 //! lives in the profile's `mediation` section.
 
 pub mod admin;
+pub mod allowlist;
 pub mod approval;
 pub mod broker;
 pub mod control;
