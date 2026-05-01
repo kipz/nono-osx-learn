@@ -106,10 +106,16 @@ pub async fn apply(
     broker: Arc<TokenBroker>,
     ctx: &SessionCtx<'_>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
+    allowlist: Arc<super::allowlist::AllowlistStore>,
     stdin_fd: OwnedFd,
     stdout_fd: OwnedFd,
     stderr_fd: OwnedFd,
 ) -> (ShimResponse, &'static str) {
+    // Note: `allowlist` is not yet consumed by the caller-policy gate below —
+    // plan 4.1 will wire it into the on_mismatch=Approve flow there. It is
+    // threaded through `apply` once now so future plans can reuse it without
+    // another plumbing pass. The argv_shape branch (further down) is the
+    // first consumer.
     // Find matching command entry
     let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
         warn!("mediation: unknown command '{}'", request.command);
@@ -221,10 +227,95 @@ pub async fn apply(
 
     // Check intercept rules in order
     for rule in &cmd.intercepts {
-        if subcommand_matches(&rule.args_prefix, &request.args) {
+        // Decide whether this rule fires for this invocation. Three outcomes:
+        //   - matched=true: rule fires; proceed to action below.
+        //   - matched=false: rule does NOT fire; continue the for-loop.
+        //   - early-return with exit 126: argv_shape on_mismatch=Approve +
+        //     Deny verdict.
+        let matched = match &rule.argv_shape {
+            Some(shape) => match argv_shape_matches(shape, &request.args) {
+                Ok(()) => true,
+                Err(reason) => match shape.on_mismatch {
+                    super::OnMismatchPolicy::Deny => false,
+                    super::OnMismatchPolicy::Approve => {
+                        // Build the allowlist key for this argv-shape mismatch.
+                        // Plans 4.1 / 4.3 will use other variants against the
+                        // same store.
+                        let key = super::allowlist::AllowlistKey {
+                            kind: super::allowlist::AllowlistKind::ArgvShape,
+                            payload: serde_json::json!({
+                                "cmd": &request.command,
+                                "argv": &request.args,
+                            }),
+                        };
+                        if allowlist.is_approved(&key) {
+                            debug!(
+                                "mediation: argv_shape mismatch for '{}' but allowlisted; treating as match",
+                                request.command
+                            );
+                            true
+                        } else {
+                            // Pop the approval dialog. The reason is
+                            // included so the user sees WHY the strict
+                            // matcher rejected this exact argv.
+                            let cmd_name = request.command.clone();
+                            let cmd_args = request.args.clone();
+                            let reason_msg = format!(
+                                "argv shape mismatch on rule for '{}': {}",
+                                cmd_name, reason
+                            );
+                            let approval_clone = Arc::clone(&approval);
+                            let verdict = tokio::task::spawn_blocking(move || {
+                                approval_clone.approve_with_save_option(
+                                    &cmd_name,
+                                    &cmd_args,
+                                    &reason_msg,
+                                )
+                            })
+                            .await
+                            .unwrap_or(super::approval::ApprovalVerdict::Deny);
+
+                            match verdict {
+                                super::approval::ApprovalVerdict::AllowOnce => true,
+                                super::approval::ApprovalVerdict::AllowAlways => {
+                                    if let Err(e) = allowlist.record(&key) {
+                                        warn!(
+                                            "mediation: allowlist record failed for '{}': {}",
+                                            request.command, e
+                                        );
+                                        // Treat as Allow-once on persistence failure.
+                                    }
+                                    true
+                                }
+                                super::approval::ApprovalVerdict::Deny => {
+                                    drop(stdin_fd);
+                                    drop(stdout_fd);
+                                    drop(stderr_fd);
+                                    return (
+                                        ShimResponse {
+                                            stdout: String::new(),
+                                            stderr: format!(
+                                                "nono: '{}' was not approved\n",
+                                                request.command
+                                            ),
+                                            exit_code: 126,
+                                        },
+                                        "denied",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                },
+            },
+            None => subcommand_matches(&rule.args_prefix, &request.args),
+        };
+        if matched {
             debug!(
-                "mediation: intercepting '{}' with prefix {:?}",
-                request.command, rule.args_prefix
+                "mediation: intercepting '{}' (prefix={:?}, argv_shape={})",
+                request.command,
+                rule.args_prefix,
+                rule.argv_shape.is_some()
             );
 
             // Admin gate: require user authentication before executing this rule.
@@ -1300,12 +1391,35 @@ mod tests {
     /// continue to assert on `resp.stdout`/`resp.stderr` regardless of
     /// whether the path was streaming (passthrough) or buffered (Capture/
     /// Respond/Approve).
+    /// Build a fresh tempdir-backed allowlist for tests. The tempdir is
+    /// leaked so its lifetime spans the test process — acceptable here.
+    fn make_allowlist() -> Arc<crate::mediation::allowlist::AllowlistStore> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("argv-allowlist.json");
+        std::mem::forget(dir);
+        Arc::new(
+            crate::mediation::allowlist::AllowlistStore::open_at(path)
+                .expect("open allowlist"),
+        )
+    }
+
     async fn apply_capture(
         req: ShimRequest,
         cmds: &[ResolvedCommand],
         broker: Arc<TokenBroker>,
         ctx: &SessionCtx<'_>,
         approval: Arc<dyn ApprovalGate + Send + Sync>,
+    ) -> (ShimResponse, &'static str) {
+        apply_capture_with_allowlist(req, cmds, broker, ctx, approval, make_allowlist()).await
+    }
+
+    async fn apply_capture_with_allowlist(
+        req: ShimRequest,
+        cmds: &[ResolvedCommand],
+        broker: Arc<TokenBroker>,
+        ctx: &SessionCtx<'_>,
+        approval: Arc<dyn ApprovalGate + Send + Sync>,
+        allowlist: Arc<crate::mediation::allowlist::AllowlistStore>,
     ) -> (ShimResponse, &'static str) {
         let (stdin_fd, stdout_fd, stderr_fd, harness) = make_passthrough_fds();
 
@@ -1329,7 +1443,7 @@ mod tests {
         });
 
         let (mut resp, action) = apply(
-            req, cmds, broker, ctx, approval, stdin_fd, stdout_fd, stderr_fd,
+            req, cmds, broker, ctx, approval, allowlist, stdin_fd, stdout_fd, stderr_fd,
         )
         .await;
 
@@ -1615,6 +1729,469 @@ mod tests {
         .await;
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout, "static_output\n");
+    }
+
+    // --- argv_shape integration tests ---
+
+    /// End-to-end: an `argv_shape` rule with extras=Deny rejects the
+    /// duplicate-`-s` bypass. The malicious invocation falls through to a
+    /// fallback rule, NOT the strict rule's output.
+    #[tokio::test]
+    async fn test_apply_argv_shape_rejects_duplicate_flag_bypass() {
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m.insert(
+                        "-s".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "Claude Code-credentials".to_string(),
+                        },
+                    );
+                    m.insert("-w".to_string(), ResolvedFlagSpec::Boolean);
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Deny,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "STRICT_APPROVED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        };
+        let fallback = ResolvedIntercept {
+            args_prefix: vec!["find-generic-password".to_string()],
+            argv_shape: None,
+            action: ResolvedAction::Respond {
+                stdout: "FALLBACK_CAPTURE\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict, fallback],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        // Malicious: appends a second `-s evil-service`.
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec![
+                "find-generic-password".to_string(),
+                "-a".to_string(),
+                "tester".to_string(),
+                "-s".to_string(),
+                "Claude Code-credentials".to_string(),
+                "-s".to_string(),
+                "evil-service".to_string(),
+                "-w".to_string(),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+        assert_eq!(
+            resp.stdout, "FALLBACK_CAPTURE\n",
+            "duplicate-flag attack must NOT match strict rule; got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Canonical invocation hits the strict rule.
+    #[tokio::test]
+    async fn test_apply_argv_shape_matches_canonical_invocation() {
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m.insert(
+                        "-s".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "Claude Code-credentials".to_string(),
+                        },
+                    );
+                    m.insert("-w".to_string(), ResolvedFlagSpec::Boolean);
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Deny,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "STRICT_APPROVED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec![
+                "find-generic-password".to_string(),
+                "-a".to_string(),
+                "tester".to_string(),
+                "-s".to_string(),
+                "Claude Code-credentials".to_string(),
+                "-w".to_string(),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+        assert_eq!(resp.stdout, "STRICT_APPROVED\n");
+    }
+
+    /// argv_shape with on_mismatch=Approve and a Deny verdict from the gate
+    /// returns exit 126 and does NOT fall through to the next rule.
+    #[tokio::test]
+    async fn test_apply_argv_shape_on_mismatch_approve_deny_returns_126() {
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Approve,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "MATCHED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        };
+        let fallback = ResolvedIntercept {
+            args_prefix: vec!["find-generic-password".to_string()],
+            argv_shape: None,
+            action: ResolvedAction::Respond {
+                stdout: "FALLBACK\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict, fallback],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        // Mismatching args (no -a) trigger Approve flow with AlwaysDeny gate.
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec!["find-generic-password".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_deny(),
+        )
+        .await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        // CRUCIAL: must NOT have fallen through to the FALLBACK rule.
+        assert_ne!(
+            resp.stdout, "FALLBACK\n",
+            "Approve+Deny must short-circuit, not fall through"
+        );
+    }
+
+    /// argv_shape with on_mismatch=Approve and an AllowOnce verdict treats
+    /// the rule as matched — its action fires.
+    #[tokio::test]
+    async fn test_apply_argv_shape_on_mismatch_approve_allow_once_fires_action() {
+        use crate::mediation::approval::AlwaysAllowOnce;
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Approve,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "MATCHED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec!["find-generic-password".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let approval: Arc<dyn ApprovalGate + Send + Sync> = Arc::new(AlwaysAllowOnce);
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            approval,
+        )
+        .await;
+        assert_eq!(resp.stdout, "MATCHED\n");
+    }
+
+    /// argv_shape with on_mismatch=Approve and an AllowAlways verdict
+    /// records the (command, argv) tuple in the allowlist AND fires the
+    /// action. A second invocation with the same argv hits the allowlist
+    /// and skips the prompt — even with a Deny gate.
+    #[tokio::test]
+    async fn test_apply_argv_shape_on_mismatch_approve_allow_always_persists() {
+        use crate::mediation::approval::{AlwaysAllowAlways, AlwaysDeny};
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Approve,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "MATCHED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        // Single shared allowlist across both invocations.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let allowlist = Arc::new(
+            crate::mediation::allowlist::AllowlistStore::open_at(
+                dir.path().join("argv-allowlist.json"),
+            )
+            .expect("open"),
+        );
+
+        // First invocation: AlwaysAllowAlways -> record + fire.
+        {
+            let req = ShimRequest {
+                command: "security".to_string(),
+                args: vec!["find-generic-password".to_string()],
+                session_token: String::new(),
+                ..Default::default()
+            };
+            let approval: Arc<dyn ApprovalGate + Send + Sync> = Arc::new(AlwaysAllowAlways);
+            let (resp, _) = apply_capture_with_allowlist(
+                req,
+                std::slice::from_ref(&cmd),
+                make_broker(),
+                &SessionCtx {
+                    shim_dir: std::path::Path::new("/tmp"),
+                    socket_path: std::path::Path::new("/tmp/test.sock"),
+                    session_token: "test_token",
+                    workdir: std::path::Path::new("/tmp"),
+                },
+                approval,
+                Arc::clone(&allowlist),
+            )
+            .await;
+            assert_eq!(resp.stdout, "MATCHED\n", "first invocation should fire action");
+        }
+
+        // Verify the allowlist actually persisted the entry.
+        let key = crate::mediation::allowlist::AllowlistKey {
+            kind: crate::mediation::allowlist::AllowlistKind::ArgvShape,
+            payload: serde_json::json!({
+                "cmd": "security",
+                "argv": ["find-generic-password"],
+            }),
+        };
+        assert!(
+            allowlist.is_approved(&key),
+            "AllowAlways must record to the allowlist"
+        );
+
+        // Second invocation: SAME args, AlwaysDeny gate. Allowlist hit means
+        // we skip the prompt entirely; gate is never consulted.
+        {
+            let req = ShimRequest {
+                command: "security".to_string(),
+                args: vec!["find-generic-password".to_string()],
+                session_token: String::new(),
+                ..Default::default()
+            };
+            let approval: Arc<dyn ApprovalGate + Send + Sync> = Arc::new(AlwaysDeny);
+            let (resp, _) = apply_capture_with_allowlist(
+                req,
+                &[cmd],
+                make_broker(),
+                &SessionCtx {
+                    shim_dir: std::path::Path::new("/tmp"),
+                    socket_path: std::path::Path::new("/tmp/test.sock"),
+                    session_token: "test_token",
+                    workdir: std::path::Path::new("/tmp"),
+                },
+                approval,
+                Arc::clone(&allowlist),
+            )
+            .await;
+            assert_eq!(
+                resp.stdout, "MATCHED\n",
+                "second invocation should hit allowlist and skip the deny gate"
+            );
+        }
+    }
+
+    /// Cross-plan smoke test: the caller-policy gate returns exit 126 for an
+    /// agent caller when `agent_allowed: false`, even though `apply` now
+    /// receives an additional `allowlist` parameter. This is the regression
+    /// test required by the cross-plan deliverable.
+    #[tokio::test]
+    async fn test_apply_caller_policy_gate_unchanged_with_allowlist_param() {
+        let mut cmd = make_cmd(vec![]);
+        cmd.caller_policy = CallerPolicy {
+            agent_allowed: false,
+            allowed_parents: Some(vec!["git".to_string()]),
+        };
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        // Use the allowlist-aware helper to assert the param is plumbed.
+        let allowlist = make_allowlist();
+        let (resp, action) = apply_capture_with_allowlist(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            always_allow(),
+            allowlist,
+        )
+        .await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        assert!(
+            resp.stderr.contains("primary sandbox"),
+            "stderr should mention primary sandbox: {}",
+            resp.stderr
+        );
     }
 
     #[tokio::test]
@@ -2869,6 +3446,7 @@ mod tests {
                 workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
+            make_allowlist(),
             OwnedFd::from(child_in),
             OwnedFd::from(child_out),
             OwnedFd::from(child_err),
@@ -2939,6 +3517,7 @@ mod tests {
                 workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
+            make_allowlist(),
             OwnedFd::from(child_in),
             OwnedFd::from(child_out),
             OwnedFd::from(child_err),

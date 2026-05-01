@@ -10,6 +10,7 @@
 //!   3. Response: u32 big-endian length || JSON payload
 
 use super::admin::AdminModeStatus;
+use super::allowlist::AllowlistStore;
 use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
 use super::policy::{admin_passthrough, apply, ShimRequest, ShimResponse};
@@ -41,6 +42,7 @@ pub async fn run(
     shim_dir: PathBuf,
     admin_state: super::admin::AdminState,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
+    allowlist: Arc<AllowlistStore>,
     audit_socket_path: PathBuf,
     audit_log_dir: PathBuf,
     workdir: PathBuf,
@@ -94,6 +96,7 @@ pub async fn run(
                 let sess_dir = Arc::clone(&audit_log_dir);
                 let admin_rx = admin_state.subscribe();
                 let gate = Arc::clone(&approval);
+                let al = Arc::clone(&allowlist);
                 let stamp = Arc::clone(&audit_info);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
@@ -105,6 +108,7 @@ pub async fn run(
                         &sp,
                         admin_rx,
                         gate,
+                        al,
                         &sess_dir,
                         &wd,
                         &stamp,
@@ -134,6 +138,7 @@ async fn handle_connection(
     socket_path: &std::path::Path,
     admin_receiver: tokio::sync::watch::Receiver<AdminModeStatus>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
+    allowlist: Arc<AllowlistStore>,
     audit_log_dir: &Path,
     workdir: &std::path::Path,
     audit_info: &SessionAuditInfo,
@@ -228,7 +233,7 @@ async fn handle_connection(
         workdir,
     };
     let (response, action_type) = apply(
-        request, commands, broker, &ctx, approval, stdin_fd, stdout_fd, stderr_fd,
+        request, commands, broker, &ctx, approval, allowlist, stdin_fd, stdout_fd, stderr_fd,
     )
     .await;
 

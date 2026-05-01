@@ -338,6 +338,11 @@ pub fn setup(
     let approval_gate: Arc<dyn super::approval::ApprovalGate + Send + Sync> =
         Arc::new(NativeApprovalGate);
 
+    // Per-user persistent allowlist for "Allow-always" approvals. Shared by
+    // the argv_shape mismatch flow (plan 4.2) and reused by future plans
+    // (4.1 caller-policy, 4.3 config/env scan).
+    let allowlist = Arc::new(super::allowlist::AllowlistStore::open_default()?);
+
     let sock = socket_path.clone();
     let cmds = resolved_commands.clone();
     let broker_clone = Arc::clone(&broker);
@@ -345,6 +350,7 @@ pub fn setup(
     let shim_dir_clone = shim_dir.clone();
     let admin_clone = admin_state.clone();
     let gate_clone = Arc::clone(&approval_gate);
+    let allowlist_clone = Arc::clone(&allowlist);
     let audit_sock = audit_socket_path.clone();
     let audit_log_dir = crate::session::ensure_sessions_dir()?;
     let audit_info_for_server = Arc::clone(&audit_info_arc);
@@ -357,6 +363,7 @@ pub fn setup(
             shim_dir_clone,
             admin_clone,
             gate_clone,
+            allowlist_clone,
             audit_sock,
             audit_log_dir,
             workdir,
