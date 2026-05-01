@@ -11,7 +11,8 @@ use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
 use super::{
-    CallerPolicy, CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo,
+    CallerPolicy, CommandEntry, CommandSandbox, ExtrasPolicy, FlagSpec, FlagSpecTagged,
+    InterceptAction, MediationConfig, OnMismatchPolicy, SessionAuditInfo,
 };
 use nix::libc;
 use nono::{NonoError, Result};
@@ -32,11 +33,42 @@ pub enum ResolvedAction {
 /// A resolved intercept rule ready for the mediation server.
 #[derive(Clone, Debug)]
 pub struct ResolvedIntercept {
+    /// Existing prefix matcher; empty when `argv_shape` is set.
     pub args_prefix: Vec<String>,
+    /// Strict shape matcher; absent when `args_prefix` is used.
+    pub argv_shape: Option<ResolvedArgvShape>,
     pub action: ResolvedAction,
     pub exit_code: i32,
     /// If true, requires user authentication before the action executes.
     pub admin: bool,
+}
+
+/// `ArgvShape` with `$VAR` tokens expanded at profile-load time.
+#[derive(Clone, Debug)]
+pub struct ResolvedArgvShape {
+    pub subcommand: String,
+    pub flags: std::collections::BTreeMap<String, ResolvedFlagSpec>,
+    pub extras: ExtrasPolicy,
+    pub on_mismatch: OnMismatchPolicy,
+}
+
+/// Flag spec with `$VAR` tokens expanded at profile-load time.
+#[derive(Clone, Debug)]
+pub enum ResolvedFlagSpec {
+    /// A flag that must be present with the given (already-expanded) value.
+    Required { value: String },
+    /// A boolean flag: present in the invocation, no value attached.
+    Boolean,
+}
+
+impl ResolvedFlagSpec {
+    /// Returns the required value, or `None` if this is a boolean flag.
+    pub fn required_value(&self) -> Option<&str> {
+        match self {
+            Self::Required { value } => Some(value),
+            Self::Boolean => None,
+        }
+    }
 }
 
 /// A fully resolved command entry ready for the mediation server.
@@ -443,11 +475,52 @@ fn resolve_command(
         .intercept
         .iter()
         .map(|rule| {
+            // Mutual-exclusion check: a rule may set args_prefix XOR argv_shape,
+            // not both. Empty args_prefix + None argv_shape is "match anything"
+            // and is the existing semantics.
+            if !rule.args_prefix.is_empty() && rule.argv_shape.is_some() {
+                return Err(NonoError::SandboxInit(format!(
+                    "mediation: command '{}' has an intercept rule with both \
+                     args_prefix and argv_shape; they are mutually exclusive — \
+                     use one",
+                    entry.name
+                )));
+            }
+
             let args_prefix = rule
                 .args_prefix
                 .iter()
                 .map(|arg| crate::profile::expand_str(arg, workdir))
                 .collect::<Result<Vec<String>>>()?;
+
+            let argv_shape = rule
+                .argv_shape
+                .as_ref()
+                .map(|shape| -> Result<ResolvedArgvShape> {
+                    let mut flags = std::collections::BTreeMap::new();
+                    for (k, v) in &shape.flags {
+                        let resolved = match v {
+                            FlagSpec::ValueOnly { value } => ResolvedFlagSpec::Required {
+                                value: crate::profile::expand_str(value, workdir)?,
+                            },
+                            FlagSpec::Tagged(FlagSpecTagged::Required { value }) => {
+                                ResolvedFlagSpec::Required {
+                                    value: crate::profile::expand_str(value, workdir)?,
+                                }
+                            }
+                            FlagSpec::Tagged(FlagSpecTagged::Boolean) => ResolvedFlagSpec::Boolean,
+                        };
+                        flags.insert(k.clone(), resolved);
+                    }
+                    Ok(ResolvedArgvShape {
+                        subcommand: shape.subcommand.clone(),
+                        flags,
+                        extras: shape.extras.clone(),
+                        on_mismatch: shape.on_mismatch.clone(),
+                    })
+                })
+                .transpose()?;
+
             let (action, exit_code) = match &rule.action {
                 InterceptAction::Respond { stdout, exit_code } => (
                     ResolvedAction::Respond {
@@ -470,6 +543,7 @@ fn resolve_command(
             };
             Ok(ResolvedIntercept {
                 args_prefix,
+                argv_shape,
                 action,
                 exit_code,
                 admin: rule.admin,
@@ -733,6 +807,144 @@ mod tests {
                 "Claude Code-credentials".to_string(),
             ],
             "env-var tokens in args_prefix must be expanded at profile-load time"
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_expands_env_vars_in_argv_shape_flag_values() {
+        use crate::mediation::{
+            ArgvShape, CommandEntry, ExtrasPolicy, FlagSpec, InterceptAction, InterceptRule,
+            OnMismatchPolicy,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+
+        // Real binary on disk so binary_path validation succeeds.
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+
+        // Shim dir + fake shim target so symlink creation succeeds.
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            (
+                "NONO_TEST_SHAPE_BINARY",
+                fake_binary.to_str().expect("utf8"),
+            ),
+            ("NONO_TEST_SHAPE_USER", "tester"),
+        ]);
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some("$NONO_TEST_SHAPE_BINARY".to_string()),
+            intercept: vec![InterceptRule {
+                args_prefix: vec![],
+                argv_shape: Some(ArgvShape {
+                    subcommand: "find-generic-password".to_string(),
+                    flags: {
+                        let mut m = std::collections::BTreeMap::new();
+                        m.insert(
+                            "-a".to_string(),
+                            FlagSpec::ValueOnly {
+                                value: "$NONO_TEST_SHAPE_USER".to_string(),
+                            },
+                        );
+                        m.insert(
+                            "-s".to_string(),
+                            FlagSpec::ValueOnly {
+                                value: "fixed-service".to_string(),
+                            },
+                        );
+                        m
+                    },
+                    extras: ExtrasPolicy::Deny,
+                    on_mismatch: OnMismatchPolicy::Deny,
+                }),
+                admin: false,
+                action: InterceptAction::Respond {
+                    stdout: "x".to_string(),
+                    exit_code: 0,
+                },
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let workdir = tmp.path();
+        let resolved = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir)
+            .expect("resolve")
+            .expect("present");
+        let shape = resolved.intercepts[0]
+            .argv_shape
+            .as_ref()
+            .expect("argv_shape resolved");
+        assert_eq!(shape.subcommand, "find-generic-password");
+        assert_eq!(
+            shape.flags.get("-a").and_then(|f| f.required_value()),
+            Some("tester"),
+            "$VAR in flag value must be expanded at resolve time"
+        );
+        assert_eq!(
+            shape.flags.get("-s").and_then(|f| f.required_value()),
+            Some("fixed-service")
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_rejects_both_args_prefix_and_argv_shape() {
+        use crate::mediation::{
+            ArgvShape, CommandEntry, ExtrasPolicy, InterceptAction, InterceptRule, OnMismatchPolicy,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+
+        // Real binary + shim so resolution gets as far as the rule loop.
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![InterceptRule {
+                args_prefix: vec!["x".to_string()],
+                argv_shape: Some(ArgvShape {
+                    subcommand: "x".to_string(),
+                    flags: std::collections::BTreeMap::new(),
+                    extras: ExtrasPolicy::Deny,
+                    on_mismatch: OnMismatchPolicy::Deny,
+                }),
+                admin: false,
+                action: InterceptAction::Respond {
+                    stdout: "x".to_string(),
+                    exit_code: 0,
+                },
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let workdir = tmp.path();
+        let result = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir);
+        let err = match result {
+            Ok(_) => panic!("must reject both fields"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("argv_shape") && msg.contains("args_prefix"),
+            "error must name both fields, got: {}",
+            msg
         );
     }
 

@@ -1299,6 +1299,7 @@ mod tests {
     async fn test_caller_policy_agent_allowed_by_default() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec![],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "ok\n".to_string(),
             },
@@ -1357,6 +1358,7 @@ mod tests {
     async fn test_caller_policy_allows_listed_parent() {
         let mut cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec![],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "from_git\n".to_string(),
             },
@@ -1455,6 +1457,7 @@ mod tests {
     async fn test_caller_policy_none_allowed_parents_accepts_any() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec![],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "any_parent_ok\n".to_string(),
             },
@@ -1491,6 +1494,7 @@ mod tests {
                 "github".to_string(),
                 "token".to_string(),
             ],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "static_output\n".to_string(),
             },
@@ -1529,6 +1533,7 @@ mod tests {
     async fn test_intercept_prefix_matches_longer_args() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "matched\n".to_string(),
             },
@@ -1563,6 +1568,7 @@ mod tests {
     async fn test_no_intercept_match_falls_through() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string(), "github".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "secret\n".to_string(),
             },
@@ -1597,6 +1603,7 @@ mod tests {
     async fn test_admin_rule_allow_proceeds() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "deleted\n".to_string(),
             },
@@ -1631,6 +1638,7 @@ mod tests {
     async fn test_admin_rule_deny_blocks() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "deleted\n".to_string(),
             },
@@ -1666,6 +1674,7 @@ mod tests {
         // admin=false rule with AlwaysDeny gate — gate must NOT be called, action executes.
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["status".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "ok\n".to_string(),
             },
@@ -1779,6 +1788,7 @@ mod tests {
     async fn test_capture_runs_real_binary_and_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Capture { script: None },
             exit_code: 0,
             admin: false,
@@ -1826,6 +1836,7 @@ mod tests {
     async fn test_capture_script_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Capture {
                 script: Some("echo my_secret_token".to_string()),
             },
@@ -2263,6 +2274,7 @@ mod tests {
             real_path: PathBuf::from("/usr/bin/env"),
             intercepts: vec![ResolvedIntercept {
                 args_prefix: vec![],
+                argv_shape: None,
                 action: ResolvedAction::Approve { script: None },
                 exit_code: 0,
                 admin: false,
@@ -2593,6 +2605,7 @@ mod tests {
 
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "buffered_response\n".to_string(),
             },
