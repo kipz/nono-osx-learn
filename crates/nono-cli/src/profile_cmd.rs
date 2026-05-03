@@ -1120,16 +1120,34 @@ fn profile_to_json(
         "extends": raw_extends.as_ref().map(|v| serde_json::json!(v)).unwrap_or(serde_json::Value::Null),
     });
 
-    // Security
-    val["security"] = serde_json::json!({
-        "groups": profile.security.groups,
-        "allowed_commands": profile.security.allowed_commands,
-        "signal_mode": format!("{:?}", profile.security.signal_mode),
-        "process_info_mode": format!("{:?}", profile.security.process_info_mode),
-        "ipc_mode": format!("{:?}", profile.security.ipc_mode),
-        "capability_elevation": profile.security.capability_elevation,
-        "wsl2_proxy_policy": format!("{:?}", profile.security.wsl2_proxy_policy),
-    });
+    // Security. Build via Map so that Option<…> mode fields are *omitted* when
+    // None, matching the shape of hand-authored profile files (e.g. those
+    // produced by users) and the input schema accepted by `profile validate`.
+    // The enum types derive Serialize with the right rename_all annotations,
+    // so values render as snake_case (`isolated`, `allow_same_sandbox`, …).
+    let mut security = serde_json::Map::new();
+    security.insert("groups".into(), serde_json::json!(profile.security.groups));
+    security.insert(
+        "allowed_commands".into(),
+        serde_json::json!(profile.security.allowed_commands),
+    );
+    if let Some(v) = profile.security.signal_mode {
+        security.insert("signal_mode".into(), serde_json::json!(v));
+    }
+    if let Some(v) = profile.security.process_info_mode {
+        security.insert("process_info_mode".into(), serde_json::json!(v));
+    }
+    if let Some(v) = profile.security.ipc_mode {
+        security.insert("ipc_mode".into(), serde_json::json!(v));
+    }
+    security.insert(
+        "capability_elevation".into(),
+        serde_json::json!(profile.security.capability_elevation),
+    );
+    if let Some(v) = profile.security.wsl2_proxy_policy {
+        security.insert("wsl2_proxy_policy".into(), serde_json::json!(v));
+    }
+    val["security"] = serde_json::Value::Object(security);
 
     // Filesystem
     val["filesystem"] = serde_json::json!({
@@ -1164,9 +1182,9 @@ fn profile_to_json(
         "upstream_bypass": profile.network.upstream_bypass,
     });
 
-    // Workdir
+    // Workdir. Serde renders WorkdirAccess as lowercase via rename_all.
     val["workdir"] = serde_json::json!({
-        "access": format!("{:?}", profile.workdir.access),
+        "access": profile.workdir.access,
     });
 
     // Rollback
@@ -1886,14 +1904,14 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "changed": p1.security.capability_elevation != p2.security.capability_elevation,
         },
         "wsl2_proxy_policy": {
-            "profile1": format!("{:?}", p1.security.wsl2_proxy_policy),
-            "profile2": format!("{:?}", p2.security.wsl2_proxy_policy),
+            "profile1": p1.security.wsl2_proxy_policy,
+            "profile2": p2.security.wsl2_proxy_policy,
             "changed": p1.security.wsl2_proxy_policy != p2.security.wsl2_proxy_policy,
         },
         "filesystem": diff_fs_json(&p1.filesystem, &p2.filesystem),
         "workdir": {
-            "profile1": format!("{:?}", p1.workdir.access),
-            "profile2": format!("{:?}", p2.workdir.access),
+            "profile1": p1.workdir.access,
+            "profile2": p2.workdir.access,
             "changed": p1.workdir.access != p2.workdir.access,
         },
         "network": {
