@@ -354,14 +354,17 @@ pub(crate) fn should_auto_enable_claude_launch_services(
 
     match load_claude_oauth_state() {
         Ok(Some(oauth)) => {
+            // A `nono_`-prefixed value is an OAuth-capture broker nonce, not a
+            // real token — treat it the same as "no credential" so LaunchServices
+            // gets auto-enabled and the user can complete a fresh /login.
             let has_access = oauth
                 .access_token
                 .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
+                .is_some_and(|v| !v.trim().is_empty() && !v.starts_with("nono_"));
             let has_refresh = oauth
                 .refresh_token
                 .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
+                .is_some_and(|v| !v.trim().is_empty() && !v.starts_with("nono_"));
             !has_access || !has_refresh
         }
         Ok(None) => true,
