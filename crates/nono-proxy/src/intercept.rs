@@ -403,6 +403,12 @@ async fn try_forward(
     token_resolver: Option<Arc<dyn TokenResolver>>,
 ) -> Result<Response<RewrittenBody>> {
     let req_path = req.uri().path().to_string();
+    debug!(
+        "intercept: request {} {} (oauth_capture={})",
+        req.method(),
+        req.uri(),
+        oauth_capture.is_some_and(|m| m.matches(&req_path))
+    );
 
     // Open a fresh upstream connection for this request.
     let upstream_tcp = connect::connect_to_resolved(resolved_addrs, host).await?;

@@ -133,19 +133,62 @@ pub async fn handle_reverse_proxy(
 
     let cred = static_cred;
 
+    // Layer 2: OAuth credential pass-through. When OAuth capture is active
+    // (token_resolver is present), the sandboxed child presents a credential
+    // in whichever header the route expects (e.g. x-api-key, Authorization:
+    // Bearer). The sandbox is the trust boundary — only the child can reach
+    // ANTHROPIC_BASE_URL — so we accept whatever credential arrives, bypass
+    // phantom-token validation, and forward it upstream.
+    //
+    // The header name to look for is cred.proxy_header_name when a static
+    // credential is configured, or "authorization" / "x-api-key" as fallback.
+    let oauth_passthrough_cred: Option<(String, Zeroizing<String>)> =
+        if ctx.token_resolver.is_some() {
+            let header_name = cred
+                .map(|c| c.proxy_header_name.as_str())
+                .unwrap_or("authorization");
+            extract_header_value(remaining_header, header_name)
+                .map(|v| (header_name.to_string(), Zeroizing::new(v)))
+                .or_else(|| {
+                    // Also try x-api-key as a common fallback when the route
+                    // header is authorization but the client sends x-api-key.
+                    if header_name.to_lowercase() != "x-api-key" {
+                        extract_header_value(remaining_header, "x-api-key")
+                            .map(|v| ("x-api-key".to_string(), Zeroizing::new(v)))
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+
     // Authenticate the request. Every reverse proxy request must prove
     // possession of the session token, regardless of whether a credential
     // is configured — this is the localhost auth boundary.
-    if let Some(cred) = cred {
-        if let Err(e) = validate_phantom_token_for_mode(
-            &cred.proxy_inject_mode,
-            remaining_header,
-            &upstream_path,
-            &cred.proxy_header_name,
-            cred.proxy_path_pattern.as_deref(),
-            cred.proxy_query_param_name.as_deref(),
-            ctx.session_token,
-        ) {
+    // Exception: an OAuth credential is its own proof when capture is active.
+    if oauth_passthrough_cred.is_none() {
+        if let Some(cred) = cred {
+            if let Err(e) = validate_phantom_token_for_mode(
+                &cred.proxy_inject_mode,
+                remaining_header,
+                &upstream_path,
+                &cred.proxy_header_name,
+                cred.proxy_path_pattern.as_deref(),
+                cred.proxy_query_param_name.as_deref(),
+                ctx.session_token,
+            ) {
+                audit::log_denied(
+                    ctx.audit_log,
+                    audit::ProxyMode::Reverse,
+                    &service,
+                    0,
+                    &e.to_string(),
+                );
+                send_error(stream, 401, "Unauthorized").await?;
+                return Ok(());
+            }
+        } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
             audit::log_denied(
                 ctx.audit_log,
                 audit::ProxyMode::Reverse,
@@ -153,19 +196,9 @@ pub async fn handle_reverse_proxy(
                 0,
                 &e.to_string(),
             );
-            send_error(stream, 401, "Unauthorized").await?;
+            send_error(stream, 407, "Proxy Authentication Required").await?;
             return Ok(());
         }
-    } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
-        audit::log_denied(
-            ctx.audit_log,
-            audit::ProxyMode::Reverse,
-            &service,
-            0,
-            &e.to_string(),
-        );
-        send_error(stream, 407, "Proxy Authentication Required").await?;
-        return Ok(());
     }
 
     let transformed_path = if let Some(cred) = cred {
@@ -255,15 +288,30 @@ pub async fn handle_reverse_proxy(
         method, upstream_path_full, version, upstream_authority
     ));
 
-    if let Some(cred) = cred {
-        inject_credential_for_mode(cred, &mut request);
-    }
+    // Inject the upstream credential. In OAuth pass-through mode, forward
+    // the client's credential directly; otherwise use the static credential.
+    let suppress_header: Option<String> =
+        if let Some((ref header_name, ref cred_value)) = oauth_passthrough_cred {
+            request.push_str(&format!("{}: {}\r\n", header_name, cred_value.as_str()));
+            Some(header_name.to_lowercase())
+        } else {
+            if let Some(cred) = cred {
+                inject_credential_for_mode(cred, &mut request);
+            }
+            None
+        };
 
     let auth_header_lower = cred.map(|c| c.header_name.to_lowercase());
     for (name, value) in &filtered_headers {
+        let name_lower = name.to_lowercase();
+        // Suppress the credential header the client sent — we already
+        // injected it (or the static credential) above.
+        if suppress_header.as_deref() == Some(name_lower.as_str()) {
+            continue;
+        }
         if let (Some(cred), Some(header_lower)) = (cred, auth_header_lower.as_ref()) {
             if matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
-                && name.to_lowercase() == *header_lower
+                && name_lower == *header_lower
             {
                 continue;
             }
@@ -764,6 +812,26 @@ fn validate_phantom_token(
         header_name
     );
     Err(ProxyError::InvalidToken)
+}
+
+/// Extract the raw value of a named HTTP header from raw header bytes.
+/// For `Authorization`, strips the `Bearer ` prefix if present.
+/// Returns `None` if the header is absent.
+fn extract_header_value(header_bytes: &[u8], header_name: &str) -> Option<String> {
+    let header_str = std::str::from_utf8(header_bytes).ok()?;
+    let target = format!("{}:", header_name.to_lowercase());
+    for line in header_str.lines() {
+        if line.to_lowercase().starts_with(&target) {
+            let value = line.split_once(':').map(|(_, v)| v.trim())?;
+            // Strip "Bearer " prefix for Authorization headers.
+            let value_lower = value.to_lowercase();
+            if value_lower.starts_with("bearer ") {
+                return Some(value[7..].trim().to_string());
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 /// Filter headers, removing hop-by-hop and proxy-internal headers.
