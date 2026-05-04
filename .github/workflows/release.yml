@@ -174,16 +174,32 @@ jobs:
 
       - name: Publish nono-proxy
         run: |
-          # Wait for crates.io to index the core library
-          sleep 30
+          VERSION="${RELEASE_TAG#v}"
+          echo "Waiting for nono $VERSION to appear on crates.io..."
+          for i in $(seq 1 30); do
+            if cargo search nono --limit 1 2>/dev/null | grep -q "\"$VERSION\""; then
+              echo "Found nono $VERSION on crates.io"
+              break
+            fi
+            echo "Attempt $i: not yet indexed, retrying in 10s..."
+            sleep 10
+          done
           cargo publish -p nono-proxy --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Publish nono-cli
         run: |
-          # Wait for crates.io to index nono-proxy
-          sleep 30
+          VERSION="${RELEASE_TAG#v}"
+          echo "Waiting for nono-proxy $VERSION to appear on crates.io..."
+          for i in $(seq 1 30); do
+            if cargo search nono-proxy --limit 1 2>/dev/null | grep -q "\"$VERSION\""; then
+              echo "Found nono-proxy $VERSION on crates.io"
+              break
+            fi
+            echo "Attempt $i: not yet indexed, retrying in 10s..."
+            sleep 10
+          done
           cargo publish -p nono-cli --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
