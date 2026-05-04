@@ -143,22 +143,38 @@ pub async fn handle_reverse_proxy(
     // The header name to look for is cred.proxy_header_name when a static
     // credential is configured, or "authorization" / "x-api-key" as fallback.
     let oauth_passthrough_cred: Option<(String, Zeroizing<String>)> =
-        if ctx.token_resolver.is_some() {
-            let header_name = cred
+        if let Some(ref resolver) = ctx.token_resolver {
+            // Claude Code uses different headers depending on auth mode:
+            //  - API key: `x-api-key: sk-ant-api03-...`
+            //  - OAuth:   `Authorization: Bearer sk-ant-oat01-...` (or nono_<hex>)
+            // The proxy doesn't know in advance which mode the child is in,
+            // so check both — preferring the route's configured header if set.
+            let configured = cred
                 .map(|c| c.proxy_header_name.as_str())
                 .unwrap_or("authorization");
-            extract_header_value(remaining_header, header_name)
-                .map(|v| (header_name.to_string(), Zeroizing::new(v)))
+            let raw = extract_header_value(remaining_header, configured)
+                .map(|v| (configured.to_string(), v))
                 .or_else(|| {
-                    // Also try x-api-key as a common fallback when the route
-                    // header is authorization but the client sends x-api-key.
-                    if header_name.to_lowercase() != "x-api-key" {
-                        extract_header_value(remaining_header, "x-api-key")
-                            .map(|v| ("x-api-key".to_string(), Zeroizing::new(v)))
-                    } else {
-                        None
-                    }
+                    extract_header_value(remaining_header, "authorization")
+                        .map(|v| ("authorization".to_string(), v))
                 })
+                .or_else(|| {
+                    extract_header_value(remaining_header, "x-api-key")
+                        .map(|v| ("x-api-key".to_string(), v))
+                });
+            // If the value is a `nono_` nonce issued during /login capture,
+            // resolve it to the real OAuth token via the broker. Send the
+            // real token upstream so Anthropic accepts it. If resolution
+            // fails (cross-session, broker is empty), forward the raw value
+            // and let upstream return its own auth error.
+            raw.map(|(hname, v)| {
+                let resolved = if v.starts_with("nono_") {
+                    resolver.resolve(&v).unwrap_or_else(|| Zeroizing::new(v))
+                } else {
+                    Zeroizing::new(v)
+                };
+                (hname, resolved)
+            })
         } else {
             None
         };
@@ -290,9 +306,17 @@ pub async fn handle_reverse_proxy(
 
     // Inject the upstream credential. In OAuth pass-through mode, forward
     // the client's credential directly; otherwise use the static credential.
+    // For the Authorization header, re-add the `Bearer ` prefix that
+    // extract_header_value strips on the way in — Anthropic and most
+    // OAuth-bearer APIs reject `Authorization: <token>` without it.
     let suppress_header: Option<String> =
         if let Some((ref header_name, ref cred_value)) = oauth_passthrough_cred {
-            request.push_str(&format!("{}: {}\r\n", header_name, cred_value.as_str()));
+            let formatted = if header_name.eq_ignore_ascii_case("authorization") {
+                format!("Authorization: Bearer {}\r\n", cred_value.as_str())
+            } else {
+                format!("{}: {}\r\n", header_name, cred_value.as_str())
+            };
+            request.push_str(&formatted);
             Some(header_name.to_lowercase())
         } else {
             if let Some(cred) = cred {
