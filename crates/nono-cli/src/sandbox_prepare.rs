@@ -1075,6 +1075,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         };
 
         precreate(&home_path.join(".claude.json.lock"), false);
+        precreate(&home_path.join(".cache/claude"), true);
         precreate(&home_path.join(".cache/claude-cli-nodejs"), true);
 
         // Claude Code writes ~/.claude.json atomically via temp files named
