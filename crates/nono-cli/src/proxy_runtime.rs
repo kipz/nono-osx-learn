@@ -10,22 +10,6 @@ use std::sync::Arc;
 use tracing::info;
 use tracing::warn;
 
-/// Env var that opts in to the OAuth-capture path
-/// (Layer 1 of `2026-04-27-capture-anthropic-auth.md`).
-///
-/// When unset (the default), proxy startup behaves exactly as before:
-/// no `InterceptCa`, no token broker on the proxy side, no
-/// `NODE_EXTRA_CA_CERTS` injection. Set to `1`/`true`/`yes`/`on` to
-/// enable.
-const OAUTH_CAPTURE_ENV: &str = "NONO_OAUTH_CAPTURE";
-
-fn oauth_capture_enabled() -> bool {
-    matches!(
-        std::env::var(OAUTH_CAPTURE_ENV).ok().as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
-}
-
 pub(crate) struct ActiveProxyRuntime {
     pub(crate) env_vars: Vec<(String, String)>,
     pub(crate) handle: Option<nono_proxy::server::ProxyHandle>,
@@ -110,6 +94,7 @@ pub(crate) fn prepare_proxy_launch_options(
         open_url_origins: prepared.open_url_origins.clone(),
         open_url_allow_localhost: prepared.open_url_allow_localhost,
         allow_launch_services_active: prepared.allow_launch_services_active,
+        oauth_capture: prepared.oauth_capture,
     })
 }
 
@@ -216,11 +201,12 @@ pub(crate) fn start_proxy_runtime(
     let mut proxy_config = build_proxy_config_from_flags(proxy, workdir)?;
     proxy_config.direct_connect_ports = caps.tcp_connect_ports().to_vec();
 
-    // OAuth-capture wiring (Layer 1 of 2026-04-27-capture-anthropic-auth.md).
-    // Opt-in via NONO_OAUTH_CAPTURE so the live test surfaces a regression
-    // with a single env-var toggle, and the default path stays identical
-    // to today's behaviour.
-    let (proxy_runtime, oauth_ca_path) = if oauth_capture_enabled() {
+    // OAuth-capture wiring. Opt-in via the profile's `oauth_capture` field
+    // (default false). When unset, proxy startup is identical to the
+    // pre-OAuth-capture build: no intercept CA, no broker, no
+    // NODE_EXTRA_CA_CERTS, real OAuth tokens flow to the keychain
+    // unchanged.
+    let (proxy_runtime, oauth_ca_path) = if proxy.oauth_capture {
         let (rt, path) = build_oauth_capture_runtime(&mut proxy_config, caps)?;
         (rt, Some(path))
     } else {
