@@ -1087,6 +1087,15 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         }
     }
 
+    if profile.oauth_capture {
+        println!();
+        println!(
+            "  {} {}",
+            theme::fg("OAuth capture:", t.subtext).bold(),
+            theme::fg("enabled", t.text)
+        );
+    }
+
     Ok(())
 }
 
@@ -1257,6 +1266,10 @@ fn profile_to_json(
 
     if !profile.unsafe_macos_seatbelt_rules.is_empty() {
         val["unsafe_macos_seatbelt_rules"] = serde_json::json!(profile.unsafe_macos_seatbelt_rules);
+    }
+
+    if profile.oauth_capture {
+        val["oauth_capture"] = serde_json::json!(true);
     }
 
     val

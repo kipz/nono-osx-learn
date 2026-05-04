@@ -10,22 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Env var that opts in to the OAuth-capture wiring (plan step 14).
-///
-/// When unset (the default), `start_proxy_runtime` behaves exactly as
-/// before: no token broker on the proxy side, no Anthropic
-/// OAuth-capture routes synthesised. Set to `1` / `true` / `yes` / `on`
-/// to enable. Step 15 of the plan replaces this env-var trigger with
-/// the profile-level `oauth_capture: true` flag.
-const OAUTH_CAPTURE_ENV: &str = "NONO_OAUTH_CAPTURE";
-
-fn oauth_capture_enabled() -> bool {
-    matches!(
-        std::env::var(OAUTH_CAPTURE_ENV).ok().as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
-}
-
 /// Synthesise the three Anthropic OAuth-capture routes the CLI injects
 /// when OAuth capture is active.
 ///
@@ -153,6 +137,7 @@ pub(crate) fn prepare_proxy_launch_options(
         open_url_origins: prepared.open_url_origins.clone(),
         open_url_allow_localhost: prepared.open_url_allow_localhost,
         allow_launch_services_active: prepared.allow_launch_services_active,
+        oauth_capture: prepared.oauth_capture,
     })
 }
 
@@ -267,17 +252,18 @@ pub(crate) fn start_proxy_runtime(
         proxy_config.intercept_parent_ca_pems = read_parent_ssl_cert_file();
     }
 
-    // OAuth-capture wiring (plan step 14). Opt-in via `NONO_OAUTH_CAPTURE`
-    // so the live test surfaces a regression with a single env-var
-    // toggle; the default path stays identical to today's behaviour.
-    // The CA materialisation and `NODE_EXTRA_CA_CERTS` env injection
-    // that the original `1df4acc` had to do by hand are now handled by
-    // upstream's `intercept_ca_dir` + `ProxyHandle::env_vars()` — this
-    // block only adds the OAuth-specific bits: synthetic routes that
-    // trigger `requires_intercept` for the Anthropic hosts, and a
+    // OAuth-capture wiring (plan step 15). Opt-in via the profile's
+    // `oauth_capture` field (default false). When unset, proxy startup
+    // is identical to the pre-OAuth-capture build: no broker, no
+    // synthetic routes, real OAuth tokens flow to the keychain
+    // unchanged. CA materialisation and `NODE_EXTRA_CA_CERTS` env
+    // injection are handled by upstream's `intercept_ca_dir` +
+    // `ProxyHandle::env_vars()` whenever any route trips
+    // `requires_intercept` — this block only adds the OAuth-specific
+    // bits: synthetic routes for the Anthropic hosts and a
     // session-scoped `TokenBroker` handed to the proxy as
     // `Arc<dyn TokenResolver>`.
-    let oauth_capture_active = oauth_capture_enabled();
+    let oauth_capture_active = proxy.oauth_capture;
     let proxy_runtime = if oauth_capture_active {
         // Idempotent: skip any route whose prefix already exists (the
         // operator may have wired it declaratively).

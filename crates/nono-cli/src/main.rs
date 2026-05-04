@@ -278,6 +278,7 @@ mod tests {
             allowed_env_vars: None,
             denied_env_vars: None,
             mediation: mediation::MediationConfig::default(),
+            oauth_capture: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -324,6 +325,7 @@ mod tests {
             allowed_env_vars: None,
             denied_env_vars: None,
             mediation: mediation::MediationConfig::default(),
+            oauth_capture: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

@@ -442,6 +442,11 @@ pub(crate) struct PreparedSandbox {
     pub(crate) denied_env_vars: Option<Vec<String>>,
     #[allow(dead_code)]
     pub(crate) mediation: crate::mediation::MediationConfig,
+    /// Profile-driven opt-in for the OAuth-capture proxy path. When true,
+    /// the proxy installs intercept routes for the Anthropic OAuth token
+    /// endpoints, wires the broker, and rewrites response bodies to
+    /// substitute real tokens with `nono_<hex>` nonces.
+    pub(crate) oauth_capture: bool,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1029,6 +1034,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 allowed_env_vars: None,
                 denied_env_vars: None,
                 mediation: crate::mediation::MediationConfig::default(),
+                oauth_capture: false,
             },
             args,
             silent,
@@ -1273,6 +1279,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|p| p.mediation.clone())
         .unwrap_or_default();
+    let profile_oauth_capture = loaded_profile
+        .as_ref()
+        .map(|p| p.oauth_capture)
+        .unwrap_or(false);
     let profile_secrets = loaded_profile
         .map(|profile| profile.env_credentials.mappings)
         .unwrap_or_default();
@@ -1303,6 +1313,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
             mediation: profile_mediation,
+            oauth_capture: profile_oauth_capture,
         },
         args,
         silent,

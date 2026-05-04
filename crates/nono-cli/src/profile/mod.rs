@@ -1509,6 +1509,21 @@ pub struct Profile {
     /// Command mediation policy: intercept commands, inject credentials.
     #[serde(default)]
     pub mediation: crate::mediation::MediationConfig,
+    /// Capture and isolate Anthropic OAuth tokens during `claude /login`.
+    ///
+    /// When `true`, the proxy intercepts the OAuth token endpoint, hands
+    /// real `access_token` / `refresh_token` values to an in-memory
+    /// broker, and substitutes opaque `nono_<hex>` nonces in the response
+    /// body before it reaches the sandboxed client. The captured pair is
+    /// also persisted under a nono-controlled keychain entry so a later
+    /// nono session can rehydrate without forcing a re-login.
+    ///
+    /// Default `false` to preserve existing behaviour. When `false`, the
+    /// proxy startup path is identical to the pre-OAuth-capture build:
+    /// no intercept routes installed, no broker wired, real tokens flow
+    /// to the keychain unchanged.
+    #[serde(default)]
+    pub oauth_capture: bool,
 }
 
 #[derive(Deserialize)]
@@ -1566,6 +1581,8 @@ struct ProfileDeserialize {
     unsafe_macos_seatbelt_rules: Vec<String>,
     #[serde(default)]
     mediation: crate::mediation::MediationConfig,
+    #[serde(default)]
+    oauth_capture: bool,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -1598,6 +1615,7 @@ impl From<ProfileDeserialize> for Profile {
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
             mediation: raw.mediation,
+            oauth_capture: raw.oauth_capture,
         };
 
         // Drain legacy keys into canonical sections (no-op unless the legacy
@@ -2500,6 +2518,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             &child.unsafe_macos_seatbelt_rules,
         ),
         mediation: crate::mediation::merge::merge_mediation(base.mediation, child.mediation),
+        // OAuth capture: child's value wins when set true; otherwise inherit
+        // the base. There is no "explicitly off" form — `false` means
+        // "no opinion, use base" so a derived profile cannot silently
+        // disable a base profile's enabled capture.
+        oauth_capture: child.oauth_capture || base.oauth_capture,
     }
 }
 
@@ -4533,6 +4556,7 @@ mod tests {
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
+            oauth_capture: false,
         }
     }
 
@@ -4611,6 +4635,7 @@ mod tests {
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
+            oauth_capture: false,
         }
     }
 
