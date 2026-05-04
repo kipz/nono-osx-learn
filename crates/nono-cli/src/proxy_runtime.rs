@@ -247,10 +247,18 @@ pub(crate) fn start_proxy_runtime(
             port, proxy.allow_bind_ports
         );
     }
-    caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
-        port,
-        bind_ports: proxy.allow_bind_ports.clone(),
-    });
+    // OAuth capture requires the child to bind a localhost port for the
+    // browser redirect callback server. Ensure network-bind is enabled.
+    // On macOS, Seatbelt's (allow network-bind) is blanket — it cannot
+    // filter by port — so any non-empty bind_ports list suffices. Port 0
+    // is the sentinel: it means "let the OS pick" and signals intent
+    // without granting access to a specific port.
+    let bind_ports = if oauth_ca_path.is_some() && proxy.allow_bind_ports.is_empty() {
+        vec![0]
+    } else {
+        proxy.allow_bind_ports.clone()
+    };
+    caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly { port, bind_ports });
 
     let mut env_vars: Vec<(String, String)> = Vec::new();
     for (key, value) in handle.env_vars() {
@@ -302,15 +310,17 @@ fn build_oauth_capture_runtime(
     proxy_config: &mut nono_proxy::config::ProxyConfig,
     caps: &mut CapabilitySet,
 ) -> Result<(nono_proxy::ProxyRuntime, PathBuf)> {
-    // Ensure the route is present even if no profile contributed it.
-    // Idempotent: skip if a route with the same prefix is already
-    // configured (operator may have wired this declaratively).
-    if !proxy_config
-        .routes
-        .iter()
-        .any(|r| r.prefix == "claude-oauth")
-    {
-        proxy_config.routes.push(make_oauth_capture_route());
+    // Ensure the intercept routes are present. Idempotent: skip any whose
+    // prefix is already configured (operator may have wired declaratively).
+    // We add three routes: api.anthropic.com, claude.ai, and
+    // platform.claude.com. Binary analysis confirmed TOKEN_URL is on
+    // platform.claude.com — the PKCE code exchange goes there, not to
+    // api.anthropic.com or claude.ai. All three are intercepted so we
+    // capture whichever host the client actually calls.
+    for route in oauth_capture_routes() {
+        if !proxy_config.routes.iter().any(|r| r.prefix == route.prefix) {
+            proxy_config.routes.push(route);
+        }
     }
 
     let ca = Arc::new(
@@ -365,20 +375,25 @@ fn ensure_session_ca_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The `claude-oauth` route definition the dispatcher consults when a
-/// CONNECT for `claude.ai:443` arrives. Both URL match patterns point
-/// at the same endpoint because Anthropic's OAuth endpoint serves both
-/// initial-token-issuance and refresh exchanges from one path,
-/// distinguished only by `grant_type` in the body.
-fn make_oauth_capture_route() -> nono_proxy::config::RouteConfig {
+/// The intercept routes injected during OAuth capture (Layer 1 of
+/// `2026-04-27-capture-anthropic-auth.md`).
+///
+/// Binary analysis (`strings claude | grep TOKEN_URL`) confirms:
+///   TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+///
+/// The PKCE code exchange (POST /v1/oauth/token) goes to
+/// `platform.claude.com`, NOT `api.anthropic.com` or `claude.ai`.
+/// All three hosts are intercepted so we catch the exchange regardless of
+/// which OAuth server handles it.
+fn oauth_capture_routes() -> Vec<nono_proxy::config::RouteConfig> {
     use nono_proxy::config::{InjectMode, RouteConfig};
-    RouteConfig {
-        prefix: "claude-oauth".to_string(),
-        upstream: "https://claude.ai".to_string(),
+    let make = |prefix: &str, upstream: &str| RouteConfig {
+        prefix: prefix.to_string(),
+        upstream: upstream.to_string(),
         credential_key: None,
         inject_mode: InjectMode::OauthCapture {
-            token_url_match: "/api/oauth/token".to_string(),
-            refresh_url_match: "/api/oauth/token".to_string(),
+            token_url_match: "/v1/oauth/token".to_string(),
+            refresh_url_match: "/v1/oauth/token".to_string(),
         },
         inject_header: "Authorization".to_string(),
         credential_format: "Bearer {}".to_string(),
@@ -393,5 +408,10 @@ fn make_oauth_capture_route() -> nono_proxy::config::RouteConfig {
         tls_client_key: None,
         oauth2: None,
         tls_intercept: true,
-    }
+    };
+    vec![
+        make("claude-oauth", "https://api.anthropic.com"),
+        make("claude-oauth-claudeai", "https://claude.ai"),
+        make("claude-oauth-platform", "https://platform.claude.com"),
+    ]
 }
