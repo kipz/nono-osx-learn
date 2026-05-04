@@ -263,6 +263,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
     }
 
     if nono::keystore::is_op_uri(key) {
+        // Validate as 1Password URI
         nono::keystore::validate_op_uri(key).map_err(|e| {
             NonoError::ProfileParse(format!(
                 "invalid 1Password URI for custom credential '{}': {}",
@@ -291,6 +292,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
             ))
         })
     } else {
+        // Validate as keyring account name (alphanumeric + underscore)
         if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(NonoError::ProfileParse(format!(
                 "credential_key '{}' for custom credential '{}' must contain only \
@@ -5572,6 +5574,7 @@ mod tests {
         assert!(result.is_err(), "env://LD_PRELOAD should be rejected");
     }
 
+    // End-to-end: parse a profile JSON with a file:// custom credential
     #[test]
     fn test_profile_json_with_file_uri_custom_credential_parses() {
         let dir = tempdir().expect("tmpdir");
