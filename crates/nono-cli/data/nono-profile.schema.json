@@ -105,6 +105,30 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules applied verbatim to the sandbox policy. Each entry must be a valid S-expression, e.g. \"(allow iokit-open)\". Rules are validated at load time and rejected if malformed. Ignored on Linux. Surfaced prominently in 'nono profile show' output. If a rule pattern becomes common, prefer promoting it to a typed first-class capability instead."
+    },
+    "mediation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "Command mediation entries (intercept or pass through specific argv patterns)."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "block": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Env var names to strip from the child environment to prevent credential leakage."
+            }
+          },
+          "description": "Environment variable policy for the sandboxed child."
+        }
+      },
+      "description": "Command mediation and environment policy."
     }
   },
   "$defs": {
