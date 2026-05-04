@@ -15,6 +15,7 @@
 //! forwarded without buffering.
 
 use crate::audit;
+use crate::broker::TokenResolver;
 use crate::config::InjectMode;
 use crate::credential::{CredentialStore, LoadedCredential};
 use crate::error::{ProxyError, Result};
@@ -22,6 +23,7 @@ use crate::filter::ProxyFilter;
 use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -53,6 +55,10 @@ pub struct ReverseProxyCtx<'a> {
     pub tls_connector: &'a TlsConnector,
     /// Shared network audit sink for session metadata capture
     pub audit_log: Option<&'a audit::SharedAuditLog>,
+    /// Optional token resolver for OAuth capture in the reverse-proxy path.
+    /// When present and the upstream path matches `/v1/oauth/token`, the
+    /// response body is buffered and tokens are replaced with nonces.
+    pub token_resolver: Option<Arc<dyn TokenResolver>>,
 }
 
 /// Handle a non-CONNECT HTTP request (reverse proxy mode).
@@ -220,13 +226,28 @@ pub async fn handle_reverse_proxy(
         return Ok(());
     }
 
+    // Detect OAuth token exchange: POST /v1/oauth/token arriving via the
+    // anthropic reverse-proxy route. ANTHROPIC_BASE_URL redirects this
+    // through our plain-HTTP reverse proxy rather than CONNECT, so TLS
+    // intercept never sees it. When a token_resolver is present we buffer
+    // and rewrite the response to replace real tokens with nonces.
+    let is_oauth_capture = ctx.token_resolver.is_some()
+        && method == "POST"
+        && upstream_path == "/v1/oauth/token";
+
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = filter_headers(remaining_header, strip_header);
+    let mut filtered_headers = filter_headers(remaining_header, strip_header);
     let content_length = extract_content_length(remaining_header);
     let body = match read_request_body(stream, content_length, buffered_body).await? {
         Some(body) => body,
         None => return Ok(()),
     };
+
+    // Strip Accept-Encoding so the upstream returns identity-encoded JSON
+    // that we can parse without decompression. Only needed when capturing.
+    if is_oauth_capture {
+        filtered_headers.retain(|(name, _)| name.to_lowercase() != "accept-encoding");
+    }
 
     let upstream_authority = format_host_header(upstream_scheme, &upstream_host, upstream_port);
     let mut request = Zeroizing::new(format!(
@@ -283,7 +304,15 @@ pub async fn handle_reverse_proxy(
             };
 
             write_upstream_request(&mut tls_stream, &request, &body).await?;
-            stream_response(&mut tls_stream, stream).await?
+            if is_oauth_capture {
+                if let Some(ref resolver) = ctx.token_resolver {
+                    capture_and_rewrite_response(&mut tls_stream, stream, resolver.as_ref()).await?
+                } else {
+                    stream_response(&mut tls_stream, stream).await?
+                }
+            } else {
+                stream_response(&mut tls_stream, stream).await?
+            }
         }
         UpstreamScheme::Http => {
             let mut upstream_stream =
@@ -317,6 +346,109 @@ pub async fn handle_reverse_proxy(
         status_code,
     );
     Ok(())
+}
+
+/// Buffer the full upstream response, rewrite OAuth token fields in the JSON
+/// body with nonces, then send the modified response to the client.
+///
+/// On any error (body read failure, non-JSON body, serialisation failure)
+/// the original bytes are forwarded unchanged so `/login` keeps working.
+async fn capture_and_rewrite_response<S>(
+    upstream: &mut S,
+    client: &mut TcpStream,
+    resolver: &(dyn TokenResolver + 'static),
+) -> Result<u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Read the full response into memory.
+    let mut raw = Vec::new();
+    upstream.read_to_end(&mut raw).await.map_err(|e| {
+        ProxyError::HttpParse(format!("oauth-capture: upstream read failed: {e}"))
+    })?;
+
+    let status_code = parse_response_status(&raw);
+
+    // Split headers from body at the blank line.
+    let header_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| raw.windows(2).position(|w| w == b"\n\n").map(|i| i + 2));
+
+    let Some(body_start) = header_end else {
+        // Malformed response — forward as-is.
+        warn!("oauth-capture (reverse): response has no header/body separator; forwarding unchanged");
+        client.write_all(&raw).await?;
+        return Ok(status_code);
+    };
+
+    let header_bytes = &raw[..body_start];
+    let body_bytes = &raw[body_start..];
+
+    let mut value: serde_json::Value = match serde_json::from_slice(body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("oauth-capture (reverse): response is not JSON ({e}); forwarding unchanged");
+            client.write_all(&raw).await?;
+            return Ok(status_code);
+        }
+    };
+
+    let mut substituted: u32 = 0;
+    if let Some(obj) = value.as_object_mut() {
+        for key in &["access_token", "refresh_token"] {
+            if let Some(serde_json::Value::String(s)) = obj.get(*key) {
+                let real = zeroize::Zeroizing::new(s.clone());
+                let nonce = resolver.issue(real);
+                obj.insert((*key).to_string(), serde_json::Value::String(nonce));
+                substituted = substituted.saturating_add(1);
+            }
+        }
+    }
+
+    if substituted == 0 {
+        debug!("oauth-capture (reverse): no access_token/refresh_token in JSON; forwarding unchanged");
+        client.write_all(&raw).await?;
+        return Ok(status_code);
+    }
+
+    let new_body = match serde_json::to_vec(&value) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("oauth-capture (reverse): re-serialising failed ({e}); forwarding unchanged");
+            client.write_all(&raw).await?;
+            return Ok(status_code);
+        }
+    };
+
+    // Rebuild headers, replacing Content-Length and dropping Transfer-Encoding /
+    // Content-Encoding so the client doesn't try to decompress our plaintext.
+    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
+    let mut rebuilt = String::with_capacity(header_bytes.len() + 32);
+    for line in header_str.split("\r\n") {
+        let lower = line.to_lowercase();
+        if lower.starts_with("content-length:")
+            || lower.starts_with("transfer-encoding:")
+            || lower.starts_with("content-encoding:")
+        {
+            continue;
+        }
+        rebuilt.push_str(line);
+        rebuilt.push_str("\r\n");
+    }
+    // Insert correct Content-Length before final blank line.
+    rebuilt.push_str(&format!("Content-Length: {}\r\n\r\n", new_body.len()));
+
+    client.write_all(rebuilt.as_bytes()).await?;
+    client.write_all(&new_body).await?;
+    client.flush().await?;
+
+    debug!(
+        "oauth-capture (reverse): substituted {} token field(s); response body re-serialised",
+        substituted
+    );
+    Ok(status_code)
 }
 
 /// Handle a reverse proxy request using an OAuth2 token cache.

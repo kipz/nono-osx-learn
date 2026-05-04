@@ -650,6 +650,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             filter: &state.filter,
             tls_connector: &state.tls_connector,
             audit_log: Some(&state.audit_log),
+            token_resolver: state.token_resolver.clone(),
         };
         reverse::handle_reverse_proxy(first_line, &mut stream, &header_bytes, &ctx, &buffered).await
     } else {
