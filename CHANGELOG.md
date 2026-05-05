@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.47.0] - 2026-05-05
+
+### Bug Fixes
+
+- Doc changes + relax strict cap check
+
+- Resolve extends against sibling profiles in the same directory
+
+- *(capability)* Platform-specific dedup key (original on macOS, resolved on Linux)
+
+- *(ci)* Poll crates.io index instead of fixed sleep before publish
+
+- *(profile)* Emit serde-rendered values in show/diff JSON output
+
+- Migrate diagnostic.rs to shared try_canonicalize helper
+
+- Canonicalize protected roots at call sites to handle raw paths
+
+- Replace unwrap() with expect() in path tests for clippy
+
+- Unify path canonicalization with ancestor-walk fallback
+
+
+### Documentation
+
+- *(plans)* Design and implementation plan for #594 phase 2 schema restructure
+
+
+### Features
+
+- *(profile)* #594 phase 2 — canonical JSON schema restructure (#594)
+
+
+### Performance
+
+- Eliminate redundant canonicalize syscalls per review feedback
+
+
+### Policy
+
+- Normalize nix profile paths to tilde-style and add defexpr
+
+
+### Style
+
+- Remove extra blank line in diagnostic.rs
+
+- Run cargo fmt
+
 ## [0.46.0] - 2026-05-01
 
 ### Bug Fixes
