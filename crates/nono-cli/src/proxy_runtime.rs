@@ -272,7 +272,7 @@ pub(crate) fn start_proxy_runtime(
                 proxy_config.routes.push(route);
             }
         }
-        let resolver: Arc<dyn nono_proxy::TokenResolver> = Arc::new(TokenBroker::new());
+        let resolver: Arc<dyn nono_proxy::TokenResolver> = Arc::new(build_broker());
         info!(
             "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker",
             oauth_capture_routes().len()
@@ -441,6 +441,31 @@ fn prepare_intercept_ca_dir() -> Result<Option<PathBuf>> {
     }
     set_intercept_ca_dir_permissions(&dir)?;
     Ok(Some(dir))
+}
+
+/// Construct the OAuth-capture broker, attempting to back it with a
+/// durable [`crate::mediation::broker_store::KeystoreBrokerStore`] so
+/// captured pairs persist across sessions. On any error initialising
+/// the store (e.g. no keyring backend available, headless Linux without
+/// secret-service), fall back to an in-memory broker and log at warn —
+/// capture still works for this session; only cross-session resume is
+/// lost.
+fn build_broker() -> TokenBroker {
+    #[cfg(feature = "system-keyring")]
+    {
+        use crate::mediation::broker_store::KeystoreBrokerStore;
+        let store = Arc::new(KeystoreBrokerStore::default_for_claude_oauth());
+        match TokenBroker::with_store(store) {
+            Ok(broker) => return broker,
+            Err(e) => {
+                warn!(
+                    "OAuth broker keystore backend init failed; using in-memory broker only \
+                     (cross-session OAuth resume disabled this run): {e}"
+                );
+            }
+        }
+    }
+    TokenBroker::new()
 }
 
 #[cfg(unix)]
