@@ -200,25 +200,109 @@ impl KeystoreBrokerStore {
             ))
         })
     }
+
+    /// macOS-specific load path: shell out to `security find-generic-password
+    /// -w` instead of going through the `keyring` crate.
+    ///
+    /// The `keyring` crate's `get_password()` on macOS uses a Security
+    /// framework code path that triggers a system password prompt when
+    /// the calling binary is not in the entry's trusted-apps ACL — even
+    /// when the entry was created with `-A` (empty trusted-apps list,
+    /// "any application may access without warning"). The `security` CLI
+    /// uses the older Keychain Services API which honours the empty ACL
+    /// silently, matching the no-prompt behaviour the existing nono
+    /// credential-injection feature relies on.
+    ///
+    /// Verified empirically: `security ... -w` reads our `-A`-created
+    /// entry without prompting; the keyring crate prompts on the same
+    /// entry. We therefore use `security` for both ends (save and load)
+    /// on macOS so the broker's experience matches what users get for
+    /// every other credential under service "nono".
+    #[cfg(target_os = "macos")]
+    fn load_via_security_cli(&self) -> Result<Option<String>> {
+        let output = Command::new("/usr/bin/security")
+            .args([
+                "find-generic-password",
+                "-s",
+                &self.service,
+                "-a",
+                &self.account,
+                "-w",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| {
+                NonoError::KeystoreAccess(format!("invoke /usr/bin/security: {e}"))
+            })?;
+        if output.status.success() {
+            // -w prints the password followed by a single newline; trim it.
+            let mut stdout = String::from_utf8(output.stdout).map_err(|e| {
+                NonoError::KeystoreAccess(format!(
+                    "non-UTF8 password from {}/{}: {e}",
+                    self.service, self.account
+                ))
+            })?;
+            if stdout.ends_with('\n') {
+                stdout.pop();
+            }
+            Ok(Some(stdout))
+        } else {
+            // Distinguish "no such item" from real errors. macOS exits 44
+            // ("The specified item could not be found in the keychain.")
+            // when the entry doesn't exist.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.code() == Some(44)
+                || stderr.contains("could not be found in the keychain")
+            {
+                Ok(None)
+            } else {
+                Err(NonoError::KeystoreAccess(format!(
+                    "security find-generic-password ({}) for {}/{}: {}",
+                    output.status,
+                    self.service,
+                    self.account,
+                    stderr.trim()
+                )))
+            }
+        }
+    }
 }
 
 #[cfg(feature = "system-keyring")]
 impl BrokerStore for KeystoreBrokerStore {
     fn load(&self) -> Result<Option<PersistedRecord>> {
-        let entry = self.entry()?;
-        match entry.get_password() {
-            Ok(json) => match serde_json::from_str::<PersistedJson>(&json) {
+        // Read via `security` CLI on macOS (silent for `-A`-created
+        // entries), keyring crate elsewhere. See the docs on
+        // [`Self::load_via_security_cli`] for why.
+        let maybe_json: Option<String> = {
+            #[cfg(target_os = "macos")]
+            {
+                self.load_via_security_cli()?
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let entry = self.entry()?;
+                match entry.get_password() {
+                    Ok(s) => Some(s),
+                    Err(keyring::Error::NoEntry) => None,
+                    Err(other) => {
+                        return Err(NonoError::KeystoreAccess(format!(
+                            "broker record load from {}/{}: {other}",
+                            self.service, self.account
+                        )));
+                    }
+                }
+            }
+        };
+        match maybe_json {
+            Some(json) => match serde_json::from_str::<PersistedJson>(&json) {
                 Ok(parsed) => Ok(Some(parsed.into_record())),
                 Err(e) => Err(NonoError::KeystoreAccess(format!(
                     "broker record at {}/{} is not valid JSON: {e}",
                     self.service, self.account
                 ))),
             },
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(other) => Err(NonoError::KeystoreAccess(format!(
-                "broker record load from {}/{}: {other}",
-                self.service, self.account
-            ))),
+            None => Ok(None),
         }
     }
 
