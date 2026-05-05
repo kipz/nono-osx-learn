@@ -37,4 +37,25 @@ pub trait TokenResolver: Send + Sync {
     /// must not distinguish "invalid format" from "not in vault" so a
     /// caller cannot probe the keyspace by inspecting error variants.
     fn resolve(&self, nonce: &str) -> Option<Zeroizing<String>>;
+
+    /// Mint nonces for a captured OAuth `(access_token, refresh_token)`
+    /// pair.
+    ///
+    /// Distinct from two separate [`Self::issue`] calls because
+    /// implementations may persist the pair to durable storage so the
+    /// mapping survives across sessions. The default implementation is
+    /// infallible and persistence-free — it just calls `issue` twice —
+    /// so non-OAuth callers and test fakes need no extra work.
+    ///
+    /// Persistence failures must NOT propagate: an implementation that
+    /// cannot write to durable storage should still return valid
+    /// in-memory nonces and log a warning. Capture-and-rewrite must keep
+    /// working even when persistence is unavailable.
+    fn capture_oauth_pair(
+        &self,
+        access: Zeroizing<String>,
+        refresh: Zeroizing<String>,
+    ) -> (String, String) {
+        (self.issue(access), self.issue(refresh))
+    }
 }
