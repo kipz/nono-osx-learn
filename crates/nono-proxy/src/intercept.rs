@@ -42,12 +42,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
-use zeroize::Zeroizing;
 
 use crate::audit;
 use crate::broker::TokenResolver;
 use crate::connect;
 use crate::error::{ProxyError, Result};
+use crate::oauth_rewrite::{rewrite_oauth_json_body, OauthRewriteOutcome};
 use crate::route::OauthCaptureMatch;
 
 /// CA validity window. Far longer than any reasonable session, and a
@@ -507,93 +507,35 @@ async fn rewrite_oauth_response(
         }
     };
 
-    let mut value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("oauth-capture: response is not JSON ({e}); passing through unmodified");
-            return Ok(Response::from_parts(parts, full_body(body_bytes)));
+    match rewrite_oauth_json_body(&body_bytes, resolver) {
+        OauthRewriteOutcome::NotJson => {
+            warn!("oauth-capture: response is not JSON; passing through unmodified");
+            Ok(Response::from_parts(parts, full_body(body_bytes)))
         }
-    };
+        OauthRewriteOutcome::NoTokenFields => {
+            debug!(
+                "oauth-capture: matched URL but no access_token/refresh_token to substitute; passing through"
+            );
+            Ok(Response::from_parts(parts, full_body(body_bytes)))
+        }
+        OauthRewriteOutcome::Rewritten { bytes, substituted } => {
+            debug!(
+                "oauth-capture: substituted {} token field(s); response body re-serialized",
+                substituted
+            );
 
-    let mut substituted: u32 = 0;
-    if let Some(obj) = value.as_object_mut() {
-        // Capture access + refresh together so the broker can persist
-        // them as a pair (and so the access -> refresh association is
-        // preserved for any future refresh-on-401 flow). When only one
-        // is present (atypical), fall back to single-token issue() with
-        // no persistence.
-        let access = obj
-            .get("access_token")
-            .and_then(serde_json::Value::as_str)
-            .map(|s| Zeroizing::new(s.to_string()));
-        let refresh = obj
-            .get("refresh_token")
-            .and_then(serde_json::Value::as_str)
-            .map(|s| Zeroizing::new(s.to_string()));
+            // The original body framing no longer applies — hyper will set a
+            // fresh Content-Length from our `Full<Bytes>`.
+            parts.headers.remove(hyper::header::CONTENT_LENGTH);
+            parts.headers.remove(hyper::header::TRANSFER_ENCODING);
+            // Defensive: even though we asked for identity, scrub
+            // Content-Encoding so a misconfigured upstream cannot trick the
+            // client into decompressing our plaintext bytes.
+            parts.headers.remove(hyper::header::CONTENT_ENCODING);
 
-        match (access, refresh) {
-            (Some(a), Some(r)) => {
-                let (access_nonce, refresh_nonce) = resolver.capture_oauth_pair(a, r);
-                obj.insert(
-                    "access_token".to_string(),
-                    serde_json::Value::String(access_nonce),
-                );
-                obj.insert(
-                    "refresh_token".to_string(),
-                    serde_json::Value::String(refresh_nonce),
-                );
-                substituted = 2;
-            }
-            (Some(a), None) => {
-                let nonce = resolver.issue(a);
-                obj.insert(
-                    "access_token".to_string(),
-                    serde_json::Value::String(nonce),
-                );
-                substituted = 1;
-            }
-            (None, Some(r)) => {
-                let nonce = resolver.issue(r);
-                obj.insert(
-                    "refresh_token".to_string(),
-                    serde_json::Value::String(nonce),
-                );
-                substituted = 1;
-            }
-            (None, None) => {}
+            Ok(Response::from_parts(parts, full_body(bytes)))
         }
     }
-
-    if substituted == 0 {
-        debug!(
-            "oauth-capture: matched URL but no access_token/refresh_token in JSON; passing through"
-        );
-        return Ok(Response::from_parts(parts, full_body(body_bytes)));
-    }
-
-    let new_body_bytes = match serde_json::to_vec(&value) {
-        Ok(b) => Bytes::from(b),
-        Err(e) => {
-            warn!("oauth-capture: re-serializing JSON failed: {e}; passing through");
-            return Ok(Response::from_parts(parts, full_body(body_bytes)));
-        }
-    };
-
-    debug!(
-        "oauth-capture: substituted {} token field(s); response body re-serialized",
-        substituted
-    );
-
-    // The original body framing no longer applies — hyper will set a
-    // fresh Content-Length from our `Full<Bytes>`.
-    parts.headers.remove(hyper::header::CONTENT_LENGTH);
-    parts.headers.remove(hyper::header::TRANSFER_ENCODING);
-    // Defensive: even though we asked for identity, scrub
-    // Content-Encoding so a misconfigured upstream cannot trick the
-    // client into decompressing our plaintext bytes.
-    parts.headers.remove(hyper::header::CONTENT_ENCODING);
-
-    Ok(Response::from_parts(parts, full_body(new_body_bytes)))
 }
 
 /// Translate any `nono_`-prefixed Bearer token in the `Authorization`
@@ -616,10 +558,7 @@ async fn rewrite_oauth_response(
 /// Tokens that don't start with `nono_` are left alone — passes through
 /// real bearer tokens (typical for non-OAuth-capture intercepted hosts)
 /// and any other `Authorization` schemes (Basic, etc.).
-fn rewrite_bearer_header(
-    headers: &mut hyper::HeaderMap,
-    resolver: &(dyn TokenResolver + 'static),
-) {
+fn rewrite_bearer_header(headers: &mut hyper::HeaderMap, resolver: &(dyn TokenResolver + 'static)) {
     let raw = match headers.get(hyper::header::AUTHORIZATION) {
         Some(v) => match v.to_str() {
             Ok(s) => s.to_string(),
@@ -627,7 +566,10 @@ fn rewrite_bearer_header(
         },
         None => return,
     };
-    let token = match raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer ")) {
+    let token = match raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+    {
         Some(t) => t.trim(),
         None => return,
     };
@@ -637,7 +579,10 @@ fn rewrite_bearer_header(
     let resolved = match resolver.resolve(token) {
         Some(real) => real,
         None => {
-            debug!("intercept: nonce {}... not in broker; forwarding raw", &token[..12.min(token.len())]);
+            debug!(
+                "intercept: nonce {}... not in broker; forwarding raw",
+                &token[..12.min(token.len())]
+            );
             return;
         }
     };
@@ -711,9 +656,7 @@ mod tests {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
             hyper::header::AUTHORIZATION,
-            hyper::header::HeaderValue::from_static(
-                "Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
+            hyper::header::HeaderValue::from_static("Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         );
 
         rewrite_bearer_header(&mut headers, &resolver);

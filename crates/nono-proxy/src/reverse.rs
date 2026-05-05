@@ -20,6 +20,7 @@ use crate::config::InjectMode;
 use crate::credential::{CredentialStore, LoadedCredential};
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
+use crate::oauth_rewrite::{rewrite_oauth_json_body, OauthRewriteOutcome};
 use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
@@ -280,9 +281,8 @@ pub async fn handle_reverse_proxy(
     // through our plain-HTTP reverse proxy rather than CONNECT, so TLS
     // intercept never sees it. When a token_resolver is present we buffer
     // and rewrite the response to replace real tokens with nonces.
-    let is_oauth_capture = ctx.token_resolver.is_some()
-        && method == "POST"
-        && upstream_path == "/v1/oauth/token";
+    let is_oauth_capture =
+        ctx.token_resolver.is_some() && method == "POST" && upstream_path == "/v1/oauth/token";
 
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
     let mut filtered_headers = filter_headers(remaining_header, strip_header);
@@ -435,9 +435,10 @@ where
 {
     // Read the full response into memory.
     let mut raw = Vec::new();
-    upstream.read_to_end(&mut raw).await.map_err(|e| {
-        ProxyError::HttpParse(format!("oauth-capture: upstream read failed: {e}"))
-    })?;
+    upstream
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| ProxyError::HttpParse(format!("oauth-capture: upstream read failed: {e}")))?;
 
     let status_code = parse_response_status(&raw);
 
@@ -450,7 +451,9 @@ where
 
     let Some(body_start) = header_end else {
         // Malformed response — forward as-is.
-        warn!("oauth-capture (reverse): response has no header/body separator; forwarding unchanged");
+        warn!(
+            "oauth-capture (reverse): response has no header/body separator; forwarding unchanged"
+        );
         client.write_all(&raw).await?;
         return Ok(status_code);
     };
@@ -458,72 +461,18 @@ where
     let header_bytes = &raw[..body_start];
     let body_bytes = &raw[body_start..];
 
-    let mut value: serde_json::Value = match serde_json::from_slice(body_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("oauth-capture (reverse): response is not JSON ({e}); forwarding unchanged");
+    let (new_body, substituted) = match rewrite_oauth_json_body(body_bytes, resolver) {
+        OauthRewriteOutcome::NotJson => {
+            warn!("oauth-capture (reverse): response is not JSON; forwarding unchanged");
             client.write_all(&raw).await?;
             return Ok(status_code);
         }
-    };
-
-    let mut substituted: u32 = 0;
-    if let Some(obj) = value.as_object_mut() {
-        let access = obj
-            .get("access_token")
-            .and_then(serde_json::Value::as_str)
-            .map(|s| zeroize::Zeroizing::new(s.to_string()));
-        let refresh = obj
-            .get("refresh_token")
-            .and_then(serde_json::Value::as_str)
-            .map(|s| zeroize::Zeroizing::new(s.to_string()));
-
-        match (access, refresh) {
-            (Some(a), Some(r)) => {
-                let (access_nonce, refresh_nonce) = resolver.capture_oauth_pair(a, r);
-                obj.insert(
-                    "access_token".to_string(),
-                    serde_json::Value::String(access_nonce),
-                );
-                obj.insert(
-                    "refresh_token".to_string(),
-                    serde_json::Value::String(refresh_nonce),
-                );
-                substituted = 2;
-            }
-            (Some(a), None) => {
-                let nonce = resolver.issue(a);
-                obj.insert(
-                    "access_token".to_string(),
-                    serde_json::Value::String(nonce),
-                );
-                substituted = 1;
-            }
-            (None, Some(r)) => {
-                let nonce = resolver.issue(r);
-                obj.insert(
-                    "refresh_token".to_string(),
-                    serde_json::Value::String(nonce),
-                );
-                substituted = 1;
-            }
-            (None, None) => {}
-        }
-    }
-
-    if substituted == 0 {
-        debug!("oauth-capture (reverse): no access_token/refresh_token in JSON; forwarding unchanged");
-        client.write_all(&raw).await?;
-        return Ok(status_code);
-    }
-
-    let new_body = match serde_json::to_vec(&value) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("oauth-capture (reverse): re-serialising failed ({e}); forwarding unchanged");
+        OauthRewriteOutcome::NoTokenFields => {
+            debug!("oauth-capture (reverse): no access_token/refresh_token to substitute; forwarding unchanged");
             client.write_all(&raw).await?;
             return Ok(status_code);
         }
+        OauthRewriteOutcome::Rewritten { bytes, substituted } => (bytes, substituted),
     };
 
     // Rebuild headers, replacing Content-Length and dropping Transfer-Encoding /
