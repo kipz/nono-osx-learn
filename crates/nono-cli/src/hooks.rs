@@ -354,5 +354,23 @@ mod tests {
             !script.contains("output_summary:"),
             "trajectory hook must not emit output_summary on tool_use(post)"
         );
+        // flock(1) must run with a timeout so a stale lock owner can't pin
+        // every subsequent hook invocation. Drops the event rather than
+        // blocking Claude Code's hook dispatch.
+        assert!(
+            script.contains("flock -w"),
+            "trajectory hook must use flock with a -w timeout"
+        );
+        assert!(
+            !script.contains("flock 9\n"),
+            "trajectory hook must not call flock without a timeout"
+        );
+        // Sequence-number write must be failure-detecting. A silent redirect
+        // failure leaves seq_file at "0" forever and produces a stream of
+        // sequence_number=0 events that violate spec I9.
+        assert!(
+            script.contains("if ! printf '%s' \"$next_seq\" > \"$seq_file\""),
+            "trajectory hook must check seq_file write success"
+        );
     }
 }

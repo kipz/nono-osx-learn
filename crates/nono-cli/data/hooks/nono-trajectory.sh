@@ -63,29 +63,68 @@ pending_tool_file="$traj_root/.pending-tool-$session_id"
 mkdir -p "$traj_root" || exit 0
 chmod 700 "$traj_root" 2>/dev/null || true
 
-# Serialize reads and writes of the counters and output file under a single
-# lock so sequence_number is strictly increasing across concurrent hook
-# invocations (trajectory-spec I9).
-lock="$traj_root/.lock-$session_id"
-exec 9>"$lock" || exit 0
+# Serialize reads and writes of the counters and output file so sequence_number
+# is strictly increasing across concurrent hook invocations (trajectory-spec I9).
+# flock(1) ships on Linux but not BSD/macOS, so fall back to a portable
+# mkdir-based lock when it is unavailable. Either way, time out and drop the
+# event rather than block Claude Code's hook dispatch on a stale lock owner.
+lock_held=""
+lock_dir="$traj_root/.lockd-$session_id"
 if command -v flock >/dev/null 2>&1; then
-    flock 9
+    lock="$traj_root/.lock-$session_id"
+    if exec 9>"$lock" 2>/dev/null && flock -w 5 9; then
+        lock_held="flock"
+    else
+        exit 0
+    fi
+else
+    attempts=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -gt 50 ]; then
+            exit 0
+        fi
+        sleep 0.1
+    done
+    lock_held="mkdir"
 fi
+
+# Always release the lock on exit, even on early return below.
+release_lock() {
+    case "$lock_held" in
+        mkdir) rmdir "$lock_dir" 2>/dev/null || true ;;
+        flock) exec 9>&- 2>/dev/null || true ;;
+    esac
+}
+trap release_lock EXIT
 
 seq=$(cat "$seq_file" 2>/dev/null || echo 0)
 case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
 next_seq=$((seq + 1))
-printf '%s' "$next_seq" > "$seq_file"
+# Detect write failure (e.g. permission, disk full, fs corruption) and drop
+# the event rather than emit a stale sequence_number that violates I9. With
+# `set -u` but no `set -e`, an unchecked redirection failure was silently
+# leaving seq_file at "0" forever, repeating sequence_number=0 on every event.
+if ! printf '%s' "$next_seq" > "$seq_file" 2>/dev/null; then
+    exit 0
+fi
 
 turn=$(cat "$turn_file" 2>/dev/null || echo 0)
 case "$turn" in ''|*[!0-9]*) turn=0 ;; esac
 
 # RFC 3339 UTC timestamp with millisecond precision. BSD `date` (macOS) does
-# not support %3N / %N, so fall back to python when available.
+# not support %3N / %N, so fall back to python when available. Capture the
+# datetime once — splitting the seconds and sub-second components across two
+# datetime.now() calls produces an inconsistent timestamp when the two reads
+# straddle a millisecond boundary.
 if date -u +"%Y-%m-%dT%H:%M:%S.%3NZ" 2>/dev/null | grep -qv 'N'; then
     ts=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
 else
-    ts=$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z")' 2>/dev/null)
+    ts=$(python3 -c '
+from datetime import datetime, timezone
+n = datetime.now(timezone.utc)
+print(n.strftime("%Y-%m-%dT%H:%M:%S.") + f"{n.microsecond // 1000:03d}Z")
+' 2>/dev/null)
     if [ -z "$ts" ]; then
         ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     fi
@@ -108,7 +147,10 @@ emit() {
 
 case "$event_name" in
     SessionStart)
-        model=$(printf '%s' "$payload" | jq -r '.model // "unknown"')
+        # Claude Code's SessionStart payload (session_id / transcript_path / cwd /
+        # hook_event_name / source) does not carry the agent model. Read it from
+        # NONO_AGENT_MODEL when the launcher exports it; emit "unknown" otherwise.
+        model="${NONO_AGENT_MODEL:-unknown}"
         cwd=$(printf '%s' "$payload" | jq -r '.cwd // ""')
         source=$(printf '%s' "$payload" | jq -r '.source // ""')
         extra=$(jq -nc \
@@ -128,7 +170,7 @@ case "$event_name" in
             } | del(..|nulls)')
         emit session_start "$extra"
         # Fresh session: no turn has started yet.
-        printf '0' > "$turn_file"
+        printf '0' > "$turn_file" 2>/dev/null || true
         ;;
 
     UserPromptSubmit)
@@ -136,7 +178,11 @@ case "$event_name" in
         # any tool_use events Claude emits while responding share the same turn_id.
         # The prompt text itself is not captured — see privacy note in header.
         turn=$((turn + 1))
-        printf '%s' "$turn" > "$turn_file"
+        # Drop the event if turn_file write fails, otherwise the next invocation
+        # would re-read the stale value and emit a duplicated turn_id.
+        if ! printf '%s' "$turn" > "$turn_file" 2>/dev/null; then
+            exit 0
+        fi
         extra=$(jq -nc --argjson tid "$turn" '{turn_id: $tid}')
         emit input_prompt "$extra"
         ;;
@@ -200,8 +246,9 @@ case "$event_name" in
             --argjson tt "$turn" \
             '{exit_reason: $er, total_turns: $tt}')
         emit session_end "$extra"
-        # Clean up sidecars; leave the JSONL output in place.
-        rm -f "$seq_file" "$turn_file" "$pending_tool_file" "$lock" 2>/dev/null || true
+        # Clean up sidecars; leave the JSONL output in place. The lock file
+        # (or lock dir) is released by the EXIT trap and removed below.
+        rm -f "$seq_file" "$turn_file" "$pending_tool_file" "$traj_root/.lock-$session_id" 2>/dev/null || true
         ;;
 
     *)
