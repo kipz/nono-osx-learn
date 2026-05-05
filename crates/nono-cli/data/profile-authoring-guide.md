@@ -200,7 +200,7 @@ Map of application name to hook configuration:
 {
   "hooks": {
     "claude-code": {
-      "event": "PostToolUseFailure",
+      "events": "PostToolUseFailure",
       "matcher": "Read|Write|Edit|Bash",
       "script": "nono-hook.sh"
     }
@@ -208,11 +208,25 @@ Map of application name to hook configuration:
 }
 ```
 
-| Field     | Type   | Description |
-|-----------|--------|-------------|
-| `event`   | string | Trigger event name. |
-| `matcher` | string | Regex for tool name matching. |
-| `script`  | string | Script filename from embedded hooks. |
+Multi-event hooks register the same script with the same matcher on every listed event:
+
+```json
+{
+  "hooks": {
+    "claude-code": {
+      "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"],
+      "matcher": "*",
+      "script": "nono-trajectory.sh"
+    }
+  }
+}
+```
+
+| Field     | Type             | Description |
+|-----------|------------------|-------------|
+| `events`  | string \| array  | Trigger event name, or an array of event names for multi-event hooks. |
+| `matcher` | string           | Regex for tool name matching. |
+| `script`  | string           | Script filename from embedded hooks. |
 
 ### rollback (alias: undo)
 

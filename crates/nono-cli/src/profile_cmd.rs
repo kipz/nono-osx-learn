@@ -1119,7 +1119,7 @@ fn profile_to_json(
                 (
                     k.clone(),
                     serde_json::json!({
-                        "event": v.event,
+                        "events": v.events,
                         "matcher": v.matcher,
                         "script": v.script,
                     }),
@@ -1574,7 +1574,7 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         .filter(|k| {
             let a = &p1.hooks.hooks[**k];
             let b = &p2.hooks.hooks[**k];
-            a.event != b.event || a.matcher != b.matcher || a.script != b.script
+            a.events != b.events || a.matcher != b.matcher || a.script != b.script
         })
         .copied()
         .collect();
@@ -1929,7 +1929,7 @@ fn diff_hooks_json(
         .filter(|k| {
             h2.get(*k).is_some_and(|v2| {
                 let v1 = &h1[*k];
-                v1.event != v2.event || v1.matcher != v2.matcher || v1.script != v2.script
+                v1.events != v2.events || v1.matcher != v2.matcher || v1.script != v2.script
             })
         })
         .collect();
@@ -1939,10 +1939,10 @@ fn diff_hooks_json(
         let old = &h1[*k];
         let new = &h2[*k];
         let mut detail = serde_json::Map::new();
-        if old.event != new.event {
+        if old.events != new.events {
             detail.insert(
-                "event".into(),
-                serde_json::json!({"profile1": old.event, "profile2": new.event}),
+                "events".into(),
+                serde_json::json!({"profile1": old.events, "profile2": new.events}),
             );
         }
         if old.matcher != new.matcher {

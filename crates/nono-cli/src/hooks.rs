@@ -149,8 +149,8 @@ fn install_claude_code_hook(
     Ok(result)
 }
 
-/// Update Claude Code settings.json to register the hook on each event in
-/// `config.event_list()`. Registration is idempotent per (event, command).
+/// Update Claude Code settings.json to register the hook on every event in
+/// `config.events`. Registration is idempotent per (event, command).
 /// Returns true if settings were modified, false if every registration was already present.
 fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Result<bool> {
     // Load existing settings or create new
@@ -184,8 +184,8 @@ fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Resul
     // Build the hook command path (use $HOME for portability)
     let hook_command = format!("$HOME/.claude/hooks/{}", config.script);
 
-    let mut any_changed = false;
-    for event in config.event_list() {
+    let mut newly_registered: Vec<&str> = Vec::new();
+    for event in config.events.iter().map(String::as_str) {
         // Get or create event array
         if !hooks.contains_key(event) {
             hooks.insert(event.to_string(), json!([]));
@@ -214,12 +214,6 @@ fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Resul
             continue;
         }
 
-        tracing::info!(
-            "Registering hook for {} event with matcher '{}'",
-            event,
-            config.matcher
-        );
-
         let hook_entry = json!({
             "matcher": config.matcher,
             "hooks": [{
@@ -228,7 +222,17 @@ fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Resul
             }]
         });
         event_hooks.push(hook_entry);
-        any_changed = true;
+        newly_registered.push(event);
+    }
+
+    let any_changed = !newly_registered.is_empty();
+    if any_changed {
+        tracing::info!(
+            "Registered {} on events [{}] with matcher '{}'",
+            config.script,
+            newly_registered.join(", "),
+            config.matcher
+        );
     }
 
     if any_changed {

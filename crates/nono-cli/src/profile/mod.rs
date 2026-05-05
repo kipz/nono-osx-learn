@@ -930,13 +930,12 @@ pub struct SecretsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
-    /// Primary event that triggers the hook (e.g., "PostToolUseFailure").
-    pub event: String,
-    /// Additional events that should run the same script with the same
-    /// matcher. Empty by default; used by multi-event hooks like the
-    /// trajectory dispatcher which registers on `SessionStart`,
-    /// `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `SessionEnd`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Events that trigger the hook. Accepts either a single string
+    /// (`"events": "PostToolUseFailure"`) or an array
+    /// (`"events": ["SessionStart", "PreToolUse", ...]`); both deserialize
+    /// to the same shape. Multi-event hooks register the same script with
+    /// the same matcher on every listed event.
+    #[serde(deserialize_with = "deserialize_string_or_seq")]
     pub events: Vec<String>,
     /// Regex pattern to match tool names (e.g., "Read|Write|Edit|Bash")
     pub matcher: String,
@@ -944,14 +943,47 @@ pub struct HookConfig {
     pub script: String,
 }
 
-impl HookConfig {
-    /// Full list of events this hook should register on: the primary
-    /// `event` followed by each entry in `events`, in declaration order.
-    pub fn event_list(&self) -> Vec<&str> {
-        std::iter::once(self.event.as_str())
-            .chain(self.events.iter().map(String::as_str))
-            .collect()
+/// Deserialize a field as either a single string or a sequence of strings.
+/// Used so `events` can be written as `"events": "PreToolUse"` for the
+/// common single-event case without forcing every profile author into the
+/// array syntax.
+fn deserialize_string_or_seq<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct StringOrSeq;
+
+    impl<'de> Visitor<'de> for StringOrSeq {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string or a sequence of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            Ok(vec![v.to_string()])
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
+            Ok(vec![v])
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
     }
+
+    deserializer.deserialize_any(StringOrSeq)
 }
 
 /// Hooks configuration in a profile
@@ -3981,8 +4013,7 @@ mod tests {
         base.hooks.hooks.insert(
             "claude-code".to_string(),
             HookConfig {
-                event: "PostToolUseFailure".to_string(),
-                events: Vec::new(),
+                events: vec!["PostToolUseFailure".to_string()],
                 matcher: "Bash".to_string(),
                 script: "base-hook.sh".to_string(),
             },
@@ -3992,8 +4023,7 @@ mod tests {
         child.hooks.hooks.insert(
             "opencode".to_string(),
             HookConfig {
-                event: "PreToolUse".to_string(),
-                events: Vec::new(),
+                events: vec!["PreToolUse".to_string()],
                 matcher: "Write".to_string(),
                 script: "child-hook.sh".to_string(),
             },
@@ -4008,8 +4038,7 @@ mod tests {
         base2.hooks.hooks.insert(
             "claude-code".to_string(),
             HookConfig {
-                event: "PostToolUseFailure".to_string(),
-                events: Vec::new(),
+                events: vec!["PostToolUseFailure".to_string()],
                 matcher: "Bash".to_string(),
                 script: "base-hook.sh".to_string(),
             },
@@ -4019,8 +4048,7 @@ mod tests {
         child2.hooks.hooks.insert(
             "claude-code".to_string(),
             HookConfig {
-                event: "PreToolUse".to_string(),
-                events: Vec::new(),
+                events: vec!["PreToolUse".to_string()],
                 matcher: "Read".to_string(),
                 script: "child-hook.sh".to_string(),
             },
@@ -4032,7 +4060,36 @@ mod tests {
             hook.script, "child-hook.sh",
             "child should win on collision"
         );
-        assert_eq!(hook.event, "PreToolUse");
+        assert_eq!(hook.events, vec!["PreToolUse".to_string()]);
+    }
+
+    #[test]
+    fn test_hook_config_deserializes_string_or_array() {
+        // Single-string form (back-compat with the old `event: String` shape).
+        let single: HookConfig = serde_json::from_str(
+            r#"{"events": "PostToolUseFailure", "matcher": "Bash", "script": "x.sh"}"#,
+        )
+        .expect("single string events should deserialize");
+        assert_eq!(single.events, vec!["PostToolUseFailure".to_string()]);
+
+        // Array form.
+        let multi: HookConfig = serde_json::from_str(
+            r#"{"events": ["SessionStart", "PreToolUse"], "matcher": "*", "script": "y.sh"}"#,
+        )
+        .expect("array events should deserialize");
+        assert_eq!(
+            multi.events,
+            vec!["SessionStart".to_string(), "PreToolUse".to_string()]
+        );
+
+        // Old `event` field is no longer accepted (deny_unknown_fields).
+        let legacy = serde_json::from_str::<HookConfig>(
+            r#"{"event": "PreToolUse", "matcher": "*", "script": "x.sh"}"#,
+        );
+        assert!(
+            legacy.is_err(),
+            "legacy `event` field must be rejected by deny_unknown_fields"
+        );
     }
 
     #[test]

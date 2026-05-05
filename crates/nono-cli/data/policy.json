@@ -701,8 +701,8 @@
       },
       "hooks": {
         "claude-code": {
-          "event": "SessionStart",
           "events": [
+            "SessionStart",
             "UserPromptSubmit",
             "PreToolUse",
             "PostToolUse",
