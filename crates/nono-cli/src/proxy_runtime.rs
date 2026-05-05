@@ -296,13 +296,21 @@ fn build_oauth_capture_runtime(
     proxy_config: &mut nono_proxy::config::ProxyConfig,
     caps: &mut CapabilitySet,
 ) -> Result<(nono_proxy::ProxyRuntime, PathBuf)> {
-    // Ensure the intercept routes are present. Idempotent: skip any whose
-    // prefix is already configured (operator may have wired declaratively).
-    // We add three routes: api.anthropic.com, claude.ai, and
-    // platform.claude.com. Binary analysis confirmed TOKEN_URL is on
-    // platform.claude.com — the PKCE code exchange goes there, not to
-    // api.anthropic.com or claude.ai. All three are intercepted so we
-    // capture whichever host the client actually calls.
+    // Ensure the intercept routes are present. We add three routes:
+    // api.anthropic.com, claude.ai, and platform.claude.com. Binary
+    // analysis confirmed TOKEN_URL is on platform.claude.com — the PKCE
+    // code exchange goes there, not to api.anthropic.com or claude.ai.
+    // All three are intercepted so we capture whichever host the client
+    // actually calls.
+    //
+    // Each prefix lives in the reserved `__nono_` namespace
+    // ([`nono_proxy::RESERVED_PREFIX_NAMESPACE`]) so user profiles cannot
+    // declare a colliding route — `RouteStore::load` rejects user routes
+    // whose prefix sits in that namespace. The dedup loop below is a
+    // safety net for re-entry within a single nono process (e.g. if a
+    // future caller invokes `build_oauth_capture_runtime` more than once
+    // against the same `proxy_config`); it is no longer the user-collision
+    // defence.
     for route in oauth_capture_routes() {
         if !proxy_config.routes.iter().any(|r| r.prefix == route.prefix) {
             proxy_config.routes.push(route);
@@ -407,6 +415,20 @@ fn create_session_ca_dir_in(parent: &std::path::Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Prefix for the OAuth-capture intercept route targeting
+/// `api.anthropic.com`. Lives in the reserved `__nono_` namespace
+/// (see [`nono_proxy::RESERVED_PREFIX_NAMESPACE`]) so user profiles
+/// cannot declare a colliding prefix.
+const OAUTH_PREFIX_ANTHROPIC: &str = "__nono_oauth_anthropic";
+
+/// Prefix for the OAuth-capture intercept route targeting `claude.ai`.
+const OAUTH_PREFIX_CLAUDEAI: &str = "__nono_oauth_claudeai";
+
+/// Prefix for the OAuth-capture intercept route targeting
+/// `platform.claude.com`. The PKCE token exchange (Layer 1.2) lands
+/// here per binary analysis of the Claude Code CLI.
+const OAUTH_PREFIX_PLATFORM: &str = "__nono_oauth_platform";
+
 /// The intercept routes injected during OAuth capture (Layer 1 of
 /// `2026-04-27-capture-anthropic-auth.md`).
 ///
@@ -417,6 +439,13 @@ fn create_session_ca_dir_in(parent: &std::path::Path) -> Result<PathBuf> {
 /// `platform.claude.com`, NOT `api.anthropic.com` or `claude.ai`.
 /// All three hosts are intercepted so we catch the exchange regardless of
 /// which OAuth server handles it.
+///
+/// Each prefix sits in the reserved `__nono_` namespace; user-supplied
+/// routes with that prefix are rejected by `RouteStore::load`. The
+/// previous prefix names (`claude-oauth`, `claude-oauth-claudeai`,
+/// `claude-oauth-platform`) looked like ordinary service names and could
+/// be silently shadowed by a user route — switching to the reserved
+/// namespace closes that gap.
 fn oauth_capture_routes() -> Vec<nono_proxy::config::RouteConfig> {
     use nono_proxy::config::{InjectMode, RouteConfig};
     let make = |prefix: &str, upstream: &str| RouteConfig {
@@ -442,9 +471,9 @@ fn oauth_capture_routes() -> Vec<nono_proxy::config::RouteConfig> {
         tls_intercept: true,
     };
     vec![
-        make("claude-oauth", "https://api.anthropic.com"),
-        make("claude-oauth-claudeai", "https://claude.ai"),
-        make("claude-oauth-platform", "https://platform.claude.com"),
+        make(OAUTH_PREFIX_ANTHROPIC, "https://api.anthropic.com"),
+        make(OAUTH_PREFIX_CLAUDEAI, "https://claude.ai"),
+        make(OAUTH_PREFIX_PLATFORM, "https://platform.claude.com"),
     ]
 }
 
@@ -526,6 +555,38 @@ mod ca_dir_tests {
             err.kind(),
             std::io::ErrorKind::AlreadyExists,
             "DirBuilder::create on a pre-existing path must error AlreadyExists"
+        );
+    }
+}
+
+#[cfg(test)]
+mod oauth_capture_routes_tests {
+    use super::*;
+
+    #[test]
+    fn oauth_capture_routes_use_reserved_namespace() {
+        // Sanity-check: every injected route sits in the reserved
+        // namespace so a user route with the same prefix is rejected at
+        // config load and cannot shadow a capture route.
+        for route in oauth_capture_routes() {
+            assert!(
+                nono_proxy::is_reserved_prefix(&route.prefix),
+                "OAuth-capture route prefix {:?} must use the reserved namespace",
+                route.prefix
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_capture_routes_distinct_prefixes() {
+        let routes = oauth_capture_routes();
+        let mut prefixes: Vec<_> = routes.iter().map(|r| r.prefix.clone()).collect();
+        prefixes.sort();
+        prefixes.dedup();
+        assert_eq!(
+            prefixes.len(),
+            routes.len(),
+            "every OAuth-capture route should have a distinct prefix"
         );
     }
 }

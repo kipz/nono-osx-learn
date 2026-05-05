@@ -36,4 +36,5 @@ pub mod token;
 pub use broker::TokenResolver;
 pub use config::ProxyConfig;
 pub use error::{ProxyError, Result};
+pub use route::{is_reserved_prefix, RESERVED_PREFIX_NAMESPACE};
 pub use server::{start, start_with_runtime, ProxyHandle, ProxyRuntime};

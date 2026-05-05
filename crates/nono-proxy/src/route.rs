@@ -18,6 +18,24 @@ use std::sync::Arc;
 use tracing::debug;
 use zeroize::Zeroizing;
 
+/// Reserved route-prefix namespace for nono-internal routes.
+///
+/// Any prefix starting with this string is reserved for nono itself
+/// (e.g. the OAuth-capture intercept routes injected at proxy startup).
+/// User-supplied profiles that try to declare a prefix in this namespace
+/// are rejected at config-load time so a colliding user route cannot
+/// shadow or disable an internal one.
+pub const RESERVED_PREFIX_NAMESPACE: &str = "__nono_";
+
+/// Returns true if `prefix` (raw or with surrounding slashes) lives in
+/// the reserved [`RESERVED_PREFIX_NAMESPACE`].
+#[must_use]
+pub fn is_reserved_prefix(prefix: &str) -> bool {
+    prefix
+        .trim_matches('/')
+        .starts_with(RESERVED_PREFIX_NAMESPACE)
+}
+
 /// Route-level configuration loaded at proxy startup.
 ///
 /// Contains everything needed to forward and filter a request for a route,
@@ -462,6 +480,43 @@ mod tests {
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
         assert!(store.get("openai").is_none());
+    }
+
+    #[test]
+    fn test_is_reserved_prefix_accepts_namespace() {
+        // Bare reserved-namespace names and the canonical OAuth-capture
+        // names must report as reserved.
+        assert!(is_reserved_prefix("__nono_"));
+        assert!(is_reserved_prefix("__nono_oauth_anthropic"));
+        assert!(is_reserved_prefix("__nono_oauth_claudeai"));
+        assert!(is_reserved_prefix("__nono_oauth_platform"));
+    }
+
+    #[test]
+    fn test_is_reserved_prefix_normalises_slashes() {
+        // The proxy normalises route prefixes by trimming surrounding
+        // slashes; the helper must match that normalisation so a user
+        // cannot bypass the check by writing "/__nono_evil" or
+        // "__nono_evil/".
+        assert!(is_reserved_prefix("/__nono_evil"));
+        assert!(is_reserved_prefix("__nono_evil/"));
+        assert!(is_reserved_prefix("/__nono_evil/"));
+    }
+
+    #[test]
+    fn test_is_reserved_prefix_rejects_lookalikes() {
+        // Common ordinary route names must NOT match.
+        assert!(!is_reserved_prefix(""));
+        assert!(!is_reserved_prefix("openai"));
+        assert!(!is_reserved_prefix("anthropic"));
+        assert!(!is_reserved_prefix("claude-oauth"));
+        // "nono_" without the leading "__" is not in the reserved
+        // namespace; only the double-underscore prefix is reserved.
+        assert!(!is_reserved_prefix("nono_compat"));
+        assert!(!is_reserved_prefix("_nono_one_underscore"));
+        // A single-underscore-prefixed name that *contains* `nono_` as
+        // a substring further in is also not reserved.
+        assert!(!is_reserved_prefix("my_nono_helper"));
     }
 
     #[test]

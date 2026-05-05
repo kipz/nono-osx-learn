@@ -308,6 +308,19 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields
 fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<()> {
+    // Reject names in the reserved nono-internal namespace. The
+    // resulting route prefix would otherwise shadow nono's own
+    // injected routes (e.g. the OAuth-capture intercept routes).
+    if nono_proxy::is_reserved_prefix(name) {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential name '{}' uses the reserved '{}' prefix \
+             namespace; that namespace is reserved for nono-internal \
+             routes. Pick a different name.",
+            name,
+            nono_proxy::RESERVED_PREFIX_NAMESPACE
+        )));
+    }
+
     // Mutual exclusion: credential_key and auth cannot both be set
     if cred.credential_key.is_some() && cred.auth.is_some() {
         return Err(NonoError::ProfileParse(format!(
@@ -2992,6 +3005,34 @@ mod tests {
     fn test_validate_custom_credential_valid() {
         let cred = header_cred_builder();
         assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_credential_rejects_reserved_prefix() {
+        // Names in the `__nono_` namespace are reserved for nono-internal
+        // routes (e.g. OAuth-capture intercept routes). User profiles
+        // must not declare credentials there.
+        let cred = header_cred_builder();
+        let result = validate_custom_credential("__nono_oauth_evil", &cred);
+        let err = result.expect_err("reserved-prefix names must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserved"),
+            "error should mention the reserved namespace, got: {msg}"
+        );
+        assert!(
+            msg.contains("__nono_"),
+            "error should name the reserved prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_allows_underscored_non_reserved() {
+        // A name that contains `nono` but not the `__nono_` prefix is
+        // not in the reserved namespace and must be accepted.
+        let cred = header_cred_builder();
+        assert!(validate_custom_credential("my_nono_helper", &cred).is_ok());
+        assert!(validate_custom_credential("nono_compat", &cred).is_ok());
     }
 
     #[test]
