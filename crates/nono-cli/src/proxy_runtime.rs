@@ -10,47 +10,63 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Prefix for the OAuth-capture intercept route targeting
+/// `api.anthropic.com`. Lives in the reserved `__nono_` namespace
+/// (see [`nono_proxy::RESERVED_PREFIX_NAMESPACE`]) so user profiles
+/// cannot declare a colliding prefix and silently shadow the capture
+/// path.
+const OAUTH_PREFIX_ANTHROPIC: &str = "__nono_oauth_anthropic";
+
+/// Prefix for the OAuth-capture intercept route targeting `claude.ai`.
+const OAUTH_PREFIX_CLAUDEAI: &str = "__nono_oauth_claudeai";
+
+/// Prefix for the OAuth-capture intercept route targeting
+/// `platform.claude.com`. The PKCE token exchange (Layer 1.2) lands
+/// here per binary analysis of the Claude Code CLI.
+const OAUTH_PREFIX_PLATFORM: &str = "__nono_oauth_platform";
+
 /// Synthesise the three Anthropic OAuth-capture routes the CLI injects
 /// when OAuth capture is active.
 ///
-/// Binary analysis of Claude Code 2.1.x shows the OAuth code-exchange
-/// `TOKEN_URL` lives at `platform.claude.com`, but the agent also talks
-/// to `api.anthropic.com` (API requests) and `claude.ai` (Pro/Max
-/// flow). All three get OAuth-capture routes so capture fires
-/// regardless of which host the client picks. Both URL-match patterns
-/// point at the same path because the OAuth endpoint serves both
-/// initial-token-issuance and refresh exchanges from one URL.
+/// Binary analysis (`strings claude | grep TOKEN_URL`) confirms:
+///   TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+///
+/// The PKCE code exchange (POST /v1/oauth/token) goes to
+/// `platform.claude.com`, NOT `api.anthropic.com` or `claude.ai`. All
+/// three hosts are intercepted so we catch the exchange regardless of
+/// which OAuth server handles it.
+///
+/// Each prefix sits in the reserved `__nono_` namespace; user-supplied
+/// routes with that prefix are rejected by the loader, so a user
+/// profile cannot silently shadow the OAuth-capture path.
 fn oauth_capture_routes() -> Vec<nono_proxy::config::RouteConfig> {
     use nono_proxy::config::{InjectMode, RouteConfig};
-    let hosts = [
-        ("anthropic-oauth", "https://api.anthropic.com"),
-        ("claude-ai-oauth", "https://claude.ai"),
-        ("platform-claude-oauth", "https://platform.claude.com"),
-    ];
-    hosts
-        .into_iter()
-        .map(|(prefix, upstream)| RouteConfig {
-            prefix: prefix.to_string(),
-            upstream: upstream.to_string(),
-            credential_key: None,
-            inject_mode: InjectMode::OauthCapture {
-                token_url_match: "/api/oauth/token".to_string(),
-                refresh_url_match: "/api/oauth/token".to_string(),
-            },
-            inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
-            path_pattern: None,
-            path_replacement: None,
-            query_param_name: None,
-            proxy: None,
-            env_var: None,
-            endpoint_rules: vec![],
-            tls_ca: None,
-            tls_client_cert: None,
-            tls_client_key: None,
-            oauth2: None,
-        })
-        .collect()
+    let make = |prefix: &str, upstream: &str| RouteConfig {
+        prefix: prefix.to_string(),
+        upstream: upstream.to_string(),
+        credential_key: None,
+        inject_mode: InjectMode::OauthCapture {
+            token_url_match: "/v1/oauth/token".to_string(),
+            refresh_url_match: "/v1/oauth/token".to_string(),
+        },
+        inject_header: "Authorization".to_string(),
+        credential_format: "Bearer {}".to_string(),
+        path_pattern: None,
+        path_replacement: None,
+        query_param_name: None,
+        proxy: None,
+        env_var: None,
+        endpoint_rules: vec![],
+        tls_ca: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        oauth2: None,
+    };
+    vec![
+        make(OAUTH_PREFIX_ANTHROPIC, "https://api.anthropic.com"),
+        make(OAUTH_PREFIX_CLAUDEAI, "https://claude.ai"),
+        make(OAUTH_PREFIX_PLATFORM, "https://platform.claude.com"),
+    ]
 }
 
 pub(crate) struct ActiveProxyRuntime {
@@ -571,5 +587,37 @@ mod tests {
                 "OauthCapture routes carry no pre-loaded credential"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod oauth_capture_routes_tests {
+    use super::*;
+
+    #[test]
+    fn oauth_capture_routes_use_reserved_namespace() {
+        // Sanity-check: every injected route sits in the reserved
+        // namespace so a user route with the same prefix is rejected at
+        // config load and cannot shadow a capture route.
+        for route in oauth_capture_routes() {
+            assert!(
+                nono_proxy::is_reserved_prefix(&route.prefix),
+                "OAuth-capture route prefix {:?} must use the reserved namespace",
+                route.prefix
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_capture_routes_distinct_prefixes() {
+        let routes = oauth_capture_routes();
+        let mut prefixes: Vec<_> = routes.iter().map(|r| r.prefix.clone()).collect();
+        prefixes.sort();
+        prefixes.dedup();
+        assert_eq!(
+            prefixes.len(),
+            routes.len(),
+            "every OAuth-capture route should have a distinct prefix"
+        );
     }
 }
