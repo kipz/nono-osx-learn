@@ -180,42 +180,24 @@ pub async fn handle_reverse_proxy(
             None
         };
 
-    // Authenticate the request. Every reverse proxy request must prove
-    // possession of the session token, regardless of whether a credential
-    // is configured — this is the localhost auth boundary.
-    // Exception: an OAuth credential is its own proof when capture is active.
-    if oauth_passthrough_cred.is_none() {
-        if let Some(cred) = cred {
-            if let Err(e) = validate_phantom_token_for_mode(
-                &cred.proxy_inject_mode,
-                remaining_header,
-                &upstream_path,
-                &cred.proxy_header_name,
-                cred.proxy_path_pattern.as_deref(),
-                cred.proxy_query_param_name.as_deref(),
-                ctx.session_token,
-            ) {
-                audit::log_denied(
-                    ctx.audit_log,
-                    audit::ProxyMode::Reverse,
-                    &service,
-                    0,
-                    &e.to_string(),
-                );
-                send_error(stream, 401, "Unauthorized").await?;
-                return Ok(());
-            }
-        } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
-            audit::log_denied(
-                ctx.audit_log,
-                audit::ProxyMode::Reverse,
-                &service,
-                0,
-                &e.to_string(),
-            );
-            send_error(stream, 407, "Proxy Authentication Required").await?;
-            return Ok(());
-        }
+    // Authenticate the request. Every reverse-proxy request must prove
+    // possession of the session token; this is the localhost auth boundary.
+    if let Err(e) = authenticate_reverse_proxy_request(
+        oauth_passthrough_cred.is_some(),
+        cred,
+        remaining_header,
+        &upstream_path,
+        ctx.session_token,
+    ) {
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &service,
+            0,
+            &e.error.to_string(),
+        );
+        send_error(stream, e.status_code, e.status_msg).await?;
+        return Ok(());
     }
 
     let transformed_path = if let Some(cred) = cred {
@@ -1163,6 +1145,71 @@ async fn send_error(stream: &mut TcpStream, status: u16, reason: &str) -> Result
 
 /// Validate phantom token based on injection mode.
 ///
+/// Auth-failure carrier for [`authenticate_reverse_proxy_request`].
+///
+/// Captures both the underlying [`ProxyError`] (for audit logging) and the
+/// HTTP status to send back to the client. Phantom-token failures keep the
+/// pre-existing 401 status; Proxy-Authorization failures surface as 407.
+struct AuthFailure {
+    error: ProxyError,
+    status_code: u16,
+    status_msg: &'static str,
+}
+
+/// Authenticate a reverse-proxy request against the session token.
+///
+/// Three modes:
+/// - **OAuth pass-through** (`oauth_passthrough` true, with or without a
+///   static credential): the credential header carries an OAuth bearer
+///   (real token or a `nono_<hex>` nonce), not a phantom token, so the
+///   phantom-token shape check would be wrong. Session-token proof must
+///   instead arrive via `Proxy-Authorization`. This guarantees a localhost
+///   peer cannot drive the proxy by presenting any bearer value (e.g. a
+///   nonce read from the keychain by another local app).
+/// - **Static credential, no pass-through**: the credential header carries
+///   the phantom token; validate via [`validate_phantom_token_for_mode`].
+/// - **No credential**: validate `Proxy-Authorization` directly.
+fn authenticate_reverse_proxy_request(
+    oauth_passthrough: bool,
+    cred: Option<&LoadedCredential>,
+    remaining_header: &[u8],
+    upstream_path: &str,
+    session_token: &Zeroizing<String>,
+) -> std::result::Result<(), AuthFailure> {
+    if oauth_passthrough {
+        return token::validate_proxy_auth(remaining_header, session_token).map_err(|e| {
+            AuthFailure {
+                error: e,
+                status_code: 407,
+                status_msg: "Proxy Authentication Required",
+            }
+        });
+    }
+
+    if let Some(cred) = cred {
+        return validate_phantom_token_for_mode(
+            &cred.proxy_inject_mode,
+            remaining_header,
+            upstream_path,
+            &cred.proxy_header_name,
+            cred.proxy_path_pattern.as_deref(),
+            cred.proxy_query_param_name.as_deref(),
+            session_token,
+        )
+        .map_err(|e| AuthFailure {
+            error: e,
+            status_code: 401,
+            status_msg: "Unauthorized",
+        });
+    }
+
+    token::validate_proxy_auth(remaining_header, session_token).map_err(|e| AuthFailure {
+        error: e,
+        status_code: 407,
+        status_msg: "Proxy Authentication Required",
+    })
+}
+
 /// Different modes extract the phantom token from different locations:
 /// - `Header`/`BasicAuth`: From the auth header (Authorization, x-api-key, etc.)
 /// - `UrlPath`: From the URL path pattern (e.g., `/bot<token>/getMe`)
@@ -2201,5 +2248,143 @@ mod tests {
             transform_path_for_mode(&InjectMode::Header, &cleaned, None, None, None, &credential)
                 .unwrap();
         assert_eq!(transformed, "/api/v1/pods?limit=100");
+    }
+
+    /// Build a minimal `LoadedCredential` for the auth-decision tests.
+    /// `handle_reverse_proxy` is hard to drive end-to-end from a unit test
+    /// (it owns a `TcpStream` and a full HTTP parser), so we cover the auth
+    /// gate via the small pure helper instead.
+    fn loaded_credential_for_auth_test() -> LoadedCredential {
+        LoadedCredential {
+            inject_mode: InjectMode::Header,
+            header_name: "Authorization".to_string(),
+            header_value: Zeroizing::new("Bearer real_upstream_secret".to_string()),
+            raw_credential: Zeroizing::new("real_upstream_secret".to_string()),
+            proxy_header_name: "Authorization".to_string(),
+            proxy_inject_mode: InjectMode::Header,
+            proxy_path_pattern: None,
+            proxy_query_param_name: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        }
+    }
+
+    #[test]
+    fn oauth_passthrough_requires_session_token_and_returns_407() {
+        // Issue #6 regression: when oauth_passthrough is active, the auth
+        // gate previously short-circuited to "always allow". The fix
+        // requires Proxy-Authorization to be present and correct, returning
+        // 407 (Proxy Authentication Required) when it is missing or wrong.
+        let session = Zeroizing::new("session-secret".to_string());
+        let header_no_proxy_auth =
+            b"Authorization: Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+              Content-Type: application/json\r\n\r\n";
+        let result = authenticate_reverse_proxy_request(
+            true,
+            None,
+            header_no_proxy_auth,
+            "/v1/oauth/token",
+            &session,
+        );
+        match result {
+            Err(failure) => {
+                assert_eq!(failure.status_code, 407);
+                assert_eq!(failure.status_msg, "Proxy Authentication Required");
+            }
+            Ok(()) => panic!("missing Proxy-Authorization must be rejected in pass-through mode"),
+        }
+    }
+
+    #[test]
+    fn oauth_passthrough_with_wrong_session_token_returns_407() {
+        let session = Zeroizing::new("session-secret".to_string());
+        let header_wrong_proxy_auth =
+            b"Authorization: Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+              Proxy-Authorization: Bearer not-the-session-token\r\n\r\n";
+        let result = authenticate_reverse_proxy_request(
+            true,
+            None,
+            header_wrong_proxy_auth,
+            "/v1/oauth/token",
+            &session,
+        );
+        let failure = result.expect_err("wrong session token must be rejected");
+        assert_eq!(failure.status_code, 407);
+    }
+
+    #[test]
+    fn oauth_passthrough_with_valid_session_token_passes() {
+        let session = Zeroizing::new("session-secret".to_string());
+        let header_valid = b"Authorization: Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+              Proxy-Authorization: Bearer session-secret\r\n\r\n";
+        let result = authenticate_reverse_proxy_request(
+            true,
+            None,
+            header_valid,
+            "/v1/oauth/token",
+            &session,
+        );
+        assert!(
+            result.is_ok(),
+            "valid session token must pass in pass-through mode"
+        );
+    }
+
+    #[test]
+    fn oauth_passthrough_with_static_credential_still_requires_proxy_auth() {
+        // When OAuth pass-through is active *and* a static credential is
+        // configured, the credential header carries an OAuth bearer (not a
+        // phantom token), so the phantom-token shape check would be wrong.
+        // Session-token proof must arrive via Proxy-Authorization regardless.
+        let session = Zeroizing::new("session-secret".to_string());
+        let cred = loaded_credential_for_auth_test();
+        let header_no_proxy_auth =
+            b"Authorization: Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n";
+        let result = authenticate_reverse_proxy_request(
+            true,
+            Some(&cred),
+            header_no_proxy_auth,
+            "/v1/oauth/token",
+            &session,
+        );
+        let failure = result.expect_err(
+            "OAuth pass-through with a static credential must still require Proxy-Authorization",
+        );
+        assert_eq!(failure.status_code, 407);
+    }
+
+    #[test]
+    fn non_passthrough_with_credential_uses_phantom_token_check() {
+        // Regression guard: the old auth path for the static-credential
+        // case (no OAuth pass-through) must still apply phantom-token
+        // validation and return 401 on failure, not 407.
+        let session = Zeroizing::new("session-secret".to_string());
+        let cred = loaded_credential_for_auth_test();
+        let header_wrong_phantom_token = b"Authorization: Bearer wrong-phantom-token\r\n\r\n";
+        let result = authenticate_reverse_proxy_request(
+            false,
+            Some(&cred),
+            header_wrong_phantom_token,
+            "/v1/messages",
+            &session,
+        );
+        let failure = result.expect_err("wrong phantom token must be rejected");
+        assert_eq!(failure.status_code, 401);
+        assert_eq!(failure.status_msg, "Unauthorized");
+    }
+
+    #[test]
+    fn non_passthrough_no_credential_uses_proxy_auth() {
+        let session = Zeroizing::new("session-secret".to_string());
+        let header_valid_proxy_auth = b"Proxy-Authorization: Bearer session-secret\r\n\r\n";
+        let result = authenticate_reverse_proxy_request(
+            false,
+            None,
+            header_valid_proxy_auth,
+            "/v1/messages",
+            &session,
+        );
+        assert!(result.is_ok());
     }
 }
