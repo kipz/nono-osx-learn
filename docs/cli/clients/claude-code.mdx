@@ -54,8 +54,8 @@ If you need different permissions, create a custom profile at `~/.config/nono/pr
     "version": "1.0.0",
     "description": "Claude Code with additional project access"
   },
-  "security": {
-    "groups": ["git_config"]
+  "groups": {
+    "include": ["git_config"]
   },
   "filesystem": {
     "allow": ["$WORKDIR", "$HOME/.claude"],

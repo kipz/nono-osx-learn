@@ -127,7 +127,7 @@ pub enum Commands {
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono run --allow . claude                    # Read/write current dir, run claude
-  nono run --profile claude-code claude        # Use a built-in profile
+  nono run --profile claude-code claude        # Use a profile
   nono run --profile claude-code --allow-domain api.openai.com claude
                                                # Restrict outbound access to listed domains
   nono run --read ./src --write ./output cargo build
@@ -167,7 +167,7 @@ pub enum Commands {
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono wrap --allow . -- cargo build           # Sandbox and exec into cargo build
-  nono wrap --profile developer -- cargo test  # Use a named profile
+  nono wrap --profile rust-dev -- cargo test    # Use a named profile
 ")]
     Wrap(Box<WrapArgs>),
 
@@ -511,9 +511,9 @@ IN-BAND DETACH:
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono pull nono-project/claude-code
-  nono pull nono-project/claude-code@1.2.0 --registry http://localhost:3000
-  nono pull nono-project/claude-code --init
+  nono pull always-further/claude
+  nono pull always-further/claude@1.2.0 --registry http://localhost:3000
+  nono pull always-further/claude --init
 ")]
     Pull(PullArgs),
 
@@ -527,7 +527,7 @@ IN-BAND DETACH:
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono remove nono-project/claude-code
+  nono remove always-further/claude
 ")]
     Remove(RemoveArgs),
 
@@ -542,7 +542,7 @@ IN-BAND DETACH:
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono update
-  nono update nono-project/claude-code
+  nono update always-further/claude
 ")]
     Update(UpdateArgs),
 

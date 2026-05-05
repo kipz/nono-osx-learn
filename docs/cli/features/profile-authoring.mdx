@@ -43,8 +43,8 @@ A minimal skeleton includes the core sections most profiles need:
     "name": "my-agent",
     "description": "Profile for my agent"
   },
-  "security": {
-    "groups": [
+  "groups": {
+    "include": [
       "deny_credentials"
     ]
   },
@@ -233,7 +233,7 @@ nono profile groups deny_credentials
 Groups are referenced by name in the `groups.include` field. See [Profiles & Groups](/cli/features/profiles-groups#groups) for the full group taxonomy and built-in group list.
 
 <Note>
-  The `groups.include` key was renamed from its former location under `security` in issue #594. The legacy key still deserializes with a deprecation warning; see `nono profile guide` for the full migration table. Legacy keys are removed in v1.0.0.
+  The `groups.include` key was renamed from its former location under `security` in issue #594. The legacy key still deserializes with a deprecation warning; see `nono profile guide` for the full migration table. Legacy keys will be removed in v1.0.0.
 </Note>
 
 ## Common Patterns

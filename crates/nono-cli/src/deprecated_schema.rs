@@ -294,7 +294,7 @@ pub(crate) fn format_deprecation_warning(
     issue: &str,
 ) -> String {
     format!(
-        "warning: deprecated key '{legacy}' — use '{canonical}' instead (removed in {remove_by}, {issue})"
+        "warning: deprecated key '{legacy}' — use '{canonical}' instead (will be removed in {remove_by}, {issue})"
     )
 }
 
