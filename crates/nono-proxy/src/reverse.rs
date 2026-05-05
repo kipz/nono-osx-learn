@@ -496,15 +496,25 @@ pub async fn handle_reverse_proxy(
     // Build the OAuth response hook if capture is active. See the
     // identical block in `tls_intercept/handle.rs::forward_inner_request`
     // for the design rationale (pass-through-on-error invariant).
+    // Audit logging of capture events (step 17 / commit `6df85cc`) is
+    // wired through `audit::log_oauth_capture` from within this hook so
+    // each successful rewrite emits an `OAUTH_CAPTURE substituted=N`
+    // event into the ring buffer.
     let response_hook: Option<forward::ResponseBodyRewriter<'_>> = if oauth_capture_active {
         ctx.token_resolver.map(|resolver| {
             let resolver = Arc::clone(resolver);
+            let audit_log_clone = ctx.audit_log.cloned();
+            let host_for_audit = upstream_host.clone();
+            let port_for_audit = upstream_port;
             let hook: forward::ResponseBodyRewriter<'_> = Box::new(move |body: &[u8]| {
                 match crate::oauth_rewrite::rewrite_oauth_json_body(body, resolver.as_ref()) {
                     crate::oauth_rewrite::OauthRewriteOutcome::Rewritten { bytes, substituted } => {
-                        debug!(
-                            "oauth-capture (reverse): rewrote {} token field(s)",
-                            substituted
+                        audit::log_oauth_capture(
+                            audit_log_clone.as_ref(),
+                            audit::ProxyMode::Reverse,
+                            &host_for_audit,
+                            port_for_audit,
+                            substituted,
                         );
                         Some(bytes.to_vec())
                     }

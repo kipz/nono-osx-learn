@@ -452,37 +452,45 @@ where
     // `rewrite_oauth_json_body` returns `NotJson` or `NoTokenFields`,
     // the hook returns `None` and `forward_request` forwards the
     // original bytes unchanged.
+    //
+    // Audit logging of capture events (step 17 / commit `6df85cc`) is
+    // wired through `audit::log_oauth_capture` from within this hook
+    // so each successful rewrite emits an `OAUTH_CAPTURE substituted=N`
+    // event into the ring buffer (with no token/nonce material).
     let response_hook: Option<forward::ResponseBodyRewriter<'_>> = if oauth_capture_active {
         ctx.token_resolver.map(|resolver| {
-                let resolver = Arc::clone(resolver);
-                let hook: forward::ResponseBodyRewriter<'_> = Box::new(move |body: &[u8]| {
-                    match crate::oauth_rewrite::rewrite_oauth_json_body(body, resolver.as_ref()) {
-                        crate::oauth_rewrite::OauthRewriteOutcome::Rewritten {
-                            bytes,
+            let resolver = Arc::clone(resolver);
+            let audit_log_clone = ctx.audit_log.cloned();
+            let host_for_audit = ctx.host.to_string();
+            let port_for_audit = ctx.port;
+            let hook: forward::ResponseBodyRewriter<'_> = Box::new(move |body: &[u8]| {
+                match crate::oauth_rewrite::rewrite_oauth_json_body(body, resolver.as_ref()) {
+                    crate::oauth_rewrite::OauthRewriteOutcome::Rewritten { bytes, substituted } => {
+                        audit::log_oauth_capture(
+                            audit_log_clone.as_ref(),
+                            audit::ProxyMode::ConnectIntercept,
+                            &host_for_audit,
+                            port_for_audit,
                             substituted,
-                        } => {
-                            debug!(
-                                "oauth-capture (tls_intercept): rewrote {} token field(s)",
-                                substituted
-                            );
-                            Some(bytes.to_vec())
-                        }
-                        crate::oauth_rewrite::OauthRewriteOutcome::NotJson => {
-                            warn!(
-                                "oauth-capture (tls_intercept): response not JSON; forwarding unchanged"
-                            );
-                            None
-                        }
-                        crate::oauth_rewrite::OauthRewriteOutcome::NoTokenFields => {
-                            debug!(
-                                "oauth-capture (tls_intercept): no token fields; forwarding unchanged"
-                            );
-                            None
-                        }
+                        );
+                        Some(bytes.to_vec())
                     }
-                });
-                hook
-            })
+                    crate::oauth_rewrite::OauthRewriteOutcome::NotJson => {
+                        warn!(
+                            "oauth-capture (tls_intercept): response not JSON; forwarding unchanged"
+                        );
+                        None
+                    }
+                    crate::oauth_rewrite::OauthRewriteOutcome::NoTokenFields => {
+                        debug!(
+                            "oauth-capture (tls_intercept): no token fields; forwarding unchanged"
+                        );
+                        None
+                    }
+                }
+            });
+            hook
+        })
     } else {
         None
     };
