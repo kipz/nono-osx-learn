@@ -4,7 +4,7 @@ use crate::mediation::broker::TokenBroker;
 use crate::network_policy;
 use crate::sandbox_prepare::{validate_external_proxy_bypass, PreparedSandbox};
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -286,7 +286,7 @@ pub(crate) fn start_proxy_runtime(
 
 /// Build the [`nono_proxy::ProxyRuntime`] for the OAuth-capture path:
 /// generate a session CA, materialize the public PEM under
-/// `$TMPDIR/nono-pid-<pid>/`, mount it as readable in the child's
+/// `$TMPDIR/nono-pid-<pid>-<rand>/`, mount it as readable in the child's
 /// capability set, and inject the `claude-oauth` route into the proxy
 /// config so the dispatcher TLS-terminates `claude.ai:443`.
 ///
@@ -363,28 +363,47 @@ fn build_broker() -> TokenBroker {
     TokenBroker::new()
 }
 
-/// Per-process directory that holds the materialized session CA PEM.
-/// Created with mode 0700 the first time this runs; the PEM file
-/// itself is mode 0644 (set by `InterceptCa::write_ca_pem`) — the cert
-/// is public information and the directory mode is what gates other
-/// local users from reading it.
+/// Per-session directory that holds the materialized session CA PEM.
+///
+/// Path shape: `$TMPDIR/nono-pid-<pid>-<32-hex>` where the suffix is 128
+/// random bits from the OS RNG. The dir is created exclusively with mode
+/// 0700 in a single syscall (`mkdir(2)` via `DirBuilder::create` — fails
+/// with `EEXIST` if the path already exists).
+///
+/// This shape closes a TOCTOU/symlink window in the previous design,
+/// where `$TMPDIR/nono-pid-<pid>` was predictable on Linux with shared
+/// `/tmp`: a local attacker could pre-create the dir or plant a symlink,
+/// then the subsequent `set_permissions` call (which follows symlinks)
+/// would `chmod` the symlink target. The exclusive-create + unguessable
+/// suffix means the path is never reused and never reachable by an
+/// attacker who hasn't observed the suffix.
+///
+/// The cert itself is public; the 0700 dir mode just keeps other local
+/// users from listing siblings inside the session directory.
 fn ensure_session_ca_dir() -> Result<PathBuf> {
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let dir = std::path::Path::new(&tmpdir).join(format!("nono-pid-{}", std::process::id()));
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| {
+    create_session_ca_dir_in(std::path::Path::new(&tmpdir))
+}
+
+/// Inner helper that takes the parent dir explicitly, for testability.
+fn create_session_ca_dir_in(parent: &std::path::Path) -> Result<PathBuf> {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let suffix: [u8; 16] = rng.random();
+    let mut suffix_hex = String::with_capacity(32);
+    for byte in suffix {
+        suffix_hex.push_str(&format!("{:02x}", byte));
+    }
+    let dir = parent.join(format!("nono-pid-{}-{}", std::process::id(), suffix_hex));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| {
             NonoError::SandboxInit(format!(
-                "failed to create OAuth-capture CA dir {}: {e}",
+                "failed to create OAuth-capture CA dir {} (mode 0700, exclusive): {e}",
                 dir.display()
             ))
         })?;
-    }
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-        NonoError::SandboxInit(format!(
-            "failed to set OAuth-capture CA dir mode to 0700 {}: {e}",
-            dir.display()
-        ))
-    })?;
     Ok(dir)
 }
 
@@ -427,4 +446,86 @@ fn oauth_capture_routes() -> Vec<nono_proxy::config::RouteConfig> {
         make("claude-oauth-claudeai", "https://claude.ai"),
         make("claude-oauth-platform", "https://platform.claude.com"),
     ]
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod ca_dir_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn create_session_ca_dir_in_creates_dir_with_mode_0700() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = create_session_ca_dir_in(parent.path()).unwrap();
+
+        assert!(dir.is_dir(), "session CA dir should exist after create");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "session CA dir must be created with mode 0700");
+    }
+
+    #[test]
+    fn create_session_ca_dir_in_path_shape_includes_pid_and_random_suffix() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = create_session_ca_dir_in(parent.path()).unwrap();
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+        let expected_prefix = format!("nono-pid-{}-", std::process::id());
+        assert!(
+            name.starts_with(&expected_prefix),
+            "name {name:?} should start with {expected_prefix:?}"
+        );
+        let suffix = &name[expected_prefix.len()..];
+        assert_eq!(
+            suffix.len(),
+            32,
+            "random suffix should be 32 hex chars (128 bits), got {suffix:?}"
+        );
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "random suffix must be lowercase hex, got {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn create_session_ca_dir_in_yields_distinct_paths_each_call() {
+        // Two consecutive invocations must yield different paths because
+        // the 128-bit suffix is fresh on each call. This is what makes
+        // the path unguessable to a local attacker.
+        let parent = tempfile::tempdir().unwrap();
+        let a = create_session_ca_dir_in(parent.path()).unwrap();
+        let b = create_session_ca_dir_in(parent.path()).unwrap();
+        assert_ne!(a, b, "two invocations must yield distinct dirs");
+    }
+
+    #[test]
+    fn create_session_ca_dir_in_is_exclusive_against_preexisting_dir() {
+        // If an attacker pre-creates the exact target path, the create
+        // must fail rather than reuse the dir. Probability of guessing
+        // the 128-bit suffix is negligible in practice; this test forces
+        // the collision to confirm the EEXIST branch is wired correctly.
+        let parent = tempfile::tempdir().unwrap();
+
+        // Build the same path the helper would, but pre-create it
+        // ourselves with the wrong mode (simulating an attacker's
+        // pre-placed dir). We can't share the random suffix with the
+        // helper, so we reach into a deterministic name and call the
+        // raw `DirBuilder::create` directly to confirm EEXIST behaviour.
+        let attacker_path = parent.path().join("nono-pid-attacker-fixed");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&attacker_path)
+            .unwrap();
+
+        // Re-creating with `DirBuilder::create` (the same call the
+        // helper uses) on an existing path must fail with AlreadyExists.
+        let err = std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&attacker_path)
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "DirBuilder::create on a pre-existing path must error AlreadyExists"
+        );
+    }
 }
