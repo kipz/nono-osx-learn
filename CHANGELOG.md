@@ -29,6 +29,7 @@
 ### Features
 
 - *(packages)* Use native tls root certificates
+- *(ux)* Warn on macOS when `--allow` targets a path blocked by a deny group (e.g. `deny_credentials`), suggesting `--override-deny`
 
 ## [0.44.0] - 2026-04-29
 

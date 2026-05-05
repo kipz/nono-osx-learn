@@ -1153,6 +1153,70 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
     )))
 }
 
+/// Find user-granted paths that are blocked by deny rules.
+///
+/// Returns a list of `(deny_path, group_name)` pairs where the deny path overlaps
+/// with an explicit user-intent grant (via `--allow`, `--read`, `--write`, or profile
+/// `filesystem`). On macOS, these grants are silently ineffective because Seatbelt
+/// deny rules override earlier allow rules for content access. The caller should
+/// warn the user to use `--override-deny`.
+///
+/// The group name is `None` when the deny comes from a profile-level
+/// `add_deny_access` rather than a named policy group.
+///
+/// This function is platform-independent (the overlap detection is pure logic),
+/// but the caller should only emit warnings on macOS where the conflict is real.
+pub fn find_denied_user_grants(
+    deny_paths: &[PathBuf],
+    caps: &CapabilitySet,
+    policy: &Policy,
+) -> Vec<(PathBuf, Option<String>)> {
+    let mut conflicts = Vec::new();
+
+    for deny_path in deny_paths {
+        let has_user_grant = caps.fs_capabilities().iter().any(|cap| {
+            if !cap.source.is_user_intent() {
+                return false;
+            }
+            if cap.is_file {
+                cap.resolved.starts_with(deny_path)
+            } else {
+                deny_path.starts_with(&cap.resolved)
+            }
+        });
+
+        if !has_user_grant {
+            continue;
+        }
+
+        let group_name = find_deny_group_for_path(policy, deny_path);
+        conflicts.push((deny_path.clone(), group_name));
+    }
+
+    conflicts
+}
+
+/// Find which deny group blocks a given path by cross-referencing the policy.
+fn find_deny_group_for_path(policy: &Policy, deny_path: &Path) -> Option<String> {
+    for (name, group) in &policy.groups {
+        if let Some(deny) = &group.deny {
+            for path_str in &deny.access {
+                if let Ok(expanded) = expand_path(path_str) {
+                    if expanded == deny_path {
+                        return Some(name.clone());
+                    }
+                    if let Ok(canonical) = expanded.canonicalize() {
+                        if canonical == *deny_path {
+                            return Some(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Get the list of all group names defined in the policy
 #[cfg(test)]
 pub fn list_groups(policy: &Policy) -> Vec<&str> {
@@ -3113,5 +3177,67 @@ mod tests {
             read_paths.contains(&"/nix/store".to_string()),
             "nix_runtime group must include /nix/store for NixOS compatibility"
         );
+    }
+
+    #[test]
+    fn test_find_denied_user_grants_detects_overlap() {
+        let path = PathBuf::from("/nonexistent/test/secret");
+        let policy = load_policy(
+            r#"{"meta":{"version":2,"schema_version":"2.0"},"groups":{
+                "deny_creds":{"description":"creds","deny":{"access":["/nonexistent/test/secret"]}}
+            }}"#,
+        )
+        .expect("parse policy");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: path.clone(),
+            resolved: path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let conflicts = find_denied_user_grants(&[path], &caps, &policy);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].1.as_deref(), Some("deny_creds"));
+    }
+
+    #[test]
+    fn test_find_denied_user_grants_ignores_non_user_grants() {
+        let path = PathBuf::from("/nonexistent/test/secret");
+        let policy = load_policy(sample_policy_json()).expect("parse policy");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: path.clone(),
+            resolved: path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::Group("system".to_string()),
+        });
+
+        let conflicts = find_denied_user_grants(&[path], &caps, &policy);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_find_denied_user_grants_profile_deny_without_group() {
+        let path = PathBuf::from("/nonexistent/test/profile_denied");
+        let policy = load_policy(r#"{"meta":{"version":2,"schema_version":"2.0"},"groups":{}}"#)
+            .expect("parse policy");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: path.clone(),
+            resolved: path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let conflicts = find_denied_user_grants(&[path], &caps, &policy);
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].1.is_none());
     }
 }

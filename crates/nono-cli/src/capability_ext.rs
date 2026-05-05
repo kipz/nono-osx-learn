@@ -12,7 +12,7 @@ use nono::{
     UnixSocketCapability, UnixSocketMode,
 };
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Try to create a directory capability, warning and skipping on PathNotFound.
 /// Propagates all other errors.
@@ -976,7 +976,7 @@ impl CapabilitySetExt for CapabilitySet {
 fn finalize_caps(
     caps: &mut CapabilitySet,
     resolved: &mut policy::ResolvedGroups,
-    _loaded_policy: &policy::Policy,
+    loaded_policy: &policy::Policy,
     args: &SandboxArgs,
     profile_override_deny: &[PathBuf],
 ) -> Result<()> {
@@ -993,6 +993,23 @@ fn finalize_caps(
 
     // Validate deny/allow overlaps (hard-fail on Linux where Landlock cannot enforce denies)
     policy::validate_deny_overlaps(&resolved.deny_paths, caps)?;
+
+    // On macOS, warn when user-granted paths are silently blocked by deny rules.
+    // Seatbelt deny rules override earlier allow rules for content access, so the
+    // user's --allow/--read/--write has no effect without --override-deny.
+    if cfg!(target_os = "macos") {
+        for (path, group) in
+            policy::find_denied_user_grants(&resolved.deny_paths, caps, loaded_policy)
+        {
+            let source = group.as_deref().unwrap_or("a deny rule");
+            warn!(
+                "'{}' is blocked by '{}'; use --override-deny {} to allow access",
+                path.display(),
+                source,
+                path.display(),
+            );
+        }
+    }
 
     // Keep broad keychain deny groups active, but allow explicit
     // keychain DB read grants (profile/CLI) on macOS.
