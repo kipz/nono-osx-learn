@@ -29,7 +29,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 /// Maximum request body size (16 MiB). Prevents DoS from malicious Content-Length.
@@ -378,7 +378,15 @@ pub async fn handle_reverse_proxy(
             write_upstream_request(&mut tls_stream, &request, &body).await?;
             if is_oauth_capture {
                 if let Some(ref resolver) = ctx.token_resolver {
-                    capture_and_rewrite_response(&mut tls_stream, stream, resolver.as_ref()).await?
+                    capture_and_rewrite_response(
+                        &mut tls_stream,
+                        stream,
+                        resolver.as_ref(),
+                        &service,
+                        upstream_port,
+                        ctx.audit_log,
+                    )
+                    .await?
                 } else {
                     stream_response(&mut tls_stream, stream).await?
                 }
@@ -429,6 +437,9 @@ async fn capture_and_rewrite_response<S>(
     upstream: &mut S,
     client: &mut TcpStream,
     resolver: &(dyn TokenResolver + 'static),
+    service: &str,
+    upstream_port: u16,
+    audit_log: Option<&audit::SharedAuditLog>,
 ) -> Result<u16>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -497,9 +508,21 @@ where
     client.write_all(&new_body).await?;
     client.flush().await?;
 
-    debug!(
-        "oauth-capture (reverse): substituted {} token field(s); response body re-serialised",
-        substituted
+    // Capture is privileged — promoted from debug! to info! and persisted
+    // to the audit ring buffer. Token / nonce values are deliberately
+    // omitted from both sinks; only the count of substituted fields is
+    // recorded. Mirrors the symmetric promotion in
+    // `crate::intercept::rewrite_oauth_response`.
+    info!(
+        "oauth-capture (reverse): substituted {} token field(s) for {} (upstream port {}); response body re-serialised",
+        substituted, service, upstream_port
+    );
+    audit::log_oauth_capture(
+        audit_log,
+        audit::ProxyMode::Reverse,
+        service,
+        upstream_port,
+        substituted,
     );
     Ok(status_code)
 }

@@ -41,7 +41,7 @@ use rustls::ServerConfig;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::audit;
 use crate::broker::TokenResolver;
@@ -334,6 +334,12 @@ pub async fn handle_intercept(
     let host_owned = host.to_string();
     let resolved_addrs_owned = resolved_addrs.to_vec();
     let oauth_capture_owned = oauth_capture.cloned();
+    // The closure captures the audit log so per-request OAuth capture
+    // events (emitted from `rewrite_oauth_response`) can be persisted
+    // alongside the per-CONNECT TLS-accept entries above. Cloning the
+    // `Arc` is cheap; `None` means audit logging is disabled for this
+    // proxy session.
+    let audit_log_owned: Option<audit::SharedAuditLog> = audit_log.cloned();
 
     let service = service_fn(move |req: Request<Incoming>| {
         let host = host_owned.clone();
@@ -341,14 +347,17 @@ pub async fn handle_intercept(
         let upstream_tls = upstream_tls.clone();
         let oauth_capture = oauth_capture_owned.clone();
         let token_resolver = token_resolver.clone();
+        let audit_log = audit_log_owned.clone();
         async move {
             forward_request(
                 req,
                 &host,
+                port,
                 &resolved_addrs,
                 upstream_tls,
                 oauth_capture.as_ref(),
                 token_resolver,
+                audit_log.as_ref(),
             )
             .await
         }
@@ -368,21 +377,26 @@ pub async fn handle_intercept(
 /// possibly-rewritten response. Always returns `Ok` at the service
 /// level — internal failures become 502 responses so the connection
 /// stays open for any subsequent requests.
+#[allow(clippy::too_many_arguments)]
 async fn forward_request(
     req: Request<Incoming>,
     host: &str,
+    port: u16,
     resolved_addrs: &[SocketAddr],
     upstream_tls: TlsConnector,
     oauth_capture: Option<&OauthCaptureMatch>,
     token_resolver: Option<Arc<dyn TokenResolver>>,
+    audit_log: Option<&audit::SharedAuditLog>,
 ) -> std::result::Result<Response<RewrittenBody>, Infallible> {
     match try_forward(
         req,
         host,
+        port,
         resolved_addrs,
         upstream_tls,
         oauth_capture,
         token_resolver,
+        audit_log,
     )
     .await
     {
@@ -394,13 +408,16 @@ async fn forward_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_forward(
     mut req: Request<Incoming>,
     host: &str,
+    port: u16,
     resolved_addrs: &[SocketAddr],
     upstream_tls: TlsConnector,
     oauth_capture: Option<&OauthCaptureMatch>,
     token_resolver: Option<Arc<dyn TokenResolver>>,
+    audit_log: Option<&audit::SharedAuditLog>,
 ) -> Result<Response<RewrittenBody>> {
     let req_path = req.uri().path().to_string();
     debug!(
@@ -475,7 +492,7 @@ async fn try_forward(
 
     if should_capture {
         let resolver = token_resolver.expect("checked by should_capture");
-        rewrite_oauth_response(resp, resolver.as_ref()).await
+        rewrite_oauth_response(resp, resolver.as_ref(), host, port, audit_log).await
     } else {
         let (parts, body) = resp.into_parts();
         Ok(Response::from_parts(parts, body.boxed()))
@@ -493,6 +510,9 @@ async fn try_forward(
 async fn rewrite_oauth_response(
     resp: Response<Incoming>,
     resolver: &(dyn TokenResolver + 'static),
+    host: &str,
+    port: u16,
+    audit_log: Option<&audit::SharedAuditLog>,
 ) -> Result<Response<RewrittenBody>> {
     let (mut parts, body) = resp.into_parts();
 
@@ -519,9 +539,21 @@ async fn rewrite_oauth_response(
             Ok(Response::from_parts(parts, full_body(body_bytes)))
         }
         OauthRewriteOutcome::Rewritten { bytes, substituted } => {
-            debug!(
-                "oauth-capture: substituted {} token field(s); response body re-serialized",
-                substituted
+            // Capture is privileged — emitted at info! so the event is
+            // visible at the default log level, and persisted to the
+            // audit ring buffer. Token / nonce values are deliberately
+            // omitted from both sinks; only the count of substituted
+            // fields is recorded.
+            info!(
+                "oauth-capture: substituted {} token field(s) for {}:{}; response body re-serialized",
+                substituted, host, port
+            );
+            audit::log_oauth_capture(
+                audit_log,
+                audit::ProxyMode::Connect,
+                host,
+                port,
+                substituted,
             );
 
             // The original body framing no longer applies — hyper will set a
