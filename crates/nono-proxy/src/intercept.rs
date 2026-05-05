@@ -448,6 +448,19 @@ async fn try_forward(
         req.headers_mut().remove(hyper::header::ACCEPT_ENCODING);
     }
 
+    // Translate `nono_` Bearer tokens to real tokens before forwarding
+    // upstream. Required for the Anthropic Console flow: after the
+    // OAuth token exchange, claude immediately calls
+    // `POST api.anthropic.com/api/oauth/claude_cli/create_api_key`
+    // with the (now nonce) bearer token to mint a long-lived API key.
+    // Without translation, Anthropic receives `Bearer nono_<hex>` and
+    // returns 401, breaking /login. The reverse-proxy path already
+    // does this translation at its own egress boundary; the intercept
+    // is the second egress boundary that has to do the same.
+    if let Some(ref resolver) = token_resolver {
+        rewrite_bearer_header(req.headers_mut(), resolver.as_ref());
+    }
+
     // Box the request body to a uniform type before sending.
     let (parts, body) = req.into_parts();
     let req: Request<RewrittenBody> = Request::from_parts(parts, body.boxed());
@@ -583,6 +596,63 @@ async fn rewrite_oauth_response(
     Ok(Response::from_parts(parts, full_body(new_body_bytes)))
 }
 
+/// Translate any `nono_`-prefixed Bearer token in the `Authorization`
+/// header to its real upstream value via the broker.
+///
+/// Required for the Anthropic Console flow: after capturing the OAuth
+/// token exchange and substituting nonces in the response body, claude
+/// immediately makes a follow-up authenticated request inside the same
+/// CONNECT tunnel (`POST api.anthropic.com/api/oauth/claude_cli/create_api_key`)
+/// using the access token it just received. Because the response was
+/// rewritten, that token is now `nono_<hex>` — the upstream rejects it
+/// with 401 unless we translate before forwarding.
+///
+/// Mirrors the resolver-then-Bearer-prefix logic in the reverse proxy's
+/// pass-through path. If the broker does not have the nonce (e.g. a
+/// stale value from a prior session whose record has been cleared),
+/// forward the raw value unchanged so the upstream's auth error
+/// surfaces to the client unchanged.
+///
+/// Tokens that don't start with `nono_` are left alone — passes through
+/// real bearer tokens (typical for non-OAuth-capture intercepted hosts)
+/// and any other `Authorization` schemes (Basic, etc.).
+fn rewrite_bearer_header(
+    headers: &mut hyper::HeaderMap,
+    resolver: &(dyn TokenResolver + 'static),
+) {
+    let raw = match headers.get(hyper::header::AUTHORIZATION) {
+        Some(v) => match v.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return,
+        },
+        None => return,
+    };
+    let token = match raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer ")) {
+        Some(t) => t.trim(),
+        None => return,
+    };
+    if !token.starts_with("nono_") {
+        return;
+    }
+    let resolved = match resolver.resolve(token) {
+        Some(real) => real,
+        None => {
+            debug!("intercept: nonce {}... not in broker; forwarding raw", &token[..12.min(token.len())]);
+            return;
+        }
+    };
+    let new_value = format!("Bearer {}", resolved.as_str());
+    match hyper::header::HeaderValue::from_str(&new_value) {
+        Ok(hv) => {
+            headers.insert(hyper::header::AUTHORIZATION, hv);
+            debug!("intercept: translated nonce Bearer to real upstream token");
+        }
+        Err(e) => {
+            warn!("intercept: resolved token contained invalid header chars: {e}; forwarding raw");
+        }
+    }
+}
+
 /// Wrap concrete bytes in our type-erased response body.
 fn full_body(bytes: Bytes) -> RewrittenBody {
     Full::new(bytes).map_err(|never| match never {}).boxed()
@@ -611,6 +681,127 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    /// Test fake: a `TokenResolver` with a fixed `nonce -> real_token`
+    /// mapping. Used to exercise `rewrite_bearer_header` without
+    /// constructing a full `TokenBroker`.
+    struct FakeResolver {
+        nonce: &'static str,
+        real: &'static str,
+    }
+    impl crate::broker::TokenResolver for FakeResolver {
+        fn issue(&self, _: zeroize::Zeroizing<String>) -> String {
+            unreachable!("not used by these tests")
+        }
+        fn resolve(&self, nonce: &str) -> Option<zeroize::Zeroizing<String>> {
+            if nonce == self.nonce {
+                Some(zeroize::Zeroizing::new(self.real.to_string()))
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_bearer_header_translates_nonce_to_real() {
+        let resolver = FakeResolver {
+            nonce: "nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            real: "sk-ant-oat01-deadbeef",
+        };
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            hyper::header::HeaderValue::from_static(
+                "Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        );
+
+        rewrite_bearer_header(&mut headers, &resolver);
+
+        let after = headers
+            .get(hyper::header::AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(after, "Bearer sk-ant-oat01-deadbeef");
+    }
+
+    #[test]
+    fn rewrite_bearer_header_passes_through_unknown_nonce() {
+        let resolver = FakeResolver {
+            nonce: "nono_known",
+            real: "real",
+        };
+        let mut headers = hyper::HeaderMap::new();
+        let original = "Bearer nono_unknown_nonce_value";
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            hyper::header::HeaderValue::from_static(original),
+        );
+
+        rewrite_bearer_header(&mut headers, &resolver);
+
+        let after = headers
+            .get(hyper::header::AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(after, original, "unknown nonce must be left as-is");
+    }
+
+    #[test]
+    fn rewrite_bearer_header_leaves_real_tokens_alone() {
+        let resolver = FakeResolver {
+            nonce: "nono_x",
+            real: "real_x",
+        };
+        let mut headers = hyper::HeaderMap::new();
+        let original = "Bearer sk-ant-oat01-realtoken";
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            hyper::header::HeaderValue::from_static(original),
+        );
+
+        rewrite_bearer_header(&mut headers, &resolver);
+
+        let after = headers
+            .get(hyper::header::AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(after, original);
+    }
+
+    #[test]
+    fn rewrite_bearer_header_no_authorization_header_is_noop() {
+        let resolver = FakeResolver {
+            nonce: "nono_x",
+            real: "real_x",
+        };
+        let mut headers = hyper::HeaderMap::new();
+        rewrite_bearer_header(&mut headers, &resolver);
+        assert!(headers.get(hyper::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn rewrite_bearer_header_handles_lowercase_bearer() {
+        let resolver = FakeResolver {
+            nonce: "nono_lc",
+            real: "real_lc",
+        };
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            hyper::header::HeaderValue::from_static("bearer nono_lc"),
+        );
+        rewrite_bearer_header(&mut headers, &resolver);
+        let after = headers
+            .get(hyper::header::AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(after, "Bearer real_lc");
+    }
 
     #[test]
     fn ca_new_succeeds_and_emits_pem() {
