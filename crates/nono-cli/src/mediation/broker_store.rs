@@ -37,13 +37,21 @@
 //! credentials for the existing credential-injection feature. Reading
 //! via the keyring crate works for both creation paths.
 //!
-//! The trade-off: the JSON payload is briefly visible in the process
-//! argument list during the `security` invocation. Acceptable for a
-//! once-per-OAuth-capture event; reads (which happen every session)
-//! still go through the keyring crate's safer in-process API.
+//! ## Why `-w` is passed without an argument
+//!
+//! `security add-generic-password -w <payload>` writes the password into
+//! the spawned process's argv, where it is briefly visible in `ps` /
+//! `/proc/<pid>/cmdline` for any local process. Per the tool's own help
+//! text ("Use of the -p or -w options is insecure. Specify -w as the
+//! last option to be prompted."), passing `-w` as the final option with
+//! no value makes `security` prompt for the password. With stdin piped
+//! (non-tty), it reads two lines: an initial value and a retype check.
+//! We satisfy that by writing `<payload>\n<payload>\n` to the child's
+//! stdin, keeping the secret out of argv entirely.
 
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use zeroize::Zeroizing;
 
@@ -158,9 +166,16 @@ impl KeystoreBrokerStore {
     /// without a password prompt. Matches the create-flags users typically
     /// use when manually adding credentials for the existing
     /// credential-injection feature.
+    ///
+    /// The payload is supplied via the child's stdin rather than as an
+    /// argv element. `-w` is passed last with no argument, which causes
+    /// `security` to read the password from its prompt (stdin when
+    /// non-tty). The tool re-prompts to confirm, so we feed
+    /// `<payload>\n<payload>\n`. This keeps OAuth tokens out of the
+    /// kernel-visible argument vector during the spawn.
     #[cfg(target_os = "macos")]
     fn save_via_security_cli(&self, payload: &str) -> Result<()> {
-        let status = Command::new("/usr/bin/security")
+        let mut child = Command::new("/usr/bin/security")
             .args([
                 "add-generic-password",
                 "-U", // update if exists
@@ -169,19 +184,53 @@ impl KeystoreBrokerStore {
                 &self.service,
                 "-a",
                 &self.account,
-                "-w",
-                payload,
+                "-w", // MUST be last: no argument → read from stdin
             ])
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .status()
-            .map_err(|e| {
-                NonoError::KeystoreAccess(format!("invoke /usr/bin/security: {e}"))
-            })?;
-        if !status.success() {
+            .spawn()
+            .map_err(|e| NonoError::KeystoreAccess(format!("invoke /usr/bin/security: {e}")))?;
+
+        // Build the stdin payload (initial + retype) in a Zeroizing
+        // buffer so it's wiped on drop. `security`'s confirmation prompt
+        // expects the password twice, separated by newlines. JSON
+        // serialised by serde_json::to_string contains no embedded
+        // newlines, so this format is unambiguous for our payload.
+        let mut stdin_buf = Zeroizing::new(String::with_capacity(payload.len() * 2 + 2));
+        stdin_buf.push_str(payload);
+        stdin_buf.push('\n');
+        stdin_buf.push_str(payload);
+        stdin_buf.push('\n');
+
+        // Take and drop stdin after writing so `security` sees EOF and
+        // wait_with_output below does not deadlock.
+        let write_result = match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(stdin_buf.as_bytes()),
+            None => {
+                return Err(NonoError::KeystoreAccess(
+                    "security add-generic-password: child stdin handle missing".to_string(),
+                ));
+            }
+        };
+        if let Err(e) = write_result {
+            // The child may already have exited; collect output for
+            // diagnostics rather than reporting only the I/O error.
+            let _ = child.wait();
             return Err(NonoError::KeystoreAccess(format!(
-                "security add-generic-password exited with {}",
-                status
+                "write payload to security stdin: {e}"
+            )));
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| NonoError::KeystoreAccess(format!("wait for /usr/bin/security: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(NonoError::KeystoreAccess(format!(
+                "security add-generic-password exited with {}: {}",
+                output.status,
+                stderr.trim()
             )));
         }
         Ok(())
@@ -307,24 +356,23 @@ impl BrokerStore for KeystoreBrokerStore {
     }
 
     fn save(&self, record: &PersistedRecord) -> Result<()> {
-        let json = serde_json::to_string(&PersistedJson::from_record(record)).map_err(|e| {
-            NonoError::KeystoreAccess(format!("broker record serialise: {e}"))
-        })?;
-        let result = {
-            #[cfg(target_os = "macos")]
-            {
-                self.save_via_security_cli(&json)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                self.save_via_keyring(&json)
-            }
-        };
-        // Best-effort: zero our copy of the JSON now that the OS owns it.
-        // The argv list passed to `security` was already consumed; the
-        // string here is independent and can be wiped.
-        let _ = Zeroizing::new(json);
-        result
+        // Wrap the serialised JSON in `Zeroizing` so the buffer is
+        // wiped when this function returns, regardless of branch.
+        // `save_via_security_cli` pipes its own copy through stdin and
+        // does not retain the bytes; the macOS argv path no longer
+        // contains the payload (see the docstring on that fn).
+        let json: Zeroizing<String> = Zeroizing::new(
+            serde_json::to_string(&PersistedJson::from_record(record))
+                .map_err(|e| NonoError::KeystoreAccess(format!("broker record serialise: {e}")))?,
+        );
+        #[cfg(target_os = "macos")]
+        {
+            self.save_via_security_cli(&json)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.save_via_keyring(&json)
+        }
     }
 
     fn clear(&self) -> Result<()> {
