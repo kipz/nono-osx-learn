@@ -139,7 +139,7 @@ This is the primary mechanism for surgically customizing inherited profiles with
 | `bypass_protection` | `filesystem` | Paths exempted from deny groups. **Does not grant access** — each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write`. |
 
 <Note>
-  **Renamed in issue #594.** The old top-level `policy` section was dissolved into `filesystem`, `groups`, and `commands` in the canonical schema. Legacy names still deserialize with a deprecation warning; see the migration table in `nono profile guide` for the full mapping. The legacy keys are removed in v1.0.0.
+  **Renamed in issue #594.** The old top-level `policy` section was dissolved into `filesystem`, `groups`, and `commands` in the canonical schema. Legacy names still deserialize with a deprecation warning; see the migration table in `nono profile guide` for the full mapping. The legacy keys will be removed in v1.0.0.
 </Note>
 
 #### Adding a Deny Rule to an Inherited Profile
