@@ -6,19 +6,45 @@
 //! script gates on it and would simply exit 0.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/hooks/nono-trajectory.sh")
 }
 
+/// Resolve jq's containing directory once. Used both to gate the test and to
+/// build the subprocess PATH, so detection and execution agree on whether
+/// jq is reachable. Without this, on a typical macOS dev machine (Homebrew
+/// jq at `/opt/homebrew/bin/jq` or `/usr/local/bin/jq`) the parent-PATH
+/// `which jq` returns true while the subprocess's `PATH=/bin:/usr/bin`
+/// can't reach jq — the hook silently exits 0 and `read_lines` panics.
+///
+/// Skips nono mediation shims. When this test runs inside a nono sandbox,
+/// the parent PATH starts with `/private/tmp/nono-session-*/shims/`, and
+/// `which jq` would otherwise return the shim — which can't operate
+/// without `NONO_MEDIATION_SOCKET` set in the (env_clear'd) subprocess.
+fn jq_dir() -> Option<PathBuf> {
+    which::which_all("jq")
+        .ok()?
+        .find(|p| {
+            let s = p.to_string_lossy();
+            !s.contains("nono-session-") && !s.contains("/shims/")
+        })
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
 fn jq_available() -> bool {
-    Command::new("jq")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    jq_dir().is_some()
+}
+
+/// Build the subprocess PATH so the hook can find jq deterministically,
+/// regardless of where it is installed on the host.
+fn sandbox_path() -> String {
+    match jq_dir() {
+        Some(d) => format!("{}:/bin:/usr/bin", d.display()),
+        None => "/bin:/usr/bin".to_string(),
+    }
 }
 
 /// Pipe `payload_json` into the trajectory hook with `HOME` set to `home`
@@ -29,7 +55,7 @@ fn feed(home: &PathBuf, payload_json: &str) {
     let mut child = Command::new(script_path())
         .env_clear()
         .env("HOME", home)
-        .env("PATH", "/bin:/usr/bin")
+        .env("PATH", sandbox_path())
         .env("NONO_CAP_FILE", "/tmp/fake-nono-cap")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -220,7 +246,7 @@ fn trajectory_hook_noop_without_nono_env() {
     let mut child = Command::new(script_path())
         .env_clear()
         .env("HOME", &home)
-        .env("PATH", "/bin:/usr/bin")
+        .env("PATH", sandbox_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -259,7 +285,7 @@ fn trajectory_hook_rejects_path_traversal_in_session_id() {
     let mut child = Command::new(script_path())
         .env_clear()
         .env("HOME", &home)
-        .env("PATH", "/bin:/usr/bin")
+        .env("PATH", sandbox_path())
         .env("NONO_CAP_FILE", "/tmp/fake")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -289,4 +315,87 @@ fn trajectory_hook_rejects_path_traversal_in_session_id() {
             entries,
         );
     }
+}
+
+/// Drives many concurrent hook invocations against the same session_id and
+/// asserts every emitted line has a unique sequence_number with no gaps.
+///
+/// This exercises the lock-and-counter critical section on a real
+/// filesystem under contention. Without the serialization (flock on Linux,
+/// mkdir-lock fallback elsewhere) two invocations would race on the
+/// read-modify-write of `.seq-<sid>` and either repeat a sequence_number
+/// or skip one — both of which violate trajectory-spec I9.
+///
+/// Without this test, the I9 claim is aspirational: the three sequential
+/// tests above only exercise one process at a time.
+#[test]
+fn trajectory_hook_serializes_sequence_under_concurrency() {
+    if !jq_available() {
+        eprintln!("skipping: jq not available");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let home: PathBuf = tmp.path().to_path_buf();
+    let session_id = "concur-test-1";
+    let out = home
+        .join(".nono")
+        .join("trajectory")
+        .join(format!("session-{session_id}.jsonl"));
+
+    // SessionStart first to establish the file and counter sidecars before
+    // the contended phase; this matches how the dispatcher is exercised in
+    // practice (one SessionStart, then many tool events).
+    feed(
+        &home,
+        r#"{"hook_event_name":"SessionStart","session_id":"concur-test-1","cwd":"/tmp","source":"startup"}"#,
+    );
+
+    // Fan out N concurrent PreToolUse invocations. Each one bumps the
+    // sequence_number under lock. With the lock working, every event lands
+    // a distinct value; without it, two invocations read the same `seq` and
+    // both write `seq + 1`, producing a duplicate.
+    const N: usize = 16;
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let home = home.clone();
+        handles.push(std::thread::spawn(move || {
+            let payload = format!(
+                r#"{{"hook_event_name":"PreToolUse","session_id":"concur-test-1","tool_name":"Bash","tool_input":{{"i":{i}}},"tool_use_id":"tu_{i}"}}"#
+            );
+            feed(&home, &payload);
+        }));
+    }
+    for h in handles {
+        h.join().expect("thread join");
+    }
+
+    let lines = read_lines(&out);
+    assert_eq!(
+        lines.len(),
+        N + 1,
+        "expected {} events on disk (1 SessionStart + {} PreToolUse), got {}",
+        N + 1,
+        N,
+        lines.len()
+    );
+
+    // sequence_number must be a permutation of 0..=N with no duplicates and
+    // no gaps. Order on disk depends on which thread won the lock each
+    // round, so we sort before checking.
+    let mut seqs: Vec<u64> = lines
+        .iter()
+        .map(|l| {
+            l["sequence_number"]
+                .as_u64()
+                .expect("sequence_number is a number")
+        })
+        .collect();
+    seqs.sort_unstable();
+    let expected: Vec<u64> = (0..=N as u64).collect();
+    assert_eq!(
+        seqs, expected,
+        "sequence_number must be a contiguous 0..={} permutation under concurrency",
+        N
+    );
 }
