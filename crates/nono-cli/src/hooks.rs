@@ -238,17 +238,67 @@ fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Resul
     if any_changed {
         let content = serde_json::to_string_pretty(&settings)
             .map_err(|e| NonoError::HookInstall(format!("Failed to serialize settings: {}", e)))?;
-        fs::write(settings_path, content).map_err(|e| {
-            NonoError::HookInstall(format!(
-                "Failed to write settings {}: {}",
-                settings_path.display(),
-                e
-            ))
-        })?;
-
+        write_atomic(settings_path, content.as_bytes())?;
         tracing::info!("Updated {}", settings_path.display());
     }
     Ok(any_changed)
+}
+
+/// Write `content` to `path` atomically: stage in a tempfile in the same
+/// directory, then `rename(2)` over the target. POSIX guarantees rename on
+/// the same filesystem is atomic — readers always see either the old or
+/// the new content, never a half-written file.
+///
+/// `fs::write` is not atomic: it truncates then writes. If the process is
+/// killed between truncate and full write (SIGINT during install, OOM,
+/// disk full, OS crash), the user's `~/.claude/settings.json` is left
+/// truncated or partially written. The trajectory hook now registers on
+/// five events, so the in-memory mutation spans more registrations and a
+/// mid-write failure loses more state than before.
+fn write_atomic(path: &PathBuf, content: &[u8]) -> Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        NonoError::HookInstall(format!(
+            "Settings path has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".settings.json.")
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .map_err(|e| {
+            NonoError::HookInstall(format!(
+                "Failed to create tempfile in {}: {}",
+                dir.display(),
+                e
+            ))
+        })?;
+    use std::io::Write as _;
+    tmp.as_file_mut().write_all(content).map_err(|e| {
+        NonoError::HookInstall(format!(
+            "Failed to write tempfile {}: {}",
+            tmp.path().display(),
+            e
+        ))
+    })?;
+    // fsync the tempfile so the bytes hit disk before the rename, otherwise
+    // a power loss between write and rename could leave the new inode empty.
+    tmp.as_file_mut().sync_all().map_err(|e| {
+        NonoError::HookInstall(format!(
+            "Failed to fsync tempfile {}: {}",
+            tmp.path().display(),
+            e
+        ))
+    })?;
+    tmp.persist(path).map_err(|e| {
+        NonoError::HookInstall(format!(
+            "Failed to rename tempfile to {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    Ok(())
 }
 
 /// Install all hooks from a profile's hooks configuration
@@ -375,6 +425,42 @@ mod tests {
         assert!(
             script.contains("if ! printf '%s' \"$next_seq\" > \"$seq_file\""),
             "trajectory hook must check seq_file write success"
+        );
+    }
+
+    #[test]
+    fn test_write_atomic_replaces_target_in_one_step() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let target = dir.path().join("settings.json");
+
+        // Initial write: file does not exist.
+        write_atomic(&target, b"{\"a\":1}\n").expect("first write");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "{\"a\":1}\n"
+        );
+
+        // Overwrite an existing file.
+        write_atomic(&target, b"{\"b\":2}\n").expect("second write");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "{\"b\":2}\n"
+        );
+
+        // No tempfiles left behind in the directory after a successful write.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read tmpdir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let name = n.to_string_lossy();
+                name.starts_with(".settings.json.") && name.ends_with(".tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic write must not leak tempfiles: {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
         );
     }
 }
