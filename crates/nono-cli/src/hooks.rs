@@ -237,16 +237,27 @@ fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Resul
     }
 }
 
-/// Install all hooks from a profile's hooks configuration
-/// Returns a list of (target, result) pairs for each hook installed
+/// Install all hooks from a profile's hooks configuration.
+///
+/// The map value is a `Vec<HookConfig>` so a single target (e.g. `claude-code`)
+/// can have multiple hooks registered — for example, one script for
+/// `PostToolUseFailure` context and a separate script for trajectory-spec
+/// emission. Each entry is installed independently; failures stop the run.
+///
+/// Returns a (target, result) pair for every hook installed, in the order
+/// they were declared per target. Iteration over the outer map is in
+/// `HashMap` order (unstable across runs), but within a target the per-hook
+/// order matches the profile's array.
 pub fn install_profile_hooks(
     profile_name: Option<&str>,
-    hooks: &HashMap<String, HookConfig>,
+    hooks: &HashMap<String, Vec<HookConfig>>,
 ) -> Result<Vec<(String, HookInstallResult)>> {
     let mut results = Vec::new();
-    for (target, config) in hooks {
-        let result = install_hooks(profile_name, target, config)?;
-        results.push((target.clone(), result));
+    for (target, configs) in hooks {
+        for config in configs {
+            let result = install_hooks(profile_name, target, config)?;
+            results.push((target.clone(), result));
+        }
     }
     Ok(results)
 }
