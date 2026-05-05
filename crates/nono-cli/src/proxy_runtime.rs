@@ -322,10 +322,13 @@ fn build_oauth_capture_runtime(
 
     caps.add_fs(FsCapability::new_file(&ca_path, AccessMode::Read)?);
 
-    // Session-scoped vault. Layer 2 of the design will make this the
-    // same instance the mediation server holds for command-mediation
-    // phantom tokens; for now the proxy owns its own.
-    let resolver: Arc<dyn nono_proxy::TokenResolver> = Arc::new(TokenBroker::new());
+    // Session-scoped broker, optionally backed by durable storage so
+    // captured OAuth pairs survive across nono sessions. Persistence is
+    // best-effort: if hydrate fails (no keystore backend, headless Linux
+    // without secret-service, etc.), fall back to an in-memory broker —
+    // capture still works for this session, only cross-session resume is
+    // degraded.
+    let resolver: Arc<dyn nono_proxy::TokenResolver> = Arc::new(build_broker());
 
     Ok((
         nono_proxy::ProxyRuntime {
@@ -334,6 +337,30 @@ fn build_oauth_capture_runtime(
         },
         ca_path,
     ))
+}
+
+/// Construct the OAuth-capture broker, attempting to back it with a
+/// durable [`crate::mediation::broker_store::KeystoreBrokerStore`] so
+/// captured pairs persist across sessions. On any error initialising
+/// the store (e.g. no keyring backend available), fall back to an
+/// in-memory broker and log a warning — capture still works for this
+/// session; only cross-session resume is lost.
+fn build_broker() -> TokenBroker {
+    #[cfg(feature = "system-keyring")]
+    {
+        use crate::mediation::broker_store::KeystoreBrokerStore;
+        let store = Arc::new(KeystoreBrokerStore::default_for_claude_oauth());
+        match TokenBroker::with_store(store) {
+            Ok(broker) => return broker,
+            Err(e) => {
+                warn!(
+                    "OAuth broker keystore backend init failed; using in-memory broker only \
+                     (cross-session OAuth resume disabled this run): {e}"
+                );
+            }
+        }
+    }
+    TokenBroker::new()
 }
 
 /// Per-process directory that holds the materialized session CA PEM.

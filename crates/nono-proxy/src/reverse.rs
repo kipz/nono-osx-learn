@@ -469,13 +469,45 @@ where
 
     let mut substituted: u32 = 0;
     if let Some(obj) = value.as_object_mut() {
-        for key in &["access_token", "refresh_token"] {
-            if let Some(serde_json::Value::String(s)) = obj.get(*key) {
-                let real = zeroize::Zeroizing::new(s.clone());
-                let nonce = resolver.issue(real);
-                obj.insert((*key).to_string(), serde_json::Value::String(nonce));
-                substituted = substituted.saturating_add(1);
+        let access = obj
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| zeroize::Zeroizing::new(s.to_string()));
+        let refresh = obj
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| zeroize::Zeroizing::new(s.to_string()));
+
+        match (access, refresh) {
+            (Some(a), Some(r)) => {
+                let (access_nonce, refresh_nonce) = resolver.capture_oauth_pair(a, r);
+                obj.insert(
+                    "access_token".to_string(),
+                    serde_json::Value::String(access_nonce),
+                );
+                obj.insert(
+                    "refresh_token".to_string(),
+                    serde_json::Value::String(refresh_nonce),
+                );
+                substituted = 2;
             }
+            (Some(a), None) => {
+                let nonce = resolver.issue(a);
+                obj.insert(
+                    "access_token".to_string(),
+                    serde_json::Value::String(nonce),
+                );
+                substituted = 1;
+            }
+            (None, Some(r)) => {
+                let nonce = resolver.issue(r);
+                obj.insert(
+                    "refresh_token".to_string(),
+                    serde_json::Value::String(nonce),
+                );
+                substituted = 1;
+            }
+            (None, None) => {}
         }
     }
 
