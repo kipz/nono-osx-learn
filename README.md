@@ -438,6 +438,28 @@ How this works:
 4. The wrapper sets `GH_TOKEN` and calls the real `gh` binary, which hits the GitHub API through the allowlisted proxy.
 5. At the top level, `ddtool auth github token` called directly by the agent still routes through the shim and returns a nonce — credentials are never exposed to the sandbox.
 
+#### Capability-bound nonces (`nonce_scope`)
+
+By default, a captured nonce promotes anywhere — any mediated command that receives it as an env var or argv gets the real credential. To bind a nonce to its intended consumer(s), declare a `nonce_scope` on the intercept rule:
+
+```json
+{
+  "args_prefix": ["auth", "github", "token"],
+  "action": { "type": "capture" },
+  "nonce_scope": { "consumers": ["gh", "git"] }
+}
+```
+
+When the agent later passes the nonce to a non-listed consumer (e.g. `GITHUB_TOKEN=<nonce> kubectl …`), the broker silently drops the env var: the consumer's process does not receive `GITHUB_TOKEN`. There is no agent-visible signal — the agent cannot distinguish "scope mismatch" from "unknown nonce" by probing.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `consumers` | array of string | required when `nonce_scope` is set | Mediated command names allowed to redeem the nonce. |
+
+`nonce_scope` is optional; rules without it produce unscoped nonces (existing behavior). It is only meaningful on `capture` actions; on other actions it is ignored.
+
+Scope mismatches are logged via `tracing::warn!` (target `nono::mediation::scope`) for operator observability. The agent process never sees these events.
+
 #### Example: Full Profile
 
 Combining all capabilities — credential capture, static responses, admin-gated approval, per-command sandboxing, and allowed commands:
@@ -488,6 +510,174 @@ Combining all capabilities — credential capture, static responses, admin-gated
   }
 }
 ```
+
+### `argv_shape` — strict flag-aware matcher
+
+Where `args_prefix` strips flags and matches a positional prefix only,
+`argv_shape` matches the *shape* of argv. Use it for rules that pivot on
+flag values — e.g. an `approve` rule that should fire only for a specific
+`-a $USER -s "Claude Code-credentials"` invocation and reject the bypass
+where the agent appends a duplicate `-s evil-service`.
+
+```json
+{
+  "argv_shape": {
+    "subcommand": "find-generic-password",
+    "flags": {
+      "-a": { "value": "$USER" },
+      "-s": { "value": "Claude Code-credentials" },
+      "-w": { "type": "boolean" }
+    },
+    "extras": "deny",
+    "on_mismatch": "approve"
+  },
+  "action": { "type": "approve" }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `subcommand` | string | required | First positional arg that must be present. |
+| `flags` | map | `{}` | Flags that must appear in argv. Key is the flag literal (`-s`, `--service`). Value is `{ "value": "..." }` for flags with required values, or `{ "type": "boolean" }` for flags that take no value. Each declared flag must appear *exactly once*. |
+| `extras` | `"deny"` \| `"allow"` | `"deny"` | What to do with unknown flags or extra positionals. `"deny"` (default) rejects the match. `"allow"` tolerates them — only use when migrating an existing `args_prefix` rule and you want strictness incrementally. |
+| `on_mismatch` | `"deny"` \| `"approve"` | `"deny"` | What to do when the strict match fails. `"deny"` (default) falls through to the next rule (or to passthrough). `"approve"` triggers an interactive approval dialog (Allow-once / Allow-always / Deny). On Allow-always, an `argv_shape` entry carrying the exact `(cmd, argv)` is recorded in `~/.nono/argv-allowlist.json` and future-session invocations of the same argv auto-approve without re-prompting. |
+
+A rule may set `args_prefix` OR `argv_shape`, not both. A rule with neither matches every invocation.
+
+`$VAR` tokens in flag values are expanded at profile-load time, the same as in `args_prefix`.
+
+#### Allowlist file (`~/.nono/argv-allowlist.json`)
+
+When a user picks Allow-always, an entry is appended here. The file uses a tagged-union schema shared across mediation features (the same store will host caller-policy and config-scan entries from sibling plans):
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "kind": "argv_shape",
+      "payload": {
+        "cmd": "security",
+        "argv": ["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials", "-s", "evil-service", "-w"]
+      },
+      "approved_at": "2026-05-01T09:14:33Z"
+    }
+  ]
+}
+```
+
+The match is **exact-payload**: a single byte differing in the canonical JSON of `payload` causes a re-prompt. The file is owned by the unsandboxed mediation server and is not reachable from the agent's sandbox.
+
+> **User-facing UX.** When `on_mismatch=approve` triggers and there is no allowlist hit, nono prompts via `CliApprovalGate` over `/dev/tty`:
+>
+> ```
+>   Approval required for: security
+>   Argv: find-generic-password -a kipz -s Claude Code-credentials -s evil-service -w
+>   Reason: argv shape mismatch on rule for 'security': flag '-s' appears more than once
+>   [a]llow once / [r]emember / [d]eny:
+> ```
+>
+> All three verdicts are reachable today. A graphical 3-button dialog in `nono-approve` is a follow-up; when it ships, `NativeApprovalGate::approve_with_save_option` will swap from delegating to `CliApprovalGate` to invoking `nono-approve --with-save-option` directly. Headless sessions will continue to fall back to the CLI gate.
+
+#### `/approve` IPC for out-of-process callers
+
+The mediation server publishes a sibling Unix socket — `approve.sock`,
+alongside `mediation.sock` and `control.sock` — that exposes the same
+allowlist-and-approval gate to processes outside the mediation server's
+address space. Sibling-plan shell wrappers (4.1 caller policy, 4.3
+config/env scan) connect here to consult the gate without re-implementing
+it. The in-process `apply` path does NOT use this IPC; it talks to the
+`AllowlistStore` and `ApprovalGate` directly.
+
+**Wire format** matches `mediation.sock` and `control.sock`:
+
+```text
+  Request:  u32 big-endian length || JSON payload
+  Response: u32 big-endian length || JSON payload
+```
+
+Length-prefixed JSON (rather than line-delimited) is used so callers can
+reuse the same framing primitives nono already exports. Each connection
+carries one request and one response.
+
+**Request:**
+
+```json
+{
+  "op": "approve",
+  "session_token": "<NONO_SESSION_TOKEN>",
+  "key": {
+    "kind": "argv_shape",
+    "payload": { "cmd": "security", "argv": ["find-generic-password", "-a", "u"] }
+  }
+}
+```
+
+`key` is a serde-serialized [`AllowlistKey`]. Any `AllowlistKind` variant
+the server already understands is accepted (`argv_shape`, `caller_policy`,
+`scan_config`, `scan_env`, `scan_ssh_opt`, `scan_ssh_identity`).
+
+**Response — exactly one of:**
+
+```json
+{ "verdict": "allow_once" }
+{ "verdict": "allow_always" }
+{ "verdict": "deny" }
+{ "error": "unauthenticated" }
+{ "error": "invalid_request" }
+{ "error": "unknown_op" }
+{ "error": "request_too_large" }
+```
+
+**Authentication.** The same `NONO_SESSION_TOKEN` injected into the
+sandboxed child gates this socket. Validation uses constant-time
+comparison via `subtle::ConstantTimeEq`. On token failure the dispatcher
+writes `{"error":"unauthenticated"}` and closes — it does NOT invoke the
+approval gate or mutate the allowlist.
+
+**Dispatch flow.** The endpoint mirrors `policy::apply`'s on-mismatch
+flow:
+
+1. `AllowlistStore::is_approved(&key)` → on hit, return `allow_once`
+   (without prompting).
+2. On miss, derive `(command, args, reason)` from the key's payload and
+   call `ApprovalGate::approve_with_save_option(...)`.
+3. If the verdict is `AllowAlways`, persist via `AllowlistStore::record`
+   before responding (warn-and-continue on persistence error, same as
+   `apply`).
+4. Return the verdict.
+
+### `parent_sandbox` — per-parent sandbox override
+
+When a mediated command is invoked from a mediated parent (e.g. `gh` shells out to `git`), the per-command `sandbox` applies regardless of the caller. To express "git invoked from gh has tighter capabilities than git invoked from the agent", declare a `parent_sandbox` map on `caller_policy`:
+
+```json
+{
+  "caller_policy": {
+    "agent_allowed": true,
+    "allowed_parents": ["gh", "git"],
+    "parent_sandbox": {
+      "gh": {
+        "fs_read": ["."],
+        "fs_read_file": ["~/.gitconfig"],
+        "network": { "block": true }
+      }
+    }
+  }
+}
+```
+
+When the resolved parent name matches a key in `parent_sandbox`, the mediation server uses that sandbox at exec instead of the default `sandbox`. Parents not listed (and the agent caller) continue to use the default.
+
+| Constraint | |
+|---|---|
+| Map keys must be in `allowed_parents` (if set) | else the entry is unreachable; rejected at profile-load. |
+| The command must have a default `sandbox` | else there is no fallback for agents and unlisted parents; rejected at profile-load. |
+| The override fully replaces the default for that parent | no merging; copy unchanged fields if needed. |
+
+#### `deny_agent_strict` — opt out of the approval gate
+
+The caller-policy gate (when `agent_allowed: false` or `allowed_parents` is set and the parent doesn't match) consults `ApprovalGate::approve_with_save_option` by default — the user can `[a]llow once`, `[r]emember`, or `[d]eny`. Set `caller_policy.deny_agent_strict: true` to disable the gate for the `agent_allowed:false` rejection branch and preserve the original hard-deny (exit 126) semantic. Used for security-critical commands where AllowAlways would re-open known regressions (e.g. `ssh`, `ssh-keygen`).
 
 ### Audit Trail
 

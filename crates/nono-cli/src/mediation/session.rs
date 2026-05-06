@@ -11,7 +11,8 @@ use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
 use super::{
-    CallerPolicy, CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo,
+    CallerPolicy, CommandEntry, CommandSandbox, ExtrasPolicy, FlagSpec, FlagSpecTagged,
+    InterceptAction, MediationConfig, OnMismatchPolicy, SessionAuditInfo,
 };
 use nix::libc;
 use nono::{NonoError, Result};
@@ -32,11 +33,45 @@ pub enum ResolvedAction {
 /// A resolved intercept rule ready for the mediation server.
 #[derive(Clone, Debug)]
 pub struct ResolvedIntercept {
+    /// Existing prefix matcher; empty when `argv_shape` is set.
     pub args_prefix: Vec<String>,
+    /// Strict shape matcher; absent when `args_prefix` is used.
+    pub argv_shape: Option<ResolvedArgvShape>,
     pub action: ResolvedAction,
     pub exit_code: i32,
     /// If true, requires user authentication before the action executes.
     pub admin: bool,
+    /// Optional capability scope for nonces issued by this rule's
+    /// `Capture` action. Absent = unscoped (any consumer may redeem).
+    pub nonce_scope: Option<Vec<String>>,
+}
+
+/// `ArgvShape` with `$VAR` tokens expanded at profile-load time.
+#[derive(Clone, Debug)]
+pub struct ResolvedArgvShape {
+    pub subcommand: String,
+    pub flags: std::collections::BTreeMap<String, ResolvedFlagSpec>,
+    pub extras: ExtrasPolicy,
+    pub on_mismatch: OnMismatchPolicy,
+}
+
+/// Flag spec with `$VAR` tokens expanded at profile-load time.
+#[derive(Clone, Debug)]
+pub enum ResolvedFlagSpec {
+    /// A flag that must be present with the given (already-expanded) value.
+    Required { value: String },
+    /// A boolean flag: present in the invocation, no value attached.
+    Boolean,
+}
+
+impl ResolvedFlagSpec {
+    /// Returns the required value, or `None` if this is a boolean flag.
+    pub fn required_value(&self) -> Option<&str> {
+        match self {
+            Self::Required { value } => Some(value),
+            Self::Boolean => None,
+        }
+    }
 }
 
 /// A fully resolved command entry ready for the mediation server.
@@ -132,6 +167,11 @@ pub fn setup(
     let socket_path = session_dir.join("mediation.sock");
     let control_socket_path = session_dir.join("control.sock");
     let audit_socket_path = session_dir.join("audit.sock");
+    // Sibling socket for the cross-process approval IPC. Same length-prefixed
+    // JSON framing, same NONO_SESSION_TOKEN auth as `mediation.sock`. Used
+    // out-of-process by plans 4.1 / 4.3 shell wrappers; plan 4.2 itself does
+    // not consume it (apply uses the in-process AllowlistStore directly).
+    let approve_socket_path = session_dir.join("approve.sock");
 
     std::fs::create_dir_all(&shim_dir).map_err(|e| {
         NonoError::SandboxInit(format!(
@@ -306,6 +346,11 @@ pub fn setup(
     let approval_gate: Arc<dyn super::approval::ApprovalGate + Send + Sync> =
         Arc::new(NativeApprovalGate);
 
+    // Per-user persistent allowlist for "Allow-always" approvals. Shared by
+    // the argv_shape mismatch flow (plan 4.2) and reused by future plans
+    // (4.1 caller-policy, 4.3 config/env scan).
+    let allowlist = Arc::new(super::allowlist::AllowlistStore::open_default()?);
+
     let sock = socket_path.clone();
     let cmds = resolved_commands.clone();
     let broker_clone = Arc::clone(&broker);
@@ -313,6 +358,7 @@ pub fn setup(
     let shim_dir_clone = shim_dir.clone();
     let admin_clone = admin_state.clone();
     let gate_clone = Arc::clone(&approval_gate);
+    let allowlist_clone = Arc::clone(&allowlist);
     let audit_sock = audit_socket_path.clone();
     let audit_log_dir = crate::session::ensure_sessions_dir()?;
     let audit_info_for_server = Arc::clone(&audit_info_arc);
@@ -325,6 +371,7 @@ pub fn setup(
             shim_dir_clone,
             admin_clone,
             gate_clone,
+            allowlist_clone,
             audit_sock,
             audit_log_dir,
             workdir,
@@ -348,6 +395,26 @@ pub fn setup(
             super::control::run_control_server(ctrl_sock, ctrl_token, ctrl_admin, ctrl_sdir).await
         {
             tracing::error!("control server error: {}", e);
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // Start the /approve IPC server (sibling socket for out-of-process callers)
+    // -------------------------------------------------------------------------
+    let approve_sock = approve_socket_path.clone();
+    let approve_token: Arc<str> = Arc::from(session_token.as_str());
+    let approve_allowlist = Arc::clone(&allowlist);
+    let approve_gate = Arc::clone(&approval_gate);
+    runtime.spawn(async move {
+        if let Err(e) = super::approve_ipc::run(
+            approve_sock,
+            approve_token,
+            approve_allowlist,
+            approve_gate,
+        )
+        .await
+        {
+            tracing::error!("approve IPC error: {}", e);
         }
     });
 
@@ -443,11 +510,52 @@ fn resolve_command(
         .intercept
         .iter()
         .map(|rule| {
+            // Mutual-exclusion check: a rule may set args_prefix XOR argv_shape,
+            // not both. Empty args_prefix + None argv_shape is "match anything"
+            // and is the existing semantics.
+            if !rule.args_prefix.is_empty() && rule.argv_shape.is_some() {
+                return Err(NonoError::SandboxInit(format!(
+                    "mediation: command '{}' has an intercept rule with both \
+                     args_prefix and argv_shape; they are mutually exclusive — \
+                     use one",
+                    entry.name
+                )));
+            }
+
             let args_prefix = rule
                 .args_prefix
                 .iter()
                 .map(|arg| crate::profile::expand_str(arg, workdir))
                 .collect::<Result<Vec<String>>>()?;
+
+            let argv_shape = rule
+                .argv_shape
+                .as_ref()
+                .map(|shape| -> Result<ResolvedArgvShape> {
+                    let mut flags = std::collections::BTreeMap::new();
+                    for (k, v) in &shape.flags {
+                        let resolved = match v {
+                            FlagSpec::ValueOnly { value } => ResolvedFlagSpec::Required {
+                                value: crate::profile::expand_str(value, workdir)?,
+                            },
+                            FlagSpec::Tagged(FlagSpecTagged::Required { value }) => {
+                                ResolvedFlagSpec::Required {
+                                    value: crate::profile::expand_str(value, workdir)?,
+                                }
+                            }
+                            FlagSpec::Tagged(FlagSpecTagged::Boolean) => ResolvedFlagSpec::Boolean,
+                        };
+                        flags.insert(k.clone(), resolved);
+                    }
+                    Ok(ResolvedArgvShape {
+                        subcommand: shape.subcommand.clone(),
+                        flags,
+                        extras: shape.extras.clone(),
+                        on_mismatch: shape.on_mismatch.clone(),
+                    })
+                })
+                .transpose()?;
+
             let (action, exit_code) = match &rule.action {
                 InterceptAction::Respond { stdout, exit_code } => (
                     ResolvedAction::Respond {
@@ -468,14 +576,42 @@ fn resolve_command(
                     0,
                 ),
             };
+            let nonce_scope = rule.nonce_scope.as_ref().map(|ns| ns.consumers.clone());
             Ok(ResolvedIntercept {
                 args_prefix,
+                argv_shape,
                 action,
                 exit_code,
                 admin: rule.admin,
+                nonce_scope,
             })
         })
         .collect::<Result<Vec<_>>>()?;
+
+    // Validate parent_sandbox: keys must be in allowed_parents (if set),
+    // and the command must have a default `sandbox` to fall back to.
+    if !entry.caller_policy.parent_sandbox.is_empty() {
+        if entry.sandbox.is_none() {
+            return Err(NonoError::SandboxInit(format!(
+                "command '{}': caller_policy.parent_sandbox is set but the \
+                 command has no default sandbox to fall back to for parents \
+                 not listed in parent_sandbox",
+                entry.name
+            )));
+        }
+        if let Some(ref allowed) = entry.caller_policy.allowed_parents {
+            for k in entry.caller_policy.parent_sandbox.keys() {
+                if !allowed.iter().any(|p| p == k) {
+                    return Err(NonoError::SandboxInit(format!(
+                        "command '{}': caller_policy.parent_sandbox key '{}' \
+                         is not in caller_policy.allowed_parents — would be \
+                         unreachable",
+                        entry.name, k
+                    )));
+                }
+            }
+        }
+    }
 
     Ok(Some(ResolvedCommand {
         name: entry.name.clone(),
@@ -707,11 +843,13 @@ mod tests {
                     "$NONO_TEST_RESOLVE_CMD_USER".to_string(),
                     "Claude Code-credentials".to_string(),
                 ],
+                argv_shape: None,
                 admin: false,
                 action: InterceptAction::Respond {
                     stdout: String::new(),
                     exit_code: 0,
                 },
+                nonce_scope: None,
             }],
             sandbox: None,
             caller_policy: CallerPolicy::default(),
@@ -736,6 +874,271 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_command_expands_env_vars_in_argv_shape_flag_values() {
+        use crate::mediation::{
+            ArgvShape, CommandEntry, ExtrasPolicy, FlagSpec, InterceptAction, InterceptRule,
+            OnMismatchPolicy,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+
+        // Real binary on disk so binary_path validation succeeds.
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+
+        // Shim dir + fake shim target so symlink creation succeeds.
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            (
+                "NONO_TEST_SHAPE_BINARY",
+                fake_binary.to_str().expect("utf8"),
+            ),
+            ("NONO_TEST_SHAPE_USER", "tester"),
+        ]);
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some("$NONO_TEST_SHAPE_BINARY".to_string()),
+            intercept: vec![InterceptRule {
+                args_prefix: vec![],
+                argv_shape: Some(ArgvShape {
+                    subcommand: "find-generic-password".to_string(),
+                    flags: {
+                        let mut m = std::collections::BTreeMap::new();
+                        m.insert(
+                            "-a".to_string(),
+                            FlagSpec::ValueOnly {
+                                value: "$NONO_TEST_SHAPE_USER".to_string(),
+                            },
+                        );
+                        m.insert(
+                            "-s".to_string(),
+                            FlagSpec::ValueOnly {
+                                value: "fixed-service".to_string(),
+                            },
+                        );
+                        m
+                    },
+                    extras: ExtrasPolicy::Deny,
+                    on_mismatch: OnMismatchPolicy::Deny,
+                }),
+                admin: false,
+                action: InterceptAction::Respond {
+                    stdout: "x".to_string(),
+                    exit_code: 0,
+                },
+                nonce_scope: None,
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let workdir = tmp.path();
+        let resolved = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir)
+            .expect("resolve")
+            .expect("present");
+        let shape = resolved.intercepts[0]
+            .argv_shape
+            .as_ref()
+            .expect("argv_shape resolved");
+        assert_eq!(shape.subcommand, "find-generic-password");
+        assert_eq!(
+            shape.flags.get("-a").and_then(|f| f.required_value()),
+            Some("tester"),
+            "$VAR in flag value must be expanded at resolve time"
+        );
+        assert_eq!(
+            shape.flags.get("-s").and_then(|f| f.required_value()),
+            Some("fixed-service")
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_rejects_both_args_prefix_and_argv_shape() {
+        use crate::mediation::{
+            ArgvShape, CommandEntry, ExtrasPolicy, InterceptAction, InterceptRule, OnMismatchPolicy,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+
+        // Real binary + shim so resolution gets as far as the rule loop.
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![InterceptRule {
+                args_prefix: vec!["x".to_string()],
+                argv_shape: Some(ArgvShape {
+                    subcommand: "x".to_string(),
+                    flags: std::collections::BTreeMap::new(),
+                    extras: ExtrasPolicy::Deny,
+                    on_mismatch: OnMismatchPolicy::Deny,
+                }),
+                admin: false,
+                action: InterceptAction::Respond {
+                    stdout: "x".to_string(),
+                    exit_code: 0,
+                },
+                nonce_scope: None,
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let workdir = tmp.path();
+        let result = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir);
+        let err = match result {
+            Ok(_) => panic!("must reject both fields"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("argv_shape") && msg.contains("args_prefix"),
+            "error must name both fields, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_rejects_parent_sandbox_without_default_sandbox() {
+        // A command without a default `sandbox` cannot have parent_sandbox
+        // entries — there is no sensible fallback for parents not listed.
+        use crate::mediation::CommandEntry;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        // Real binary + shim so resolution gets past binary_path / symlink steps.
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let mut policy = CallerPolicy::default();
+        let mut ps = std::collections::HashMap::new();
+        ps.insert("gh".to_string(), CommandSandbox::default());
+        policy.parent_sandbox = ps;
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![],
+            sandbox: None, // <-- key constraint
+            caller_policy: policy,
+        };
+
+        let workdir = tmp.path();
+        let result = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir);
+        let err = match result {
+            Ok(_) => panic!("must reject parent_sandbox without default sandbox"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("parent_sandbox") && msg.contains("default sandbox"),
+            "error must explain the constraint, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_rejects_parent_sandbox_key_not_in_allowed_parents() {
+        // When `allowed_parents` is set, `parent_sandbox` keys must be a subset.
+        use crate::mediation::CommandEntry;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let mut ps = std::collections::HashMap::new();
+        ps.insert("gh".to_string(), CommandSandbox::default());
+        let policy = CallerPolicy {
+            agent_allowed: true,
+            allowed_parents: Some(vec!["git".to_string()]), // gh not allowed
+            parent_sandbox: ps,
+            deny_agent_strict: false,
+        };
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![],
+            sandbox: Some(CommandSandbox::default()),
+            caller_policy: policy,
+        };
+
+        let workdir = tmp.path();
+        let result = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir);
+        let err = match result {
+            Ok(_) => panic!("must reject parent_sandbox key not in allowed_parents"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("parent_sandbox") && msg.contains("gh") && msg.contains("allowed_parents"),
+            "error must name 'gh' and 'allowed_parents', got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_accepts_parent_sandbox_with_no_allowed_parents_constraint() {
+        // When `allowed_parents` is None (any parent), parent_sandbox keys
+        // are unrestricted (the keys define which parents get an override;
+        // any parent name is permissible).
+        use crate::mediation::CommandEntry;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let mut ps = std::collections::HashMap::new();
+        ps.insert("gh".to_string(), CommandSandbox::default());
+        let policy = CallerPolicy {
+            agent_allowed: true,
+            allowed_parents: None,
+            parent_sandbox: ps,
+            deny_agent_strict: false,
+        };
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![],
+            sandbox: Some(CommandSandbox::default()),
+            caller_policy: policy,
+        };
+
+        let workdir = tmp.path();
+        let resolved = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir)
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(resolved.caller_policy.parent_sandbox.len(), 1);
+    }
+
+    #[test]
     fn test_control_socket_path_in_session_dir() {
         // The control socket path should be derived from the session directory.
         let session_dir = session_dir_path();
@@ -743,5 +1146,50 @@ mod tests {
         // Re-derive using the same logic as setup()
         let derived = session_dir_path().join("control.sock");
         assert_eq!(expected, derived);
+    }
+
+    #[test]
+    fn test_resolve_command_carries_nonce_scope_into_resolved_intercept() {
+        use crate::mediation::{CommandEntry, InterceptAction, InterceptRule, NonceScope};
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+
+        // Real binary + shim so resolution proceeds past binary_path / symlink.
+        let fake_binary = tmp.path().join("ddtool");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let entry = CommandEntry {
+            name: "ddtool".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().to_string()),
+            intercept: vec![InterceptRule {
+                args_prefix: vec![
+                    "auth".to_string(),
+                    "github".to_string(),
+                    "token".to_string(),
+                ],
+                argv_shape: None,
+                admin: false,
+                action: InterceptAction::Capture { script: None },
+                nonce_scope: Some(NonceScope {
+                    consumers: vec!["gh".to_string(), "git".to_string()],
+                }),
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let workdir = tmp.path();
+        let resolved = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir)
+            .expect("resolve")
+            .expect("present");
+        let scope = resolved.intercepts[0]
+            .nonce_scope
+            .as_ref()
+            .expect("scope present");
+        assert_eq!(scope, &vec!["gh".to_string(), "git".to_string()]);
     }
 }

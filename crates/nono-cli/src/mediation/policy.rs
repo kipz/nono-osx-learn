@@ -87,6 +87,17 @@ static DANGEROUS_ENV_VAR_NAMES: &[&str] = &[
     "NONO_SANDBOX_CONTEXT",
 ];
 
+/// Returns true if a sandbox-supplied env var name is a NONO_GATE_* test-knob
+/// that must never be forwarded into a mediated child. NONO_GATE_FORCE_DENY
+/// (and similar) force the approval gate into known verdicts; an agent that
+/// could smuggle them via `request.env` would bypass the gate. The wider
+/// NONO_ prefix is intentionally NOT filtered: nono itself sets
+/// NONO_SESSION_TOKEN, NONO_MEDIATION_SOCKET, NONO_BROKER_SOCKET, and
+/// NONO_CALLER for sandboxed children.
+fn is_nono_gate_var(key: &str) -> bool {
+    key.starts_with("NONO_GATE_")
+}
+
 /// Apply policy to a shim request and produce a response.
 ///
 /// - If the command is unknown: returns an error response (not found).
@@ -106,10 +117,16 @@ pub async fn apply(
     broker: Arc<TokenBroker>,
     ctx: &SessionCtx<'_>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
+    allowlist: Arc<super::allowlist::AllowlistStore>,
     stdin_fd: OwnedFd,
     stdout_fd: OwnedFd,
     stderr_fd: OwnedFd,
 ) -> (ShimResponse, &'static str) {
+    // Note: `allowlist` is not yet consumed by the caller-policy gate below —
+    // plan 4.1 will wire it into the on_mismatch=Approve flow there. It is
+    // threaded through `apply` once now so future plans can reuse it without
+    // another plumbing pass. The argv_shape branch (further down) is the
+    // first consumer.
     // Find matching command entry
     let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
         warn!("mediation: unknown command '{}'", request.command);
@@ -139,46 +156,130 @@ pub async fn apply(
         .env
         .get("NONO_SANDBOX_CONTEXT")
         .and_then(|nonce| broker.resolve(nonce));
-    match &caller_parent {
+    // Decide whether the caller-policy gate rejects this caller and, if so,
+    // whether to hard-deny or consult `approve_with_save_option`.
+    //
+    // The `parent_name` slot ("agent" or the resolved parent command name) is
+    // also the value persisted in the `(cmd, parent, argv)` allowlist key, so
+    // a future invocation with the same caller bypasses the gate.
+    enum CallerPolicyGate {
+        Pass,
+        HardDeny { stderr: String },
+        Consult { parent_name: String, reason: String },
+    }
+    let gate_decision = match &caller_parent {
         None => {
-            if !cmd.caller_policy.agent_allowed {
+            if cmd.caller_policy.agent_allowed {
+                CallerPolicyGate::Pass
+            } else if cmd.caller_policy.deny_agent_strict {
                 warn!(
-                    "mediation: rejecting '{}' from primary sandbox (agent_allowed=false)",
+                    "mediation: hard-denying '{}' from primary sandbox (agent_allowed=false, deny_agent_strict=true)",
                     request.command
                 );
-                return (
-                    ShimResponse {
-                        stdout: String::new(),
-                        stderr: format!(
-                            "nono-mediation: '{}' cannot be invoked from the primary sandbox\n",
-                            request.command
-                        ),
-                        exit_code: 126,
-                    },
-                    "denied",
+                CallerPolicyGate::HardDeny {
+                    stderr: format!(
+                        "nono-mediation: '{}' cannot be invoked from the primary sandbox\n",
+                        request.command
+                    ),
+                }
+            } else {
+                let reason = format!(
+                    "'{}' attempted by agent — caller-policy denies the agent",
+                    request.command
                 );
+                CallerPolicyGate::Consult {
+                    parent_name: "agent".to_string(),
+                    reason,
+                }
             }
         }
         Some(parent) => {
-            if let Some(allowed) = &cmd.caller_policy.allowed_parents {
-                let parent_name: &str = parent;
-                if !allowed.iter().any(|p| p == parent_name) {
-                    warn!(
-                        "mediation: rejecting '{}' invoked from '{}' (not in allowed_parents)",
-                        request.command, parent_name
+            let parent_name: &str = parent;
+            match &cmd.caller_policy.allowed_parents {
+                Some(allowed) if !allowed.iter().any(|p| p == parent_name) => {
+                    let reason = format!(
+                        "'{}' invoked from unexpected parent '{}' — only {:?} are allowed",
+                        request.command, parent_name, allowed
                     );
-                    return (
-                        ShimResponse {
-                            stdout: String::new(),
-                            stderr: format!(
-                                "nono-mediation: '{}' cannot be invoked from '{}'\n",
-                                request.command, parent_name
-                            ),
-                            exit_code: 126,
-                        },
-                        "denied",
-                    );
+                    CallerPolicyGate::Consult {
+                        parent_name: parent_name.to_string(),
+                        reason,
+                    }
                 }
+                _ => CallerPolicyGate::Pass,
+            }
+        }
+    };
+    match gate_decision {
+        CallerPolicyGate::Pass => {}
+        CallerPolicyGate::HardDeny { stderr } => {
+            drop(stdin_fd);
+            drop(stdout_fd);
+            drop(stderr_fd);
+            return (
+                ShimResponse {
+                    stdout: String::new(),
+                    stderr,
+                    exit_code: 126,
+                },
+                "denied",
+            );
+        }
+        CallerPolicyGate::Consult { parent_name, reason } => {
+            let key = super::allowlist::AllowlistKey {
+                kind: super::allowlist::AllowlistKind::CallerPolicy,
+                payload: serde_json::json!({
+                    "cmd": &cmd.name,
+                    "parent": &parent_name,
+                    "argv": &request.args,
+                }),
+            };
+            if !allowlist.is_approved(&key) {
+                let cmd_name = cmd.name.clone();
+                let cmd_args = request.args.clone();
+                let approval_clone = Arc::clone(&approval);
+                let verdict = tokio::task::spawn_blocking(move || {
+                    approval_clone.approve_with_save_option(&cmd_name, &cmd_args, &reason)
+                })
+                .await
+                .unwrap_or(super::approval::ApprovalVerdict::Deny);
+                match verdict {
+                    super::approval::ApprovalVerdict::AllowOnce => {}
+                    super::approval::ApprovalVerdict::AllowAlways => {
+                        if let Err(e) = allowlist.record(&key) {
+                            warn!(
+                                "mediation: allowlist record failed for caller-policy '{}': {}",
+                                request.command, e
+                            );
+                            // Treat as Allow-once on persistence failure.
+                        }
+                    }
+                    super::approval::ApprovalVerdict::Deny => {
+                        warn!(
+                            "mediation: caller-policy gate denied '{}' (parent={})",
+                            request.command, parent_name
+                        );
+                        drop(stdin_fd);
+                        drop(stdout_fd);
+                        drop(stderr_fd);
+                        return (
+                            ShimResponse {
+                                stdout: String::new(),
+                                stderr: format!(
+                                    "nono-mediation: '{}' caller-policy denied by user\n",
+                                    request.command
+                                ),
+                                exit_code: 126,
+                            },
+                            "denied",
+                        );
+                    }
+                }
+            } else {
+                debug!(
+                    "mediation: caller-policy gate allowlisted '{}' (parent={})",
+                    request.command, parent_name
+                );
             }
         }
     }
@@ -221,10 +322,95 @@ pub async fn apply(
 
     // Check intercept rules in order
     for rule in &cmd.intercepts {
-        if subcommand_matches(&rule.args_prefix, &request.args) {
+        // Decide whether this rule fires for this invocation. Three outcomes:
+        //   - matched=true: rule fires; proceed to action below.
+        //   - matched=false: rule does NOT fire; continue the for-loop.
+        //   - early-return with exit 126: argv_shape on_mismatch=Approve +
+        //     Deny verdict.
+        let matched = match &rule.argv_shape {
+            Some(shape) => match argv_shape_matches(shape, &request.args) {
+                Ok(()) => true,
+                Err(reason) => match shape.on_mismatch {
+                    super::OnMismatchPolicy::Deny => false,
+                    super::OnMismatchPolicy::Approve => {
+                        // Build the allowlist key for this argv-shape mismatch.
+                        // Plans 4.1 / 4.3 will use other variants against the
+                        // same store.
+                        let key = super::allowlist::AllowlistKey {
+                            kind: super::allowlist::AllowlistKind::ArgvShape,
+                            payload: serde_json::json!({
+                                "cmd": &request.command,
+                                "argv": &request.args,
+                            }),
+                        };
+                        if allowlist.is_approved(&key) {
+                            debug!(
+                                "mediation: argv_shape mismatch for '{}' but allowlisted; treating as match",
+                                request.command
+                            );
+                            true
+                        } else {
+                            // Pop the approval dialog. The reason is
+                            // included so the user sees WHY the strict
+                            // matcher rejected this exact argv.
+                            let cmd_name = request.command.clone();
+                            let cmd_args = request.args.clone();
+                            let reason_msg = format!(
+                                "argv shape mismatch on rule for '{}': {}",
+                                cmd_name, reason
+                            );
+                            let approval_clone = Arc::clone(&approval);
+                            let verdict = tokio::task::spawn_blocking(move || {
+                                approval_clone.approve_with_save_option(
+                                    &cmd_name,
+                                    &cmd_args,
+                                    &reason_msg,
+                                )
+                            })
+                            .await
+                            .unwrap_or(super::approval::ApprovalVerdict::Deny);
+
+                            match verdict {
+                                super::approval::ApprovalVerdict::AllowOnce => true,
+                                super::approval::ApprovalVerdict::AllowAlways => {
+                                    if let Err(e) = allowlist.record(&key) {
+                                        warn!(
+                                            "mediation: allowlist record failed for '{}': {}",
+                                            request.command, e
+                                        );
+                                        // Treat as Allow-once on persistence failure.
+                                    }
+                                    true
+                                }
+                                super::approval::ApprovalVerdict::Deny => {
+                                    drop(stdin_fd);
+                                    drop(stdout_fd);
+                                    drop(stderr_fd);
+                                    return (
+                                        ShimResponse {
+                                            stdout: String::new(),
+                                            stderr: format!(
+                                                "nono: '{}' was not approved\n",
+                                                request.command
+                                            ),
+                                            exit_code: 126,
+                                        },
+                                        "denied",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                },
+            },
+            None => subcommand_matches(&rule.args_prefix, &request.args),
+        };
+        if matched {
             debug!(
-                "mediation: intercepting '{}' with prefix {:?}",
-                request.command, rule.args_prefix
+                "mediation: intercepting '{}' (prefix={:?}, argv_shape={})",
+                request.command,
+                rule.args_prefix,
+                rule.argv_shape.is_some()
             );
 
             // Admin gate: require user authentication before executing this rule.
@@ -297,7 +483,10 @@ pub async fn apply(
                     if result.exit_code != 0 {
                         return (result, "capture");
                     }
-                    let nonce = broker.issue(Zeroizing::new(result.stdout.trim().to_string()));
+                    let nonce = broker.issue_with_scope(
+                        Zeroizing::new(result.stdout.trim().to_string()),
+                        rule.nonce_scope.clone(),
+                    );
                     (
                         ShimResponse {
                             stdout: format!("{}\n", nonce),
@@ -351,7 +540,7 @@ pub async fn apply(
         &request.args,
         &request.env,
         &broker,
-        cmd.sandbox.clone(),
+        effective_sandbox(cmd, caller_parent.as_deref().map(|s| s.as_str())),
         ctx,
         commands,
         Some((stdin_fd, stdout_fd, stderr_fd)),
@@ -472,6 +661,112 @@ pub fn subcommand_matches(prefix: &[String], args: &[String]) -> bool {
     prefix.iter().zip(positional.iter()).all(|(p, a)| p == *a)
 }
 
+/// Match an invocation against a strict `ResolvedArgvShape`.
+///
+/// Returns Ok(()) on match, Err(reason) on no-match. The Err carries a short
+/// reason string useful for tracing/audit. Callers should treat any Err the
+/// same way (no match → fall through to the next intercept rule or to
+/// passthrough); the reason is not surfaced to the agent.
+///
+/// Matching semantics (see `ArgvShape` doc):
+/// - args[0] must equal shape.subcommand.
+/// - Each declared flag must appear exactly once with the declared value
+///   (or with no value if Boolean).
+/// - With ExtrasPolicy::Deny, any unknown flag or extra positional after
+///   args[0] causes a no-match.
+/// - With ExtrasPolicy::Allow, extras are tolerated; required-flag rules
+///   still apply.
+pub fn argv_shape_matches(
+    shape: &super::session::ResolvedArgvShape,
+    args: &[String],
+) -> std::result::Result<(), String> {
+    use super::session::ResolvedFlagSpec;
+    use super::ExtrasPolicy;
+
+    if args.is_empty() || args[0] != shape.subcommand {
+        return Err(format!(
+            "subcommand mismatch (want '{}', got args[0]={:?})",
+            shape.subcommand,
+            args.first()
+        ));
+    }
+
+    // Walk the rest of args left-to-right, tracking which declared flags
+    // we have seen (each must appear exactly once).
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut i = 1usize;
+    while i < args.len() {
+        let token = args[i].as_str();
+
+        if let Some(spec) = shape.flags.get(token) {
+            if !seen.insert(token) {
+                return Err(format!("flag '{}' appears more than once", token));
+            }
+            match spec {
+                ResolvedFlagSpec::Required { value } => {
+                    let next = args
+                        .get(i + 1)
+                        .ok_or_else(|| format!("flag '{}' missing required value", token))?;
+                    if next != value {
+                        return Err(format!(
+                            "flag '{}' value mismatch (want '{}', got '{}')",
+                            token, value, next
+                        ));
+                    }
+                    i += 2;
+                }
+                ResolvedFlagSpec::Boolean => {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Token not in declared flags. Either an unknown flag or an extra
+        // positional. Both are governed by `extras`.
+        match shape.extras {
+            ExtrasPolicy::Deny => {
+                return Err(format!("unknown token '{}' (extras=Deny)", token));
+            }
+            ExtrasPolicy::Allow => {
+                // Skip unknown token. If it looks like a flag with a value
+                // (`-X foo`), we cannot know whether it consumes the next
+                // arg. Be conservative: skip just this token. The next iter
+                // will inspect the would-be-value; if it equals one of our
+                // declared flags, we will see it (correct); if it equals
+                // some unknown token, extras=Allow tolerates that too.
+                i += 1;
+            }
+        }
+    }
+
+    // Verify every declared flag was seen.
+    for declared in shape.flags.keys() {
+        if !seen.contains(declared.as_str()) {
+            return Err(format!("required flag '{}' not present", declared));
+        }
+    }
+    Ok(())
+}
+
+/// Pick the per-command sandbox to apply to a passthrough exec.
+///
+/// If the request comes from a mediated parent listed in `parent_sandbox`,
+/// return that override. Otherwise fall back to the command's default
+/// sandbox (which may itself be `None`). Agent callers (no parent) always
+/// receive the default sandbox.
+fn effective_sandbox(
+    cmd: &ResolvedCommand,
+    caller_parent: Option<&str>,
+) -> Option<super::CommandSandbox> {
+    if let Some(parent) = caller_parent {
+        if let Some(sb) = cmd.caller_policy.parent_sandbox.get(parent) {
+            return Some(sb.clone());
+        }
+    }
+    cmd.sandbox.clone()
+}
+
 /// Execute a shell script and collect its output.
 ///
 /// Uses the same strict env-building as `exec_passthrough`: starts from the
@@ -481,7 +776,11 @@ async fn exec_script(
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
 ) -> ShimResponse {
-    let env = build_exec_env(sandbox_env, broker);
+    // Capture scripts are not in any consumer scope: scoped nonces must NOT
+    // be promoted into a capture script's environment (they would leak the
+    // very credential the capture is producing). Pass "" so `resolve_for`
+    // rejects every scoped nonce; unscoped nonces still resolve.
+    let env = build_exec_env(sandbox_env, broker, "");
     let script = script.to_string();
 
     let result = tokio::task::spawn_blocking(move || -> Result<ShimResponse> {
@@ -563,7 +862,7 @@ async fn exec_passthrough(
     stdio_fds: Option<(OwnedFd, OwnedFd, OwnedFd)>,
     request_cwd: Option<&str>,
 ) -> ShimResponse {
-    let mut env = build_exec_env(sandbox_env, broker);
+    let mut env = build_exec_env(sandbox_env, broker, &cmd.name);
 
     // Build the effective shim directory and PATH.
     // When allow_commands is set, create a filtered shim dir that excludes allowed
@@ -1109,9 +1408,20 @@ fn add_sandbox_file(
 ///
 /// Starts from the trusted parent env, then promotes nonce-bearing sandbox vars.
 /// Non-nonce sandbox vars and dangerous var names are silently discarded.
+///
+/// `consumer` is the command name about to be exec'd (e.g. "gh", "kubectl").
+/// Nonces are resolved via `broker.resolve_for(value, consumer)` so that
+/// scope-bound nonces only promote into commands listed in the issuing rule's
+/// `nonce_scope.consumers`. A scope mismatch silently drops the env var and
+/// emits a `tracing::warn!` audit event (the existing `AuditEvent` schema does
+/// not yet model scope-mismatch drops; promoting that to a structured audit
+/// event is a follow-up). Pass `""` as the consumer to disable scoped-nonce
+/// promotion entirely (used by capture scripts: scoped nonces must not leak
+/// into a capture script's environment).
 fn build_exec_env(
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
+    consumer: &str,
 ) -> HashMap<String, String> {
     // Start from parent (trusted) env
     let mut env: HashMap<String, String> = std::env::vars().collect();
@@ -1125,11 +1435,34 @@ fn build_exec_env(
             warn!("mediation: blocked dangerous var {} from sandbox env", key);
             continue;
         }
+        if is_nono_gate_var(key) {
+            warn!(
+                "mediation: blocked NONO_GATE_* test-knob {} from sandbox env",
+                key
+            );
+            continue;
+        }
         if value.starts_with("nono_") {
-            if let Some(real) = broker.resolve(value) {
-                env.insert(key.clone(), real.as_str().to_string());
+            match broker.resolve_for(value, consumer) {
+                Some(real) => {
+                    env.insert(key.clone(), real.as_str().to_string());
+                }
+                None => {
+                    // Either an unknown nonce or a scope mismatch (the nonce
+                    // exists but `consumer` is not in its allowed list). In
+                    // both cases silently drop the env var so the sandbox
+                    // cannot probe broker contents. We cannot distinguish
+                    // the two cases here without exposing scope from the
+                    // broker, but the warn-log records enough context to
+                    // diagnose scope mismatches in practice.
+                    warn!(
+                        target: "nono::mediation::scope",
+                        consumer_cmd = consumer,
+                        env_key = key.as_str(),
+                        "mediation: dropped scoped/unknown nonce for env var",
+                    );
+                }
             }
-            // Unknown nonce: silently discard — don't let sandbox probe broker contents.
         } else {
             env.insert(key.clone(), value.clone());
         }
@@ -1212,12 +1545,35 @@ mod tests {
     /// continue to assert on `resp.stdout`/`resp.stderr` regardless of
     /// whether the path was streaming (passthrough) or buffered (Capture/
     /// Respond/Approve).
+    /// Build a fresh tempdir-backed allowlist for tests. The tempdir is
+    /// leaked so its lifetime spans the test process — acceptable here.
+    fn make_allowlist() -> Arc<crate::mediation::allowlist::AllowlistStore> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("argv-allowlist.json");
+        std::mem::forget(dir);
+        Arc::new(
+            crate::mediation::allowlist::AllowlistStore::open_at(path)
+                .expect("open allowlist"),
+        )
+    }
+
     async fn apply_capture(
         req: ShimRequest,
         cmds: &[ResolvedCommand],
         broker: Arc<TokenBroker>,
         ctx: &SessionCtx<'_>,
         approval: Arc<dyn ApprovalGate + Send + Sync>,
+    ) -> (ShimResponse, &'static str) {
+        apply_capture_with_allowlist(req, cmds, broker, ctx, approval, make_allowlist()).await
+    }
+
+    async fn apply_capture_with_allowlist(
+        req: ShimRequest,
+        cmds: &[ResolvedCommand],
+        broker: Arc<TokenBroker>,
+        ctx: &SessionCtx<'_>,
+        approval: Arc<dyn ApprovalGate + Send + Sync>,
+        allowlist: Arc<crate::mediation::allowlist::AllowlistStore>,
     ) -> (ShimResponse, &'static str) {
         let (stdin_fd, stdout_fd, stderr_fd, harness) = make_passthrough_fds();
 
@@ -1241,7 +1597,7 @@ mod tests {
         });
 
         let (mut resp, action) = apply(
-            req, cmds, broker, ctx, approval, stdin_fd, stdout_fd, stderr_fd,
+            req, cmds, broker, ctx, approval, allowlist, stdin_fd, stdout_fd, stderr_fd,
         )
         .await;
 
@@ -1299,11 +1655,13 @@ mod tests {
     async fn test_caller_policy_agent_allowed_by_default() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec![],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "ok\n".to_string(),
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
         // Default caller_policy from make_cmd.
         assert!(cmd.caller_policy.agent_allowed);
@@ -1323,14 +1681,17 @@ mod tests {
         assert_eq!(resp.stdout, "ok\n");
     }
 
-    /// `agent_allowed: false` rejects a call from the primary sandbox
-    /// (no NONO_SANDBOX_CONTEXT) with exit 126.
+    /// `agent_allowed: false` consults the approval gate; on `Deny` the call
+    /// is rejected with exit 126. `always_deny()` simulates the user choosing
+    /// "deny" at the prompt.
     #[tokio::test]
     async fn test_caller_policy_rejects_agent_when_agent_allowed_false() {
         let mut cmd = make_cmd(vec![]);
         cmd.caller_policy = CallerPolicy {
             agent_allowed: false,
             allowed_parents: Some(vec!["git".to_string()]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         };
 
         let req = ShimRequest {
@@ -1340,12 +1701,12 @@ mod tests {
             ..Default::default()
         };
         let (resp, action) =
-            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_deny()).await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
         assert!(
-            resp.stderr.contains("primary sandbox"),
-            "stderr should mention primary sandbox: {}",
+            resp.stderr.contains("caller-policy denied"),
+            "stderr should mention caller-policy denial: {}",
             resp.stderr
         );
     }
@@ -1357,15 +1718,19 @@ mod tests {
     async fn test_caller_policy_allows_listed_parent() {
         let mut cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec![],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "from_git\n".to_string(),
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
         cmd.caller_policy = CallerPolicy {
             agent_allowed: false,
             allowed_parents: Some(vec!["git".to_string()]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         };
 
         let broker = make_broker();
@@ -1387,13 +1752,16 @@ mod tests {
         assert_eq!(resp.stdout, "from_git\n");
     }
 
-    /// A parent not in `allowed_parents` is rejected with exit 126.
+    /// A parent not in `allowed_parents` consults the gate; on `Deny` the
+    /// call is rejected with exit 126.
     #[tokio::test]
     async fn test_caller_policy_rejects_unlisted_parent() {
         let mut cmd = make_cmd(vec![]);
         cmd.caller_policy = CallerPolicy {
             agent_allowed: true,
             allowed_parents: Some(vec!["git".to_string()]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         };
 
         let broker = make_broker();
@@ -1410,25 +1778,28 @@ mod tests {
             pid: 0,
             cwd: None,
         };
-        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_deny()).await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
         assert!(
-            resp.stderr.contains("kubectl"),
-            "stderr should name the rejected parent: {}",
+            resp.stderr.contains("caller-policy denied"),
+            "stderr should mention caller-policy denial: {}",
             resp.stderr
         );
     }
 
     /// `allowed_parents: Some(vec![])` (explicit empty list) blocks every
     /// mediated parent. With `agent_allowed: true` the command is still
-    /// reachable from the agent — useful for "agent-only" tools.
+    /// reachable from the agent — useful for "agent-only" tools. The gate
+    /// still mediates: `always_deny()` here simulates the user denying.
     #[tokio::test]
     async fn test_caller_policy_empty_allowed_parents_blocks_all_parents() {
         let mut cmd = make_cmd(vec![]);
         cmd.caller_policy = CallerPolicy {
             agent_allowed: true,
             allowed_parents: Some(vec![]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
         };
 
         let broker = make_broker();
@@ -1444,7 +1815,7 @@ mod tests {
             pid: 0,
             cwd: None,
         };
-        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_deny()).await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
     }
@@ -1455,11 +1826,13 @@ mod tests {
     async fn test_caller_policy_none_allowed_parents_accepts_any() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec![],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "any_parent_ok\n".to_string(),
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
         // Confirm default state.
         assert!(cmd.caller_policy.allowed_parents.is_none());
@@ -1491,11 +1864,13 @@ mod tests {
                 "github".to_string(),
                 "token".to_string(),
             ],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "static_output\n".to_string(),
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -1525,15 +1900,489 @@ mod tests {
         assert_eq!(resp.stdout, "static_output\n");
     }
 
+    // --- argv_shape integration tests ---
+
+    /// End-to-end: an `argv_shape` rule with extras=Deny rejects the
+    /// duplicate-`-s` bypass. The malicious invocation falls through to a
+    /// fallback rule, NOT the strict rule's output.
+    #[tokio::test]
+    async fn test_apply_argv_shape_rejects_duplicate_flag_bypass() {
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m.insert(
+                        "-s".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "Claude Code-credentials".to_string(),
+                        },
+                    );
+                    m.insert("-w".to_string(), ResolvedFlagSpec::Boolean);
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Deny,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "STRICT_APPROVED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+            nonce_scope: None,
+        };
+        let fallback = ResolvedIntercept {
+            args_prefix: vec!["find-generic-password".to_string()],
+            argv_shape: None,
+            action: ResolvedAction::Respond {
+                stdout: "FALLBACK_CAPTURE\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+            nonce_scope: None,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict, fallback],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        // Malicious: appends a second `-s evil-service`.
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec![
+                "find-generic-password".to_string(),
+                "-a".to_string(),
+                "tester".to_string(),
+                "-s".to_string(),
+                "Claude Code-credentials".to_string(),
+                "-s".to_string(),
+                "evil-service".to_string(),
+                "-w".to_string(),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+        assert_eq!(
+            resp.stdout, "FALLBACK_CAPTURE\n",
+            "duplicate-flag attack must NOT match strict rule; got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Canonical invocation hits the strict rule.
+    #[tokio::test]
+    async fn test_apply_argv_shape_matches_canonical_invocation() {
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m.insert(
+                        "-s".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "Claude Code-credentials".to_string(),
+                        },
+                    );
+                    m.insert("-w".to_string(), ResolvedFlagSpec::Boolean);
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Deny,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "STRICT_APPROVED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+            nonce_scope: None,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec![
+                "find-generic-password".to_string(),
+                "-a".to_string(),
+                "tester".to_string(),
+                "-s".to_string(),
+                "Claude Code-credentials".to_string(),
+                "-w".to_string(),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+        assert_eq!(resp.stdout, "STRICT_APPROVED\n");
+    }
+
+    /// argv_shape with on_mismatch=Approve and a Deny verdict from the gate
+    /// returns exit 126 and does NOT fall through to the next rule.
+    #[tokio::test]
+    async fn test_apply_argv_shape_on_mismatch_approve_deny_returns_126() {
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Approve,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "MATCHED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+            nonce_scope: None,
+        };
+        let fallback = ResolvedIntercept {
+            args_prefix: vec!["find-generic-password".to_string()],
+            argv_shape: None,
+            action: ResolvedAction::Respond {
+                stdout: "FALLBACK\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+            nonce_scope: None,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict, fallback],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        // Mismatching args (no -a) trigger Approve flow with AlwaysDeny gate.
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec!["find-generic-password".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_deny(),
+        )
+        .await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        // CRUCIAL: must NOT have fallen through to the FALLBACK rule.
+        assert_ne!(
+            resp.stdout, "FALLBACK\n",
+            "Approve+Deny must short-circuit, not fall through"
+        );
+    }
+
+    /// argv_shape with on_mismatch=Approve and an AllowOnce verdict treats
+    /// the rule as matched — its action fires.
+    #[tokio::test]
+    async fn test_apply_argv_shape_on_mismatch_approve_allow_once_fires_action() {
+        use crate::mediation::approval::AlwaysAllowOnce;
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Approve,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "MATCHED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+            nonce_scope: None,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec!["find-generic-password".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let approval: Arc<dyn ApprovalGate + Send + Sync> = Arc::new(AlwaysAllowOnce);
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            approval,
+        )
+        .await;
+        assert_eq!(resp.stdout, "MATCHED\n");
+    }
+
+    /// argv_shape with on_mismatch=Approve and an AllowAlways verdict
+    /// records the (command, argv) tuple in the allowlist AND fires the
+    /// action. A second invocation with the same argv hits the allowlist
+    /// and skips the prompt — even with a Deny gate.
+    #[tokio::test]
+    async fn test_apply_argv_shape_on_mismatch_approve_allow_always_persists() {
+        use crate::mediation::approval::{AlwaysAllowAlways, AlwaysDeny};
+        use crate::mediation::session::{ResolvedArgvShape, ResolvedFlagSpec};
+        use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+        let strict = ResolvedIntercept {
+            args_prefix: vec![],
+            argv_shape: Some(ResolvedArgvShape {
+                subcommand: "find-generic-password".to_string(),
+                flags: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "-a".to_string(),
+                        ResolvedFlagSpec::Required {
+                            value: "tester".to_string(),
+                        },
+                    );
+                    m
+                },
+                extras: ExtrasPolicy::Deny,
+                on_mismatch: OnMismatchPolicy::Approve,
+            }),
+            action: ResolvedAction::Respond {
+                stdout: "MATCHED\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+            nonce_scope: None,
+        };
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![strict],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        // Single shared allowlist across both invocations.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let allowlist = Arc::new(
+            crate::mediation::allowlist::AllowlistStore::open_at(
+                dir.path().join("argv-allowlist.json"),
+            )
+            .expect("open"),
+        );
+
+        // First invocation: AlwaysAllowAlways -> record + fire.
+        {
+            let req = ShimRequest {
+                command: "security".to_string(),
+                args: vec!["find-generic-password".to_string()],
+                session_token: String::new(),
+                ..Default::default()
+            };
+            let approval: Arc<dyn ApprovalGate + Send + Sync> = Arc::new(AlwaysAllowAlways);
+            let (resp, _) = apply_capture_with_allowlist(
+                req,
+                std::slice::from_ref(&cmd),
+                make_broker(),
+                &SessionCtx {
+                    shim_dir: std::path::Path::new("/tmp"),
+                    socket_path: std::path::Path::new("/tmp/test.sock"),
+                    session_token: "test_token",
+                    workdir: std::path::Path::new("/tmp"),
+                },
+                approval,
+                Arc::clone(&allowlist),
+            )
+            .await;
+            assert_eq!(resp.stdout, "MATCHED\n", "first invocation should fire action");
+        }
+
+        // Verify the allowlist actually persisted the entry.
+        let key = crate::mediation::allowlist::AllowlistKey {
+            kind: crate::mediation::allowlist::AllowlistKind::ArgvShape,
+            payload: serde_json::json!({
+                "cmd": "security",
+                "argv": ["find-generic-password"],
+            }),
+        };
+        assert!(
+            allowlist.is_approved(&key),
+            "AllowAlways must record to the allowlist"
+        );
+
+        // Second invocation: SAME args, AlwaysDeny gate. Allowlist hit means
+        // we skip the prompt entirely; gate is never consulted.
+        {
+            let req = ShimRequest {
+                command: "security".to_string(),
+                args: vec!["find-generic-password".to_string()],
+                session_token: String::new(),
+                ..Default::default()
+            };
+            let approval: Arc<dyn ApprovalGate + Send + Sync> = Arc::new(AlwaysDeny);
+            let (resp, _) = apply_capture_with_allowlist(
+                req,
+                &[cmd],
+                make_broker(),
+                &SessionCtx {
+                    shim_dir: std::path::Path::new("/tmp"),
+                    socket_path: std::path::Path::new("/tmp/test.sock"),
+                    session_token: "test_token",
+                    workdir: std::path::Path::new("/tmp"),
+                },
+                approval,
+                Arc::clone(&allowlist),
+            )
+            .await;
+            assert_eq!(
+                resp.stdout, "MATCHED\n",
+                "second invocation should hit allowlist and skip the deny gate"
+            );
+        }
+    }
+
+    /// Cross-plan smoke test: the caller-policy gate returns exit 126 for an
+    /// agent caller when `agent_allowed: false` and the user denies, even
+    /// though `apply` now receives an additional `allowlist` parameter and
+    /// the gate is consulted instead of hard-denied (plan 4.1 task 3.5).
+    #[tokio::test]
+    async fn test_apply_caller_policy_gate_unchanged_with_allowlist_param() {
+        let mut cmd = make_cmd(vec![]);
+        cmd.caller_policy = CallerPolicy {
+            agent_allowed: false,
+            allowed_parents: Some(vec!["git".to_string()]),
+            parent_sandbox: std::collections::HashMap::new(),
+            deny_agent_strict: false,
+        };
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        // Use the allowlist-aware helper to assert the param is plumbed.
+        let allowlist = make_allowlist();
+        let (resp, action) = apply_capture_with_allowlist(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            always_deny(),
+            allowlist,
+        )
+        .await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        assert!(
+            resp.stderr.contains("caller-policy denied"),
+            "stderr should mention caller-policy denial: {}",
+            resp.stderr
+        );
+    }
+
     #[tokio::test]
     async fn test_intercept_prefix_matches_longer_args() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "matched\n".to_string(),
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -1563,11 +2412,13 @@ mod tests {
     async fn test_no_intercept_match_falls_through() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string(), "github".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "secret\n".to_string(),
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -1597,11 +2448,13 @@ mod tests {
     async fn test_admin_rule_allow_proceeds() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "deleted\n".to_string(),
             },
             exit_code: 0,
             admin: true,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -1631,11 +2484,13 @@ mod tests {
     async fn test_admin_rule_deny_blocks() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "deleted\n".to_string(),
             },
             exit_code: 0,
             admin: true,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -1666,11 +2521,13 @@ mod tests {
         // admin=false rule with AlwaysDeny gate — gate must NOT be called, action executes.
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["status".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "ok\n".to_string(),
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -1773,15 +2630,233 @@ mod tests {
         ));
     }
 
+    // --- argv_shape_matches tests ---
+
+    use crate::mediation::session::ResolvedArgvShape;
+    use crate::mediation::session::ResolvedFlagSpec;
+    use crate::mediation::{ExtrasPolicy, OnMismatchPolicy};
+
+    fn shape(
+        subcommand: &str,
+        flags: &[(&str, ResolvedFlagSpec)],
+        extras: ExtrasPolicy,
+    ) -> ResolvedArgvShape {
+        ResolvedArgvShape {
+            subcommand: subcommand.to_string(),
+            flags: flags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            extras,
+            on_mismatch: OnMismatchPolicy::Deny,
+        }
+    }
+
+    fn req(value: &str) -> ResolvedFlagSpec {
+        ResolvedFlagSpec::Required {
+            value: value.to_string(),
+        }
+    }
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn test_argv_shape_matches_canonical_security_invocation() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz")), ("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        assert!(argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials", "-w"]),
+        ).is_err()); // "-w" is an extra → Deny → no match
+    }
+
+    #[test]
+    fn test_argv_shape_matches_when_no_extras() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz")), ("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials"]),
+        );
+        assert!(r.is_ok(), "expected match, got: {:?}", r);
+    }
+
+    #[test]
+    fn test_argv_shape_matches_with_boolean_flag() {
+        let shape = shape(
+            "find-generic-password",
+            &[
+                ("-a", req("kipz")),
+                ("-s", req("Claude Code-credentials")),
+                ("-w", ResolvedFlagSpec::Boolean),
+            ],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials", "-w"]),
+        );
+        assert!(r.is_ok(), "expected match, got: {:?}", r);
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_duplicate_required_flag() {
+        // The bypass: agent passes `-s Claude Code-credentials -s evil-service`.
+        // security itself uses the LAST -s value (evil-service) but a prefix
+        // matcher would happily approve based on the FIRST one. The shape
+        // matcher must reject duplicates.
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz")), ("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-s", "Claude Code-credentials", "-s", "evil-service"]),
+        );
+        assert!(r.is_err(), "duplicate -s must reject the match");
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_wrong_flag_value() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-s", "wrong-service"]),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_missing_required_flag() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz")), ("-s", req("Claude Code-credentials"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-s", "Claude Code-credentials"]),
+        );
+        assert!(r.is_err(), "missing -a must reject");
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_unknown_flag_when_extras_deny() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-x", "anything"]),
+        );
+        assert!(r.is_err(), "unknown flag with extras=Deny must reject");
+    }
+
+    #[test]
+    fn test_argv_shape_tolerates_unknown_flag_when_extras_allow() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz"))],
+            ExtrasPolicy::Allow,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-a", "kipz", "-x", "anything"]),
+        );
+        assert!(r.is_ok(), "unknown flag with extras=Allow must match");
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_wrong_subcommand() {
+        let shape = shape("find-generic-password", &[], ExtrasPolicy::Deny);
+        let r = argv_shape_matches(&shape, &s(&["delete-generic-password"]));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_argv_shape_rejects_extra_positional_when_extras_deny() {
+        let shape = shape(
+            "find-generic-password",
+            &[("-a", req("kipz"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "extra-positional", "-a", "kipz"]),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_argv_shape_boolean_flag_must_not_consume_next_arg() {
+        // -w is boolean; the "kipz" that follows is the value of -a, not -w.
+        let shape = shape(
+            "find-generic-password",
+            &[("-w", ResolvedFlagSpec::Boolean), ("-a", req("kipz"))],
+            ExtrasPolicy::Deny,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["find-generic-password", "-w", "-a", "kipz"]),
+        );
+        assert!(r.is_ok(), "-w must not consume -a; got: {:?}", r);
+    }
+
+    /// Boundary test for the documented `extras=Allow` "skip just this token"
+    /// semantic. argv is `["sub", "-x", "-a", "evil"]` with declared `-a $USER`.
+    /// The matcher walks left-to-right: `-x` is unknown — under extras=Allow it
+    /// is skipped (just this token, not the next). The next iter inspects `-a`,
+    /// which IS declared as Required("kipz"). Its value-arg is "evil" (≠ "kipz"),
+    /// so the match fails on the `-a` value mismatch — NOT because `-x` consumed
+    /// `-a`. This pins down the conservative "skip one token" semantic from
+    /// `argv_shape_matches`'s extras=Allow branch (see policy.rs comments). If
+    /// a future refactor changes that branch to also skip the value-arg of an
+    /// unknown flag, this test will start failing — which is the intended
+    /// signal for re-reviewing the security implications.
+    #[test]
+    fn test_argv_shape_extras_allow_skips_only_unknown_token_not_its_value() {
+        let shape = shape(
+            "sub",
+            &[("-a", req("kipz"))],
+            ExtrasPolicy::Allow,
+        );
+        let r = argv_shape_matches(
+            &shape,
+            &s(&["sub", "-x", "-a", "evil"]),
+        );
+        assert!(
+            r.is_err(),
+            "declared -a must consume 'evil' (the token after -a) and reject the value mismatch; got: {:?}",
+            r
+        );
+    }
+
     // --- Capture tests ---
 
     #[tokio::test]
     async fn test_capture_runs_real_binary_and_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Capture { script: None },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
         // Use a command that outputs something: `echo hello` → "hello"
         let cmd = ResolvedCommand {
@@ -1826,11 +2901,13 @@ mod tests {
     async fn test_capture_script_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Capture {
                 script: Some("echo my_secret_token".to_string()),
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let req = ShimRequest {
@@ -1860,6 +2937,141 @@ mod tests {
         assert_eq!(resolved.as_str(), "my_secret_token");
     }
 
+    /// End-to-end check that nonces issued by a `Capture` rule with
+    /// `nonce_scope = ["gh"]` only promote into in-scope consumers.
+    ///
+    /// Flow:
+    /// 1. A "ddtool auth github token" rule captures stdout into a scoped
+    ///    nonce (consumers = ["gh"]).
+    /// 2. The agent passes the nonce as `GITHUB_TOKEN` when invoking
+    ///    `kubectl` (NOT in scope). The promotion path must NOT resolve
+    ///    the nonce; the env var is dropped silently.
+    /// 3. The agent invokes `gh` with `GITHUB_TOKEN=<nonce>`. The
+    ///    promotion path resolves it; gh's env contains the real value.
+    ///
+    /// This test relies on `/usr/bin/env` being a real binary that prints
+    /// its environment to stdout when invoked with no arguments — the
+    /// passthrough exec path in `apply` then surfaces that stdout via the
+    /// streaming socketpair harness used by `apply_capture`.
+    #[tokio::test]
+    async fn test_apply_scoped_nonce_only_promotes_for_listed_consumer() {
+        // Step 1: capture rule with scope=["gh"]. Use a "ddtool" command
+        // configured to pretend to be a credential issuer.
+        let issuer = ResolvedCommand {
+            name: "ddtool".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+            intercepts: vec![ResolvedIntercept {
+                args_prefix: vec!["auth".to_string(), "github".to_string(), "token".to_string()],
+                argv_shape: None,
+                action: ResolvedAction::Capture {
+                    script: Some("echo ghp_real".to_string()),
+                },
+                exit_code: 0,
+                admin: false,
+                nonce_scope: Some(vec!["gh".to_string()]),
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        // Step 2: a "consumer" command that just prints its env.
+        let gh = ResolvedCommand {
+            name: "gh".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+        let kubectl = ResolvedCommand {
+            name: "kubectl".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let broker = make_broker();
+
+        // Issue: invoke ddtool auth github token; receive a nonce.
+        let issue_req = ShimRequest {
+            command: "ddtool".to_string(),
+            args: vec!["auth".to_string(), "github".to_string(), "token".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (issue_resp, action) = apply_capture(
+            issue_req,
+            &[issuer.clone(), gh.clone(), kubectl.clone()],
+            Arc::clone(&broker),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_eq!(action, "capture");
+        let nonce = issue_resp.stdout.trim().to_string();
+        assert!(nonce.starts_with("nono_"), "got: {}", nonce);
+
+        // Promote into kubectl (NOT in scope). Pass GITHUB_TOKEN=<nonce>
+        // in the request env. The build_exec_env path should drop it.
+        let mut env_kc = std::collections::HashMap::new();
+        env_kc.insert("GITHUB_TOKEN".to_string(), nonce.clone());
+        let kc_req = ShimRequest {
+            command: "kubectl".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env: env_kc,
+            pid: 0,
+            ..Default::default()
+        };
+        let (kc_resp, _) = apply_capture(
+            kc_req,
+            &[issuer.clone(), gh.clone(), kubectl.clone()],
+            Arc::clone(&broker),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_eq!(kc_resp.exit_code, 0);
+        // env was printed by /usr/bin/env to stdout. GITHUB_TOKEN must
+        // either be absent or NOT equal to the real value.
+        let kc_lines: Vec<&str> = kc_resp.stdout.lines().collect();
+        let kc_gh_token = kc_lines
+            .iter()
+            .find(|l| l.starts_with("GITHUB_TOKEN="))
+            .map(|l| l.trim_start_matches("GITHUB_TOKEN="));
+        assert!(
+            kc_gh_token != Some("ghp_real"),
+            "scope mismatch: nonce must NOT promote into kubectl, got: {:?}",
+            kc_gh_token
+        );
+
+        // Promote into gh (IN scope). Real value must appear.
+        let mut env_gh = std::collections::HashMap::new();
+        env_gh.insert("GITHUB_TOKEN".to_string(), nonce.clone());
+        let gh_req = ShimRequest {
+            command: "gh".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env: env_gh,
+            pid: 0,
+            ..Default::default()
+        };
+        let (gh_resp, _) = apply_capture(
+            gh_req,
+            &[issuer, gh, kubectl],
+            Arc::clone(&broker),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_eq!(gh_resp.exit_code, 0);
+        assert!(
+            gh_resp.stdout.contains("GITHUB_TOKEN=ghp_real"),
+            "in-scope consumer must see real value, got: {}",
+            gh_resp.stdout
+        );
+    }
+
     // --- Env filtering tests ---
 
     #[test]
@@ -1876,7 +3088,7 @@ mod tests {
             "context_value".to_string(),
         );
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
 
         // Dangerous vars must not be injected from sandbox.
         assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil"));
@@ -1896,10 +3108,65 @@ mod tests {
         let mut sandbox_env = HashMap::new();
         sandbox_env.insert("GH_TOKEN".to_string(), nonce.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
         assert_eq!(
             env.get("GH_TOKEN").map(|s| s.as_str()),
             Some("real_credential")
+        );
+    }
+
+    /// A scoped nonce must NOT promote into an out-of-scope consumer.
+    /// `build_exec_env` resolves via `broker.resolve_for(value, consumer)`;
+    /// when the nonce's `consumers` list does not include `consumer`, the
+    /// var is silently dropped (no insert, no probing leak). The audit
+    /// path emits a `tracing::warn!` event for diagnostics — verifying
+    /// that emit is currently a follow-up since the env-only assertion
+    /// already covers the security-critical behaviour.
+    #[test]
+    fn test_build_exec_env_drops_scoped_nonce_for_out_of_scope_consumer() {
+        let broker = make_broker();
+        // Issue a nonce scoped to "gh" only.
+        let nonce = broker.issue_with_scope(
+            Zeroizing::new("real_credential".to_string()),
+            Some(vec!["gh".to_string()]),
+        );
+
+        let mut sandbox_env = HashMap::new();
+        sandbox_env.insert("GH_TOKEN".to_string(), nonce.clone());
+
+        // Consumer "kubectl" is NOT in the scope — the env var must be
+        // dropped. It must contain neither the real value nor the nonce.
+        let env = build_exec_env(&sandbox_env, &broker, "kubectl");
+        let actual = env.get("GH_TOKEN").map(|s| s.as_str());
+        assert_ne!(
+            actual,
+            Some("real_credential"),
+            "scoped nonce must NOT promote for out-of-scope consumer",
+        );
+        assert_ne!(
+            actual,
+            Some(nonce.as_str()),
+            "scoped nonce value must not leak through unresolved either",
+        );
+    }
+
+    /// Companion to the scope-mismatch drop test: an in-scope consumer
+    /// resolves the same nonce as expected.
+    #[test]
+    fn test_build_exec_env_promotes_scoped_nonce_for_in_scope_consumer() {
+        let broker = make_broker();
+        let nonce = broker.issue_with_scope(
+            Zeroizing::new("real_credential".to_string()),
+            Some(vec!["gh".to_string(), "git".to_string()]),
+        );
+
+        let mut sandbox_env = HashMap::new();
+        sandbox_env.insert("GH_TOKEN".to_string(), nonce);
+
+        let env = build_exec_env(&sandbox_env, &broker, "gh");
+        assert_eq!(
+            env.get("GH_TOKEN").map(|s| s.as_str()),
+            Some("real_credential"),
         );
     }
 
@@ -1912,7 +3179,7 @@ mod tests {
         sandbox_env.insert("PATH".to_string(), nonce.clone());
         sandbox_env.insert("LD_PRELOAD".to_string(), nonce.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
         // PATH from sandbox must not be the injected value (parent PATH is used instead)
         assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil/path"));
         // LD_PRELOAD should not have been injected
@@ -1932,11 +3199,55 @@ mod tests {
             "nono_0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         );
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
         // Unknown nonce: var should not be set to any nonce value
         assert_ne!(
             env.get("MY_TOKEN").map(|s| s.as_str()),
             Some("nono_0000000000000000000000000000000000000000000000000000000000000000")
+        );
+    }
+
+    /// An agent must not be able to smuggle NONO_GATE_* test-knobs into a
+    /// mediated child via `sandbox_env`. NONO_GATE_FORCE_DENY (and any other
+    /// NONO_GATE_* var) forces the approval gate into a known verdict; a
+    /// sandboxed agent that could set it would bypass the gate.
+    #[test]
+    fn test_build_exec_env_strips_nono_gate_prefix_from_sandbox_env() {
+        let broker = make_broker();
+        let mut sandbox_env = HashMap::new();
+        sandbox_env.insert(
+            "NONO_GATE_FORCE_DENY".to_string(),
+            "from-agent-sandbox".to_string(),
+        );
+        sandbox_env.insert(
+            "NONO_GATE_FUTURE_KNOB".to_string(),
+            "from-agent-sandbox".to_string(),
+        );
+        // Sanity: a non-NONO_GATE_* var with a similar shape still flows.
+        sandbox_env.insert(
+            "NONO_TEST_PASSTHROUGH_98765".to_string(),
+            "preserved".to_string(),
+        );
+
+        let env = build_exec_env(&sandbox_env, &broker, "testcmd");
+
+        // The sandbox-supplied NONO_GATE_* values must never overwrite/inject.
+        assert_ne!(
+            env.get("NONO_GATE_FORCE_DENY").map(|s| s.as_str()),
+            Some("from-agent-sandbox"),
+            "NONO_GATE_FORCE_DENY from agent sandbox env must be stripped"
+        );
+        assert_ne!(
+            env.get("NONO_GATE_FUTURE_KNOB").map(|s| s.as_str()),
+            Some("from-agent-sandbox"),
+            "NONO_GATE_* prefix-strip must cover future test knobs without code change"
+        );
+        // Unrelated vars still flow through (the strip is an exact prefix, not
+        // wholesale "NONO_*" — nono itself sets NONO_SESSION_TOKEN etc. for
+        // sandboxed children).
+        assert_eq!(
+            env.get("NONO_TEST_PASSTHROUGH_98765").map(|s| s.as_str()),
+            Some("preserved")
         );
     }
 
@@ -2263,9 +3574,11 @@ mod tests {
             real_path: PathBuf::from("/usr/bin/env"),
             intercepts: vec![ResolvedIntercept {
                 args_prefix: vec![],
+                argv_shape: None,
                 action: ResolvedAction::Approve { script: None },
                 exit_code: 0,
                 admin: false,
+                nonce_scope: None,
             }],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2553,6 +3866,7 @@ mod tests {
                 workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
+            make_allowlist(),
             OwnedFd::from(child_in),
             OwnedFd::from(child_out),
             OwnedFd::from(child_err),
@@ -2593,11 +3907,13 @@ mod tests {
 
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            argv_shape: None,
             action: ResolvedAction::Respond {
                 stdout: "buffered_response\n".to_string(),
             },
             exit_code: 0,
             admin: false,
+            nonce_scope: None,
         }]);
 
         let (child_in, _test_in) = UnixStream::pair().expect("pair stdin");
@@ -2622,6 +3938,7 @@ mod tests {
                 workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
+            make_allowlist(),
             OwnedFd::from(child_in),
             OwnedFd::from(child_out),
             OwnedFd::from(child_err),
@@ -2695,6 +4012,7 @@ mod tests {
                 workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
+            make_allowlist(),
             OwnedFd::from(child_in),
             OwnedFd::from(child_out),
             OwnedFd::from(child_err),
@@ -2712,5 +4030,602 @@ mod tests {
             caller_cwd,
             "pwd should print the caller's cwd from ShimRequest.cwd"
         );
+    }
+
+    // --- parent_sandbox override (plan 4.1) ---
+
+    /// When the resolved parent has a `parent_sandbox` entry, the keyed
+    /// CommandSandbox replaces the default for the passthrough exec.
+    /// Verified via the network policy: parent="gh" → block:true → no
+    /// HTTPS_PROXY injected, even though the default sandbox would have
+    /// allowed `github.com` via the proxy.
+    #[tokio::test]
+    async fn test_apply_uses_parent_sandbox_when_caller_matches() {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+
+        let mut parent_sandbox = std::collections::HashMap::new();
+        parent_sandbox.insert(
+            "gh".to_string(),
+            CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+            },
+        );
+
+        let default_sb = CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec!["github.com".to_string()],
+            },
+            fs_read: vec![],
+            fs_read_file: vec![],
+            fs_write: vec![],
+            fs_write_file: vec![],
+            allow_commands: vec![],
+            keychain_access: false,
+        };
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sb),
+            caller_policy: CallerPolicy {
+                agent_allowed: true,
+                allowed_parents: None,
+                parent_sandbox,
+                deny_agent_strict: false,
+            },
+        };
+
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("gh".to_string()));
+        let mut env = std::collections::HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+            ..Default::default()
+        };
+
+        let (resp, action) =
+            apply_capture(req, &[cmd], Arc::clone(&broker), &ctx(), always_allow()).await;
+        assert_eq!(action, "passthrough");
+        assert!(
+            !resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "parent_sandbox should have applied network.block, but HTTPS_PROXY was injected: {}",
+            resp.stdout
+        );
+    }
+
+    /// When the parent name is not present in `parent_sandbox`, the default
+    /// sandbox is used. Caller is "git", parent_sandbox only has "gh", so the
+    /// default sandbox (allowed_hosts) wins → HTTPS_PROXY is injected.
+    #[tokio::test]
+    async fn test_apply_uses_default_sandbox_when_no_parent_sandbox_match() {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+
+        let mut parent_sandbox = std::collections::HashMap::new();
+        parent_sandbox.insert(
+            "gh".to_string(),
+            CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+            },
+        );
+
+        let default_sb = CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec!["github.com".to_string()],
+            },
+            fs_read: vec![],
+            fs_read_file: vec![],
+            fs_write: vec![],
+            fs_write_file: vec![],
+            allow_commands: vec![],
+            keychain_access: false,
+        };
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sb),
+            caller_policy: CallerPolicy {
+                agent_allowed: true,
+                allowed_parents: None,
+                parent_sandbox,
+                deny_agent_strict: false,
+            },
+        };
+
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("git".to_string()));
+        let mut env = std::collections::HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+            ..Default::default()
+        };
+
+        let (resp, _) =
+            apply_capture(req, &[cmd], Arc::clone(&broker), &ctx(), always_allow()).await;
+        assert!(
+            resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "should have used default sandbox (network.allowed_hosts) for parent not in map, got: {}",
+            resp.stdout
+        );
+    }
+
+    /// When the caller is the agent (no NONO_SANDBOX_CONTEXT), the default
+    /// sandbox is used regardless of `parent_sandbox` contents.
+    #[tokio::test]
+    async fn test_apply_uses_default_sandbox_for_agent_caller() {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+
+        let mut parent_sandbox = std::collections::HashMap::new();
+        parent_sandbox.insert(
+            "gh".to_string(),
+            CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+            },
+        );
+
+        let default_sb = CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec!["github.com".to_string()],
+            },
+            fs_read: vec![],
+            fs_read_file: vec![],
+            fs_write: vec![],
+            fs_write_file: vec![],
+            allow_commands: vec![],
+            keychain_access: false,
+        };
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sb),
+            caller_policy: CallerPolicy {
+                agent_allowed: true,
+                allowed_parents: None,
+                parent_sandbox,
+                deny_agent_strict: false,
+            },
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+            ..Default::default()
+        };
+
+        let broker = make_broker();
+        let (resp, _) =
+            apply_capture(req, &[cmd], Arc::clone(&broker), &ctx(), always_allow()).await;
+        assert!(
+            resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "agent caller should use default sandbox, expected HTTPS_PROXY, got: {}",
+            resp.stdout
+        );
+    }
+
+    // --- caller-policy gate prompt-on-deny (plan 4.1 task 3.5) ---
+
+    use crate::mediation::allowlist::{AllowlistKey, AllowlistKind, AllowlistStore};
+    use crate::mediation::approval::ApprovalVerdict;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Test double for the caller-policy gate dispatch tests.
+    ///
+    /// Records a fixed `ApprovalVerdict` and counts how many times
+    /// `approve_with_save_option` is invoked. Cloneable via the inner `Arc`,
+    /// so a test can hand a clone to `apply` and still observe the call
+    /// counter afterwards.
+    #[derive(Clone)]
+    struct MockApprovalGate {
+        verdict: ApprovalVerdict,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockApprovalGate {
+        fn deny() -> Arc<Self> {
+            Arc::new(Self {
+                verdict: ApprovalVerdict::Deny,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+        fn allow_once() -> Arc<Self> {
+            Arc::new(Self {
+                verdict: ApprovalVerdict::AllowOnce,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+        fn allow_always() -> Arc<Self> {
+            Arc::new(Self {
+                verdict: ApprovalVerdict::AllowAlways,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ApprovalGate for MockApprovalGate {
+        fn approve(&self, _command: &str, _args: &[String]) -> bool {
+            // Fallback used by callers that haven't migrated to the 3-way
+            // form. The caller-policy gate uses approve_with_save_option, so
+            // this branch is unused in these tests.
+            !matches!(self.verdict, ApprovalVerdict::Deny)
+        }
+        fn approve_with_save_option(
+            &self,
+            _command: &str,
+            _args: &[String],
+            _reason: &str,
+        ) -> ApprovalVerdict {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.verdict
+        }
+    }
+
+    /// Thin newtype around a tempdir-backed `AllowlistStore` for tests that
+    /// need to share the allowlist across multiple `apply` invocations and
+    /// poke at its state directly.
+    #[derive(Clone)]
+    struct TestAllowlistStore {
+        inner: Arc<AllowlistStore>,
+    }
+
+    impl TestAllowlistStore {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("argv-allowlist.json");
+            std::mem::forget(dir);
+            Self {
+                inner: Arc::new(
+                    AllowlistStore::open_at(path).expect("open allowlist"),
+                ),
+            }
+        }
+        fn is_approved(&self, key: &AllowlistKey) -> bool {
+            self.inner.is_approved(key)
+        }
+    }
+
+    impl From<TestAllowlistStore> for Arc<AllowlistStore> {
+        fn from(t: TestAllowlistStore) -> Self {
+            t.inner
+        }
+    }
+
+    /// Default `CommandSandbox` for caller-policy gate tests. Inert (no
+    /// network, no fs allowances) — the gate decision is what's under test,
+    /// not sandbox enforcement.
+    fn default_sandbox() -> super::super::CommandSandbox {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+        CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec![],
+            },
+            fs_read: vec![],
+            fs_read_file: vec![],
+            fs_write: vec![],
+            fs_write_file: vec![],
+            allow_commands: vec![],
+            keychain_access: false,
+        }
+    }
+
+    /// (a) agent_allowed:false + deny_agent_strict:true → exit 126,
+    /// gate not consulted at all.
+    #[tokio::test]
+    async fn caller_policy_gate_strict_hard_denies_without_consulting_gate() {
+        let cmd = ResolvedCommand {
+            name: "ssh".to_string(),
+            real_path: PathBuf::from("/usr/bin/ssh"),
+            intercepts: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: Some(vec!["git".to_string()]),
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: true,
+            },
+        };
+        let req = ShimRequest {
+            command: "ssh".to_string(),
+            args: vec!["example.com".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+            ..Default::default()
+        };
+        let gate = MockApprovalGate::deny(); // would deny if asked, but must not be asked
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+        )
+        .await;
+        assert_eq!(resp.exit_code, 126);
+        assert_eq!(gate.call_count(), 0, "strict path must not consult gate");
+    }
+
+    /// (b) agent_allowed:false + deny_agent_strict:false + gate denies → exit 126.
+    #[tokio::test]
+    async fn caller_policy_gate_consults_gate_then_denies() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/git"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: Some(vec!["gh".to_string()]),
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        let req = ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(), // agent
+            pid: 0,
+            ..Default::default()
+        };
+        let gate = MockApprovalGate::deny();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (resp, _) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+        )
+        .await;
+        assert_eq!(resp.exit_code, 126);
+        assert_eq!(gate.call_count(), 1);
+    }
+
+    /// (c) gate returns AllowOnce → request proceeds (passthrough), no
+    /// allowlist entry persisted.
+    #[tokio::test]
+    async fn caller_policy_gate_allow_once_proceeds_without_persisting() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: None,
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        let req = ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+            ..Default::default()
+        };
+        let gate = MockApprovalGate::allow_once();
+        let allowlist = TestAllowlistStore::new();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (_resp, action) = apply_capture_with_allowlist(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(action, "passthrough");
+        let key = AllowlistKey {
+            kind: AllowlistKind::CallerPolicy,
+            payload: serde_json::json!({
+                "cmd": "git", "parent": "agent", "argv": ["status"],
+            }),
+        };
+        assert!(!allowlist.is_approved(&key), "AllowOnce must not persist");
+    }
+
+    /// (d) gate returns AllowAlways → request proceeds AND key persists.
+    #[tokio::test]
+    async fn caller_policy_gate_allow_always_persists_key() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: None,
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        let req = ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+            ..Default::default()
+        };
+        let gate = MockApprovalGate::allow_always();
+        let allowlist = TestAllowlistStore::new();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (_resp, action) = apply_capture_with_allowlist(
+            req,
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(action, "passthrough");
+        let key = AllowlistKey {
+            kind: AllowlistKind::CallerPolicy,
+            payload: serde_json::json!({
+                "cmd": "git", "parent": "agent", "argv": ["status"],
+            }),
+        };
+        assert!(allowlist.is_approved(&key), "AllowAlways must persist key");
+    }
+
+    /// (e) Second invocation with the same key auto-bypasses the gate.
+    #[tokio::test]
+    async fn caller_policy_gate_skipped_when_allowlist_has_key() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: false,
+                allowed_parents: None,
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        let req = || ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env: std::collections::HashMap::new(),
+            pid: 0,
+            ..Default::default()
+        };
+        let gate = MockApprovalGate::allow_always();
+        let allowlist = TestAllowlistStore::new();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        // First call records the key.
+        let _ = apply_capture_with_allowlist(
+            req(),
+            std::slice::from_ref(&cmd),
+            make_broker(),
+            &ctx(),
+            gate_for_apply,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(gate.call_count(), 1);
+        // Second call: the gate must NOT be consulted (allowlist hit).
+        let gate_for_apply2: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let (_resp, action) = apply_capture_with_allowlist(
+            req(),
+            &[cmd],
+            make_broker(),
+            &ctx(),
+            gate_for_apply2,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(action, "passthrough");
+        assert_eq!(gate.call_count(), 1, "second call must not re-consult gate");
+    }
+
+    /// (f) allowed_parents mismatch: parent not in allowed_parents → gate
+    /// consulted; AllowAlways stores key under the actual parent name.
+    #[tokio::test]
+    async fn caller_policy_gate_handles_allowed_parents_mismatch() {
+        let cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(default_sandbox()),
+            caller_policy: CallerPolicy {
+                agent_allowed: true,
+                allowed_parents: Some(vec!["gh".to_string()]),
+                parent_sandbox: std::collections::HashMap::new(),
+                deny_agent_strict: false,
+            },
+        };
+        // Caller is "kubectl" — not in allowed_parents.
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("kubectl".to_string()));
+        let mut env = std::collections::HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+        let req = ShimRequest {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+            session_token: String::new(),
+            env,
+            pid: 0,
+            ..Default::default()
+        };
+        let gate = MockApprovalGate::allow_always();
+        let allowlist = TestAllowlistStore::new();
+        let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
+        let _ = apply_capture_with_allowlist(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &ctx(),
+            gate_for_apply,
+            allowlist.clone().into(),
+        )
+        .await;
+        assert_eq!(gate.call_count(), 1);
+        let key = AllowlistKey {
+            kind: AllowlistKind::CallerPolicy,
+            payload: serde_json::json!({
+                "cmd": "git", "parent": "kubectl", "argv": ["status"],
+            }),
+        };
+        assert!(allowlist.is_approved(&key));
     }
 }
