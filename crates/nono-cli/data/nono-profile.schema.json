@@ -606,9 +606,15 @@
     },
     "HooksConfig": {
       "type": "object",
-      "description": "Hook configurations for target applications. Keys are application names (e.g., \"claude-code\"), values define the hook to install.",
+      "description": "Hook configurations for target applications. Keys are application names (e.g., \"claude-code\"); values are either a single HookConfig (back-compat single-hook form) or an array of HookConfig entries (used when one target needs multiple hooks — e.g. a context script plus a trajectory-spec emitter).",
       "additionalProperties": {
-        "$ref": "#/$defs/HookConfig"
+        "oneOf": [
+          { "$ref": "#/$defs/HookConfig" },
+          {
+            "type": "array",
+            "items": { "$ref": "#/$defs/HookConfig" }
+          }
+        ]
       }
     },
     "HookConfig": {

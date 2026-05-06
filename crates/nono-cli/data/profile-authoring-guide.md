@@ -194,7 +194,9 @@ Inheritance: child `allow_vars` are appended to base values and deduplicated.
 
 ### hooks
 
-Map of application name to hook configuration:
+Map of application name to one or more hook configurations.
+
+Single-hook form (back-compat shorthand for one hook on a target):
 
 ```json
 {
@@ -208,19 +210,28 @@ Map of application name to hook configuration:
 }
 ```
 
-Multi-event hooks register the same script with the same matcher on every listed event:
+Multi-hook form (use when one target needs more than one script — e.g. one for failure context, another for trajectory-spec emission). Each entry's `events` may also be an array to register the same script/matcher on multiple events:
 
 ```json
 {
   "hooks": {
-    "claude-code": {
-      "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"],
-      "matcher": "*",
-      "script": "nono-trajectory.sh"
-    }
+    "claude-code": [
+      {
+        "events": "PostToolUseFailure",
+        "matcher": "Read|Write|Edit|Bash",
+        "script": "shadowfax-hook.sh"
+      },
+      {
+        "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"],
+        "matcher": "*",
+        "script": "nono-trajectory.sh"
+      }
+    ]
   }
 }
 ```
+
+Inheritance: when a child profile declares `hooks.<target>`, it replaces the base profile's entry for that target. To keep base hooks alongside child-specific ones, restate the base entries in the child's array.
 
 | Field     | Type             | Description |
 |-----------|------------------|-------------|

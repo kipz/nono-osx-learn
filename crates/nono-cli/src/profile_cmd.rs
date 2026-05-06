@@ -1115,15 +1115,18 @@ fn profile_to_json(
             .hooks
             .hooks
             .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    serde_json::json!({
-                        "events": v.events,
-                        "matcher": v.matcher,
-                        "script": v.script,
-                    }),
-                )
+            .map(|(target, list)| {
+                let entries: Vec<serde_json::Value> = list
+                    .iter()
+                    .map(|v| {
+                        serde_json::json!({
+                            "events": v.events,
+                            "matcher": v.matcher,
+                            "script": v.script,
+                        })
+                    })
+                    .collect();
+                (target.clone(), serde_json::Value::Array(entries))
             })
             .collect();
         val["hooks"] = serde_json::Value::Object(hooks);
@@ -1568,13 +1571,18 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     let h2: BTreeSet<&String> = p2.hooks.hooks.keys().collect();
     let hooks_added: BTreeSet<&&String> = h2.difference(&h1).collect();
     let hooks_removed: BTreeSet<&&String> = h1.difference(&h2).collect();
-    // Check for hooks present in both but with different config
+    // Check for hooks present in both but with different config. Two
+    // hook lists for the same target compare equal only when they are
+    // the same length AND every entry matches at the same index.
     let hooks_changed: Vec<&String> = h1
         .intersection(&h2)
         .filter(|k| {
             let a = &p1.hooks.hooks[**k];
             let b = &p2.hooks.hooks[**k];
-            a.events != b.events || a.matcher != b.matcher || a.script != b.script
+            a.len() != b.len()
+                || a.iter().zip(b.iter()).any(|(x, y)| {
+                    x.events != y.events || x.matcher != y.matcher || x.script != y.script
+                })
         })
         .copied()
         .collect();
@@ -1919,45 +1927,43 @@ fn diff_fs_json(
 }
 
 fn diff_hooks_json(
-    h1: &std::collections::HashMap<String, profile::HookConfig>,
-    h2: &std::collections::HashMap<String, profile::HookConfig>,
+    h1: &std::collections::HashMap<String, Vec<profile::HookConfig>>,
+    h2: &std::collections::HashMap<String, Vec<profile::HookConfig>>,
 ) -> serde_json::Value {
+    let hook_to_json = |h: &profile::HookConfig| {
+        serde_json::json!({
+            "events": h.events,
+            "matcher": h.matcher,
+            "script": h.script,
+        })
+    };
+
     let added: Vec<&String> = h2.keys().filter(|k| !h1.contains_key(*k)).collect();
     let removed: Vec<&String> = h1.keys().filter(|k| !h2.contains_key(*k)).collect();
+    // Two hook lists are "changed" when they differ in length or any entry
+    // at the same index differs. Reordering counts as a change because the
+    // installer applies entries in declared order.
     let changed: Vec<&String> = h1
         .keys()
         .filter(|k| {
-            h2.get(*k).is_some_and(|v2| {
-                let v1 = &h1[*k];
-                v1.events != v2.events || v1.matcher != v2.matcher || v1.script != v2.script
+            h2.get(*k).is_some_and(|list2| {
+                let list1 = &h1[*k];
+                list1.len() != list2.len()
+                    || list1.iter().zip(list2.iter()).any(|(a, b)| {
+                        a.events != b.events || a.matcher != b.matcher || a.script != b.script
+                    })
             })
         })
         .collect();
 
     let mut changed_details = serde_json::Map::new();
     for k in &changed {
-        let old = &h1[*k];
-        let new = &h2[*k];
-        let mut detail = serde_json::Map::new();
-        if old.events != new.events {
-            detail.insert(
-                "events".into(),
-                serde_json::json!({"profile1": old.events, "profile2": new.events}),
-            );
-        }
-        if old.matcher != new.matcher {
-            detail.insert(
-                "matcher".into(),
-                serde_json::json!({"profile1": old.matcher, "profile2": new.matcher}),
-            );
-        }
-        if old.script != new.script {
-            detail.insert(
-                "script".into(),
-                serde_json::json!({"profile1": old.script, "profile2": new.script}),
-            );
-        }
-        changed_details.insert((*k).clone(), serde_json::Value::Object(detail));
+        let old: Vec<serde_json::Value> = h1[*k].iter().map(hook_to_json).collect();
+        let new: Vec<serde_json::Value> = h2[*k].iter().map(hook_to_json).collect();
+        changed_details.insert(
+            (*k).clone(),
+            serde_json::json!({"profile1": old, "profile2": new}),
+        );
     }
 
     serde_json::json!({

@@ -988,13 +988,53 @@ where
 
 /// Hooks configuration in a profile
 ///
-/// Maps target application names to their hook configurations.
-/// Example: [hooks.claude-code] for Claude Code hooks
+/// Maps target application names to a list of hook configurations.
+/// Example: [hooks.claude-code] for Claude Code hooks. A target may have
+/// multiple hooks — e.g. one script for `PostToolUseFailure` context and
+/// a separate script for trajectory-spec event emission.
+///
+/// Each map value accepts either a single object (back-compat with the
+/// pre-multi-hook schema) or an array of `HookConfig`s. Both deserialize
+/// to `Vec<HookConfig>`; the single-object form normalizes to a one-element
+/// vec on the way in.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HooksConfig {
-    /// Map of target application -> hook configuration
-    #[serde(flatten)]
-    pub hooks: HashMap<String, HookConfig>,
+    /// Map of target application -> hooks for that target.
+    #[serde(flatten, deserialize_with = "deserialize_hooks_map")]
+    pub hooks: HashMap<String, Vec<HookConfig>>,
+}
+
+/// Accept either a single `HookConfig` object or an array of them on the
+/// value side of the hooks map. The single-object form preserves
+/// backwards compatibility with profiles written before multi-hook-per-target
+/// support; both forms produce a `Vec<HookConfig>` so callers iterate
+/// uniformly.
+fn deserialize_hooks_map<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, Vec<HookConfig>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(HookConfig),
+        Many(Vec<HookConfig>),
+    }
+
+    let raw: HashMap<String, OneOrMany> = HashMap::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k,
+                match v {
+                    OneOrMany::One(h) => vec![h],
+                    OneOrMany::Many(v) => v,
+                },
+            )
+        })
+        .collect())
 }
 
 /// Working directory access level for profiles
@@ -4012,55 +4052,58 @@ mod tests {
         let mut base = base_profile();
         base.hooks.hooks.insert(
             "claude-code".to_string(),
-            HookConfig {
+            vec![HookConfig {
                 events: vec!["PostToolUseFailure".to_string()],
                 matcher: "Bash".to_string(),
                 script: "base-hook.sh".to_string(),
-            },
+            }],
         );
 
         let mut child = child_profile();
         child.hooks.hooks.insert(
             "opencode".to_string(),
-            HookConfig {
+            vec![HookConfig {
                 events: vec!["PreToolUse".to_string()],
                 matcher: "Write".to_string(),
                 script: "child-hook.sh".to_string(),
-            },
+            }],
         );
 
         let merged = merge_profiles(base, child);
         assert!(merged.hooks.hooks.contains_key("claude-code"));
         assert!(merged.hooks.hooks.contains_key("opencode"));
 
-        // Same-key collision: child wins
+        // Same-key collision: child wins (replaces the base list entirely
+        // for that target — callers wanting both base and child hooks must
+        // restate the base entries in the child's list).
         let mut base2 = base_profile();
         base2.hooks.hooks.insert(
             "claude-code".to_string(),
-            HookConfig {
+            vec![HookConfig {
                 events: vec!["PostToolUseFailure".to_string()],
                 matcher: "Bash".to_string(),
                 script: "base-hook.sh".to_string(),
-            },
+            }],
         );
 
         let mut child2 = child_profile();
         child2.hooks.hooks.insert(
             "claude-code".to_string(),
-            HookConfig {
+            vec![HookConfig {
                 events: vec!["PreToolUse".to_string()],
                 matcher: "Read".to_string(),
                 script: "child-hook.sh".to_string(),
-            },
+            }],
         );
 
         let merged2 = merge_profiles(base2, child2);
-        let hook = &merged2.hooks.hooks["claude-code"];
+        let hooks = &merged2.hooks.hooks["claude-code"];
+        assert_eq!(hooks.len(), 1);
         assert_eq!(
-            hook.script, "child-hook.sh",
+            hooks[0].script, "child-hook.sh",
             "child should win on collision"
         );
-        assert_eq!(hook.events, vec!["PreToolUse".to_string()]);
+        assert_eq!(hooks[0].events, vec!["PreToolUse".to_string()]);
     }
 
     #[test]
@@ -4089,6 +4132,43 @@ mod tests {
         assert!(
             legacy.is_err(),
             "legacy `event` field must be rejected by deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn test_hooks_config_accepts_object_or_array() {
+        // Single-object form (back-compat with the pre-multi-hook schema).
+        let single: HooksConfig = serde_json::from_str(
+            r#"{"claude-code": {"events": "PostToolUseFailure", "matcher": "Bash", "script": "x.sh"}}"#,
+        )
+        .expect("single-object hook should deserialize");
+        assert_eq!(single.hooks["claude-code"].len(), 1);
+        assert_eq!(
+            single.hooks["claude-code"][0].events,
+            vec!["PostToolUseFailure".to_string()]
+        );
+
+        // Array form (the new shape — used when one target needs multiple hooks).
+        let multi: HooksConfig = serde_json::from_str(
+            r#"{
+                "claude-code": [
+                    {"events": "PostToolUseFailure", "matcher": "Bash", "script": "ctx.sh"},
+                    {"events": "SessionStart", "matcher": "*", "script": "trajectory.sh"}
+                ]
+            }"#,
+        )
+        .expect("array hooks should deserialize");
+        assert_eq!(multi.hooks["claude-code"].len(), 2);
+        assert_eq!(multi.hooks["claude-code"][0].script, "ctx.sh");
+        assert_eq!(multi.hooks["claude-code"][1].script, "trajectory.sh");
+
+        // Unknown fields inside a HookConfig still rejected.
+        let bad = serde_json::from_str::<HooksConfig>(
+            r#"{"claude-code": {"events": "PreToolUse", "matcher": "*", "script": "x.sh", "wat": 1}}"#,
+        );
+        assert!(
+            bad.is_err(),
+            "unknown fields in HookConfig must be rejected"
         );
     }
 
