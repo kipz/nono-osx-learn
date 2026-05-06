@@ -15,6 +15,36 @@ use tracing::{error, info};
 
 const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Canonicalize the mediation deny set for the BPF-LSM filter and
+/// extract the per-session shim and audit-log directories.
+///
+/// Returns `(deny_set, shim_dir, audit_log_dir)`. All three are
+/// empty / `None` when mediation is inactive.
+#[cfg(target_os = "linux")]
+fn mediation_filter_state(
+    handle: Option<&crate::mediation::session::SessionHandle>,
+) -> (
+    Vec<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+) {
+    match handle {
+        Some(h) => {
+            let deny_set: Vec<std::path::PathBuf> = h
+                .blocked_binaries
+                .iter()
+                .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+                .collect();
+            // audit.jsonl lives in sessions_dir (~/.nono/sessions),
+            // matching where the shim's audit server writes its own
+            // events. Both shapes interleave in the same file.
+            let audit_log_dir = crate::session::sessions_dir().ok();
+            (deny_set, Some(h.shim_dir.clone()), audit_log_dir)
+        }
+        None => (Vec::new(), None, None),
+    }
+}
+
 fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
     caps: &CapabilitySet,
@@ -291,6 +321,19 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
 
+    // Compute BPF-LSM filter state: deny set from mediation handle, plus
+    // protected subtrees from the sandbox preparation.
+    #[cfg(target_os = "linux")]
+    let (mediation_deny_set, mediation_shim_dir, mut mediation_audit_log_dir) =
+        mediation_filter_state(mediation_handle.as_ref());
+    // BPF-LSM emits audit events for protected-subtree denies even when
+    // there's no exec mediation session. When the audit log dir wasn't
+    // supplied by the session handle, fall back to ~/.nono/sessions.
+    #[cfg(target_os = "linux")]
+    if mediation_audit_log_dir.is_none() && !flags.protected_paths.is_empty() {
+        mediation_audit_log_dir = crate::session::sessions_dir().ok();
+    }
+
     let mut env_vars: Vec<(&str, &str)> = loaded_secrets
         .iter()
         .map(|secret| (secret.env_var.as_str(), secret.value.as_str()))
@@ -433,6 +476,14 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 mediation_sandboxed_pid_latch: mediation_handle
                     .as_ref()
                     .map(|_| Arc::clone(&sandboxed_pid_latch)),
+                #[cfg(target_os = "linux")]
+                mediation_deny_set,
+                #[cfg(target_os = "linux")]
+                mediation_protected_paths: flags.protected_paths.clone(),
+                #[cfg(target_os = "linux")]
+                mediation_shim_dir,
+                #[cfg(target_os = "linux")]
+                mediation_audit_log_dir,
             })?;
 
             cleanup_capability_state_file(&cap_file_path);

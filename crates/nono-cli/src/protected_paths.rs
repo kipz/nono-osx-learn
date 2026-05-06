@@ -3,7 +3,7 @@
 //! These checks enforce a hard fail if initial sandbox capabilities overlap
 //! with internal CLI state roots (currently `~/.nono`).
 
-use nono::{try_canonicalize, CapabilitySet, NonoError, Result};
+use nono::{CapabilitySet, NonoError, Result};
 use std::path::{Path, PathBuf};
 
 /// Resolved internal state roots that must not be accessible by the sandboxed child.
@@ -20,7 +20,7 @@ impl ProtectedRoots {
     /// Today this protects the full `~/.nono` subtree.
     pub fn from_defaults() -> Result<Self> {
         let home = dirs::home_dir().ok_or(NonoError::HomeNotFound)?;
-        let state_root = try_canonicalize(&home.join(".nono"));
+        let state_root = resolve_path(&home.join(".nono"));
         Ok(Self {
             roots: vec![state_root],
         })
@@ -44,17 +44,12 @@ pub fn validate_caps_against_protected_roots(
     protected_roots: &[PathBuf],
     allow_parent_of_protected: bool,
 ) -> Result<()> {
-    // Pre-canonicalize once so the per-capability loop doesn't repeat the work.
-    let resolved_roots: Vec<PathBuf> = protected_roots
-        .iter()
-        .map(|p| try_canonicalize(p))
-        .collect();
     for cap in caps.fs_capabilities() {
         validate_requested_path_against_protected_roots(
             &cap.resolved,
             cap.is_file,
             &cap.source.to_string(),
-            &resolved_roots,
+            protected_roots,
             allow_parent_of_protected,
         )?;
     }
@@ -67,11 +62,13 @@ pub fn validate_caps_against_protected_roots(
 /// This catches protected-root overlaps even when requested paths don't exist
 /// yet and are later skipped during capability creation.
 ///
-/// On macOS, `parent_of_protected` is allowed because Seatbelt can express
-/// deny-within-allow via rule specificity. The caller must emit deny rules
-/// for the protected roots via [`emit_protected_root_deny_rules`].
-/// On Linux, `parent_of_protected` remains a hard error because Landlock
-/// is strictly allow-list and cannot express deny-within-allow.
+/// `parent_of_protected` is admitted on both platforms when
+/// `allow_parent_of_protected` is true. The OS sandbox layer enforces the
+/// subtree at runtime: Seatbelt deny rules emitted via
+/// [`emit_protected_root_deny_rules`] on macOS, BPF-LSM `protected_roots`
+/// hooks (populated from [`bpf_lsm_protected_roots_for_session`]) on Linux.
+/// Without the opt-in the grant is rejected so a profile cannot
+/// accidentally expose nono's state directory.
 pub fn validate_requested_path_against_protected_roots(
     path: &Path,
     is_file: bool,
@@ -79,12 +76,12 @@ pub fn validate_requested_path_against_protected_roots(
     protected_roots: &[PathBuf],
     allow_parent_of_protected: bool,
 ) -> Result<()> {
-    let requested_path = try_canonicalize(path);
+    let requested_path = resolve_path(path);
+    let resolved_roots: Vec<PathBuf> = protected_roots.iter().map(|p| resolve_path(p)).collect();
 
-    for protected_root in protected_roots {
-        let resolved_root = try_canonicalize(protected_root);
-        let inside_protected = requested_path.starts_with(&resolved_root);
-        let parent_of_protected = !is_file && resolved_root.starts_with(&requested_path);
+    for protected_root in &resolved_roots {
+        let inside_protected = requested_path.starts_with(protected_root);
+        let parent_of_protected = !is_file && protected_root.starts_with(&requested_path);
 
         // inside_protected is always a hard error on all platforms
         if inside_protected {
@@ -92,18 +89,22 @@ pub fn validate_requested_path_against_protected_roots(
                 "Refusing to grant '{}' (source: {}) because it overlaps protected nono state root '{}'.",
                 requested_path.display(),
                 source,
-                resolved_root.display(),
+                protected_root.display(),
             )));
         }
 
-        // parent_of_protected: on macOS with opt-in, Seatbelt deny rules protect the root;
-        // on Linux, Landlock cannot express deny-within-allow so we must reject.
-        if parent_of_protected && !(cfg!(target_os = "macos") && allow_parent_of_protected) {
+        // parent_of_protected: with the opt-in, both platforms admit the
+        // grant and rely on the OS sandbox layer to enforce the protected
+        // subtree at runtime — Seatbelt deny rules on macOS, BPF-LSM hooks
+        // on Linux (`protected_roots` map + dentry walker). Without the
+        // opt-in we still hard-reject so a profile cannot accidentally
+        // expose nono's state.
+        if parent_of_protected && !allow_parent_of_protected {
             return Err(NonoError::SandboxInit(format!(
                 "Refusing to grant '{}' (source: {}) because it overlaps protected nono state root '{}'.",
                 requested_path.display(),
                 source,
-                resolved_root.display(),
+                protected_root.display(),
             )));
         }
     }
@@ -113,34 +114,32 @@ pub fn validate_requested_path_against_protected_roots(
 
 /// Return the protected root overlapped by a requested path, if any.
 ///
-/// On macOS, only `inside_protected` is flagged because Seatbelt deny rules
-/// protect the root from parent grants. On Linux, both `inside_protected` and
-/// `parent_of_protected` are flagged.
+/// Only `inside_protected` is flagged on either platform, because by the
+/// time this runtime check runs the OS sandbox layer (Seatbelt deny rules
+/// on macOS, BPF-LSM `protected_roots` on Linux) is already enforcing the
+/// subtree. Parent grants are admitted at pre-flight by
+/// [`validate_requested_path_against_protected_roots`] only when the
+/// profile opted in via `allow_parent_of_protected`; if it did not, the
+/// pre-flight already rejected and we never get here.
 ///
 /// Unlike [`validate_requested_path_against_protected_roots`], this function
-/// does **not** take an `allow_parent_of_protected` flag. It is called by the
-/// supervisor at runtime, after Seatbelt deny rules have already been emitted,
-/// so the unconditional macOS relaxation is safe here. The pre-flight
-/// validation (which does respect the opt-in flag) has already rejected the
-/// grant if the profile did not opt in.
+/// does **not** take an `allow_parent_of_protected` flag — at runtime there
+/// is no parent-grant case to gate.
 #[must_use]
 pub fn overlapping_protected_root(
     path: &Path,
     is_file: bool,
     protected_roots: &[PathBuf],
 ) -> Option<PathBuf> {
-    let requested_path = try_canonicalize(path);
+    let requested_path = resolve_path(path);
+    let resolved_roots: Vec<PathBuf> = protected_roots.iter().map(|p| resolve_path(p)).collect();
 
-    for protected_root in protected_roots {
-        let resolved_root = try_canonicalize(protected_root);
-        let inside_protected = requested_path.starts_with(&resolved_root);
+    let _ = is_file; // is_file no longer informs the runtime decision.
+
+    for protected_root in &resolved_roots {
+        let inside_protected = requested_path.starts_with(protected_root);
         if inside_protected {
-            return Some(resolved_root);
-        }
-
-        let parent_of_protected = !is_file && resolved_root.starts_with(&requested_path);
-        if parent_of_protected && !cfg!(target_os = "macos") {
-            return Some(resolved_root);
+            return Some(protected_root.clone());
         }
     }
 
@@ -164,7 +163,7 @@ pub(crate) fn emit_protected_root_deny_rules(
     }
 
     for root in protected_roots {
-        let resolved = try_canonicalize(root);
+        let resolved = resolve_path(root);
         emit_deny_rules_for_path(&resolved, caps)?;
 
         // Also emit for the canonical path if it differs (important on macOS
@@ -193,6 +192,112 @@ fn emit_deny_rules_for_path(path: &Path, caps: &mut CapabilitySet) -> Result<()>
 #[cfg(not(target_os = "macos"))]
 fn emit_deny_rules_for_path(_path: &Path, _caps: &mut CapabilitySet) -> Result<()> {
     Ok(())
+}
+
+/// Compute the set of protected-root paths to load into the BPF-LSM
+/// `protected_roots` map for a session. Linux-only at runtime — on macOS
+/// returns empty because Seatbelt deny rules emitted via
+/// [`emit_protected_root_deny_rules`] and `add_deny_access_rules` cover
+/// the same ground.
+///
+/// Inputs (all merged into a single deduped list):
+///   - `state_roots`: the protected state-root set (today: `~/.nono`) as
+///     produced by `ProtectedRoots::from_defaults`.
+///   - `add_deny_access`: the profile's `policy.add_deny_access` entries
+///     (raw strings, possibly containing `$VAR` placeholders that have
+///     already been expanded by the profile loader).
+///   - `policy_group_denies`: deny paths inherited from policy groups
+///     (`deny_credentials`, `deny_keychains_*`, etc.) as resolved by
+///     `policy::resolve_deny_paths_for_groups`. These are required-by-
+///     default safety denies; on macOS Seatbelt enforces them via the
+///     same `add_deny_access_rules` machinery, on Linux pre-BPF-LSM the
+///     `validate_deny_overlaps` check rejected any session whose allow
+///     set covered them. Routing them through BPF-LSM lets a profile
+///     legitimately grant a broad parent (e.g. `$HOME`) without losing
+///     these baseline denies.
+///
+/// Output: the union of all three sets, each path resolved via
+/// [`resolve_path`] (canonicalize where possible, fall back to the
+/// longest existing ancestor). Duplicates are removed. Bind-mount sources
+/// mounted at-or-under any returned path are NOT enumerated here — that
+/// lives in `nono::sandbox::bpf_lsm`, where `/proc/self/mountinfo` is
+/// scanned just before BPF map population.
+///
+/// Paths that fail to resolve at all (no canonical form, no extant
+/// ancestor) are still included, so a not-yet-created path the agent
+/// might later mkdir into still gets denied (the kernel walker matches
+/// by `(dev, ino)`, which only exists once the path does — but inserting
+/// the resolved path is harmless).
+#[must_use]
+pub fn bpf_lsm_protected_roots_for_session(
+    state_roots: &[PathBuf],
+    add_deny_access: &[String],
+    policy_group_denies: &[PathBuf],
+) -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+
+    let mut out: Vec<PathBuf> =
+        Vec::with_capacity(state_roots.len() + add_deny_access.len() + policy_group_denies.len());
+    let mut push_unique = |path: PathBuf| {
+        let resolved = resolve_path(&path);
+        if !out.iter().any(|p| p == &resolved) {
+            out.push(resolved);
+        }
+    };
+
+    for root in state_roots {
+        push_unique(root.clone());
+    }
+    for entry in add_deny_access {
+        // `add_deny_access` entries arrive as raw strings from the
+        // profile JSON; placeholders like `$HOME/...` and `~/...`
+        // are NOT expanded by the profile loader (the existing
+        // `add_deny_access_rules` path expands them per-call). Use
+        // the same `expand_path` helper here so the BPF map is
+        // populated with concrete paths the kernel can stat.
+        match crate::policy::expand_path(entry) {
+            Ok(p) => push_unique(p),
+            Err(_) => push_unique(PathBuf::from(entry)),
+        }
+    }
+    for path in policy_group_denies {
+        push_unique(path.clone());
+    }
+    out
+}
+
+/// Resolve path by canonicalizing the full path, or canonicalizing the longest
+/// existing ancestor and appending remaining components.
+fn resolve_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+
+    let mut remaining = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(canonical) = current.canonicalize() {
+            let mut result = canonical;
+            for component in remaining.iter().rev() {
+                result = result.join(component);
+            }
+            return result;
+        }
+
+        match current.file_name() {
+            Some(name) => {
+                remaining.push(name.to_os_string());
+                if !current.pop() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+
+    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -239,7 +344,7 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn parent_directory_capability_blocked_even_with_opt_in_on_linux() {
+    fn parent_directory_capability_allowed_with_opt_in_on_linux() {
         let tmp = TempDir::new().expect("tmpdir");
         let parent = tmp.path().to_path_buf();
         let protected = parent.join(".nono");
@@ -248,15 +353,12 @@ mod tests {
         let cap = FsCapability::new_dir(&parent, AccessMode::ReadWrite).expect("dir cap");
         caps.add_fs(cap);
 
-        // On Linux, parent grant is always rejected even with opt-in
-        // (Landlock cannot express deny-within-allow)
-        let err = validate_caps_against_protected_roots(&caps, &[protected], true)
-            .expect_err("blocked on Linux even with opt-in");
-        assert!(
-            err.to_string()
-                .contains("overlaps protected nono state root"),
-            "unexpected error: {err}",
-        );
+        // With opt-in on Linux, parent grant is allowed because BPF-LSM
+        // enforces a deny over `~/.nono` at runtime (matching macOS Seatbelt
+        // behavior). Pre-flight admits the parent grant; the kernel hooks
+        // emit -EACCES when the agent actually reaches into the subtree.
+        validate_caps_against_protected_roots(&caps, &[protected], true)
+            .expect("allowed on Linux with opt-in (BPF-LSM enforces)");
     }
 
     #[test]
@@ -378,14 +480,64 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn overlapping_protected_root_parent_flagged_on_linux() {
+    fn overlapping_protected_root_parent_not_flagged_on_linux() {
         let tmp = TempDir::new().expect("tmpdir");
         let parent = tmp.path().to_path_buf();
         let protected = parent.join(".nono");
 
         let overlap = overlapping_protected_root(&parent, false, std::slice::from_ref(&protected));
-        // Linux: parent-of-protected is flagged
-        assert!(overlap.is_some(), "parent should be flagged on Linux");
+        // Linux: parent-of-protected is NOT flagged at runtime once BPF-LSM
+        // is the primary enforcer (matching macOS, where Seatbelt deny rules
+        // already protect the root). The pre-flight validator separately
+        // gates parent grants on the profile's `allow_parent_of_protected`.
+        assert_eq!(
+            overlap, None,
+            "parent should not be flagged on Linux (BPF-LSM enforces)"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn bpf_lsm_protected_roots_includes_state_root_and_add_deny_access() {
+        // Smoke-tests the merger that feeds the BPF protected_roots map.
+        // Inputs: state root paths (~/.nono and friends) plus the profile's
+        // `policy.add_deny_access` entries. Output: the union, expanded.
+        let tmp = TempDir::new().expect("tmpdir");
+        let state_root = tmp.path().join(".nono");
+        std::fs::create_dir_all(&state_root).expect("mkdir");
+        let secret_dir = tmp.path().join("secret");
+        std::fs::create_dir_all(&secret_dir).expect("mkdir");
+
+        let group_dir = tmp.path().join("group_deny");
+        std::fs::create_dir_all(&group_dir).expect("mkdir");
+
+        let state_roots = vec![state_root.clone()];
+        let add_deny_access = vec![secret_dir.to_string_lossy().into_owned()];
+        let policy_group_denies = vec![group_dir.clone()];
+
+        let merged = bpf_lsm_protected_roots_for_session(
+            &state_roots,
+            &add_deny_access,
+            &policy_group_denies,
+        );
+
+        let merged_strs: Vec<String> =
+            merged.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert!(
+            merged_strs.iter().any(|p| p.ends_with("/.nono")),
+            "expected state root in merged set, got: {:?}",
+            merged_strs
+        );
+        assert!(
+            merged_strs.iter().any(|p| p.ends_with("/secret")),
+            "expected add_deny_access path in merged set, got: {:?}",
+            merged_strs
+        );
+        assert!(
+            merged_strs.iter().any(|p| p.ends_with("/group_deny")),
+            "expected policy-group deny path in merged set, got: {:?}",
+            merged_strs
+        );
     }
 
     #[cfg(target_os = "macos")]

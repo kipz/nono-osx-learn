@@ -1099,6 +1099,25 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
         return Ok(());
     }
 
+    // On Linux, BPF-LSM (when active) enforces deny-within-allow by
+    // walking dentries against the `protected_roots` map at every
+    // file_open / inode_* mutation. The deny paths checked here are
+    // routed into that map at session start (see
+    // `protected_paths::bpf_lsm_protected_roots_for_session`), so an
+    // overlap with a granted parent is no longer "silently dropped" —
+    // the kernel hooks return `-EACCES` for any access. Skip the
+    // pre-flight rejection in that case so a profile can grant a broad
+    // parent (e.g. `$HOME`) while the baseline denies remain enforced.
+    //
+    // If BPF-LSM is not available (kernel cmdline missing `lsm=...,bpf`,
+    // or running without `cap_bpf`), the pre-flight check still runs
+    // and refuses to start with conflicting policy — silent partial
+    // enforcement is worse than a loud failure.
+    #[cfg(target_os = "linux")]
+    if nono::sandbox::bpf_lsm::is_bpf_lsm_available() {
+        return Ok(());
+    }
+
     let mut fatal_conflicts = Vec::new();
 
     for deny_path in deny_paths {
