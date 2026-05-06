@@ -621,11 +621,14 @@
       "type": "object",
       "description": "Hook definition for a target application.",
       "additionalProperties": false,
-      "required": ["event", "matcher", "script"],
+      "required": ["events", "matcher", "script"],
       "properties": {
-        "event": {
-          "type": "string",
-          "description": "Event that triggers the hook (e.g., \"PostToolUseFailure\")."
+        "events": {
+          "description": "Events that trigger the hook. Accepts either a single string for one event, or an array for multi-event hooks like the trajectory-spec dispatcher.",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
         },
         "matcher": {
           "type": "string",

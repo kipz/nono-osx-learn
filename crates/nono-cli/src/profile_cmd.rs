@@ -1120,7 +1120,7 @@ fn profile_to_json(
                     .iter()
                     .map(|v| {
                         serde_json::json!({
-                            "event": v.event,
+                            "events": v.events,
                             "matcher": v.matcher,
                             "script": v.script,
                         })
@@ -1581,7 +1581,7 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
             let b = &p2.hooks.hooks[**k];
             a.len() != b.len()
                 || a.iter().zip(b.iter()).any(|(x, y)| {
-                    x.event != y.event || x.matcher != y.matcher || x.script != y.script
+                    x.events != y.events || x.matcher != y.matcher || x.script != y.script
                 })
         })
         .copied()
@@ -1932,7 +1932,7 @@ fn diff_hooks_json(
 ) -> serde_json::Value {
     let hook_to_json = |h: &profile::HookConfig| {
         serde_json::json!({
-            "event": h.event,
+            "events": h.events,
             "matcher": h.matcher,
             "script": h.script,
         })
@@ -1950,7 +1950,7 @@ fn diff_hooks_json(
                 let list1 = &h1[*k];
                 list1.len() != list2.len()
                     || list1.iter().zip(list2.iter()).any(|(a, b)| {
-                        a.event != b.event || a.matcher != b.matcher || a.script != b.script
+                        a.events != b.events || a.matcher != b.matcher || a.script != b.script
                     })
             })
         })

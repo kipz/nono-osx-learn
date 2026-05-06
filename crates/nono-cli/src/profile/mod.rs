@@ -930,12 +930,60 @@ pub struct SecretsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
-    /// Event that triggers the hook (e.g., "PostToolUseFailure")
-    pub event: String,
+    /// Events that trigger the hook. Accepts either a single string
+    /// (`"events": "PostToolUseFailure"`) or an array
+    /// (`"events": ["SessionStart", "PreToolUse", ...]`); both deserialize
+    /// to the same shape. Multi-event hooks register the same script with
+    /// the same matcher on every listed event.
+    #[serde(deserialize_with = "deserialize_string_or_seq")]
+    pub events: Vec<String>,
     /// Regex pattern to match tool names (e.g., "Read|Write|Edit|Bash")
     pub matcher: String,
     /// Script filename from data/hooks/ to install
     pub script: String,
+}
+
+/// Deserialize a field as either a single string or a sequence of strings.
+/// Used so `events` can be written as `"events": "PreToolUse"` for the
+/// common single-event case without forcing every profile author into the
+/// array syntax.
+fn deserialize_string_or_seq<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct StringOrSeq;
+
+    impl<'de> Visitor<'de> for StringOrSeq {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string or a sequence of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            Ok(vec![v.to_string()])
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
+            Ok(vec![v])
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrSeq)
 }
 
 /// Hooks configuration in a profile
@@ -4005,7 +4053,7 @@ mod tests {
         base.hooks.hooks.insert(
             "claude-code".to_string(),
             vec![HookConfig {
-                event: "PostToolUseFailure".to_string(),
+                events: vec!["PostToolUseFailure".to_string()],
                 matcher: "Bash".to_string(),
                 script: "base-hook.sh".to_string(),
             }],
@@ -4015,7 +4063,7 @@ mod tests {
         child.hooks.hooks.insert(
             "opencode".to_string(),
             vec![HookConfig {
-                event: "PreToolUse".to_string(),
+                events: vec!["PreToolUse".to_string()],
                 matcher: "Write".to_string(),
                 script: "child-hook.sh".to_string(),
             }],
@@ -4032,7 +4080,7 @@ mod tests {
         base2.hooks.hooks.insert(
             "claude-code".to_string(),
             vec![HookConfig {
-                event: "PostToolUseFailure".to_string(),
+                events: vec!["PostToolUseFailure".to_string()],
                 matcher: "Bash".to_string(),
                 script: "base-hook.sh".to_string(),
             }],
@@ -4042,7 +4090,7 @@ mod tests {
         child2.hooks.hooks.insert(
             "claude-code".to_string(),
             vec![HookConfig {
-                event: "PreToolUse".to_string(),
+                events: vec!["PreToolUse".to_string()],
                 matcher: "Read".to_string(),
                 script: "child-hook.sh".to_string(),
             }],
@@ -4055,25 +4103,57 @@ mod tests {
             hooks[0].script, "child-hook.sh",
             "child should win on collision"
         );
-        assert_eq!(hooks[0].event, "PreToolUse");
+        assert_eq!(hooks[0].events, vec!["PreToolUse".to_string()]);
+    }
+
+    #[test]
+    fn test_hook_config_deserializes_string_or_array() {
+        // Single-string form (back-compat with the old `event: String` shape).
+        let single: HookConfig = serde_json::from_str(
+            r#"{"events": "PostToolUseFailure", "matcher": "Bash", "script": "x.sh"}"#,
+        )
+        .expect("single string events should deserialize");
+        assert_eq!(single.events, vec!["PostToolUseFailure".to_string()]);
+
+        // Array form.
+        let multi: HookConfig = serde_json::from_str(
+            r#"{"events": ["SessionStart", "PreToolUse"], "matcher": "*", "script": "y.sh"}"#,
+        )
+        .expect("array events should deserialize");
+        assert_eq!(
+            multi.events,
+            vec!["SessionStart".to_string(), "PreToolUse".to_string()]
+        );
+
+        // Old `event` field is no longer accepted (deny_unknown_fields).
+        let legacy = serde_json::from_str::<HookConfig>(
+            r#"{"event": "PreToolUse", "matcher": "*", "script": "x.sh"}"#,
+        );
+        assert!(
+            legacy.is_err(),
+            "legacy `event` field must be rejected by deny_unknown_fields"
+        );
     }
 
     #[test]
     fn test_hooks_config_accepts_object_or_array() {
         // Single-object form (back-compat with the pre-multi-hook schema).
         let single: HooksConfig = serde_json::from_str(
-            r#"{"claude-code": {"event": "PostToolUseFailure", "matcher": "Bash", "script": "x.sh"}}"#,
+            r#"{"claude-code": {"events": "PostToolUseFailure", "matcher": "Bash", "script": "x.sh"}}"#,
         )
         .expect("single-object hook should deserialize");
         assert_eq!(single.hooks["claude-code"].len(), 1);
-        assert_eq!(single.hooks["claude-code"][0].event, "PostToolUseFailure");
+        assert_eq!(
+            single.hooks["claude-code"][0].events,
+            vec!["PostToolUseFailure".to_string()]
+        );
 
         // Array form (the new shape — used when one target needs multiple hooks).
         let multi: HooksConfig = serde_json::from_str(
             r#"{
                 "claude-code": [
-                    {"event": "PostToolUseFailure", "matcher": "Bash", "script": "ctx.sh"},
-                    {"event": "SessionStart", "matcher": "*", "script": "trajectory.sh"}
+                    {"events": "PostToolUseFailure", "matcher": "Bash", "script": "ctx.sh"},
+                    {"events": "SessionStart", "matcher": "*", "script": "trajectory.sh"}
                 ]
             }"#,
         )
@@ -4084,7 +4164,7 @@ mod tests {
 
         // Unknown fields inside a HookConfig still rejected.
         let bad = serde_json::from_str::<HooksConfig>(
-            r#"{"claude-code": {"event": "x", "matcher": "*", "script": "x.sh", "wat": 1}}"#,
+            r#"{"claude-code": {"events": "PreToolUse", "matcher": "*", "script": "x.sh", "wat": 1}}"#,
         );
         assert!(
             bad.is_err(),

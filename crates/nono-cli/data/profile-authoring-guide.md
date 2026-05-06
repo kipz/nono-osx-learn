@@ -202,7 +202,7 @@ Single-hook form (back-compat shorthand for one hook on a target):
 {
   "hooks": {
     "claude-code": {
-      "event": "PostToolUseFailure",
+      "events": "PostToolUseFailure",
       "matcher": "Read|Write|Edit|Bash",
       "script": "nono-hook.sh"
     }
@@ -210,19 +210,19 @@ Single-hook form (back-compat shorthand for one hook on a target):
 }
 ```
 
-Multi-hook form (use when one target needs more than one script — e.g. one for failure context, another for trajectory-spec emission):
+Multi-hook form (use when one target needs more than one script — e.g. one for failure context, another for trajectory-spec emission). Each entry's `events` may also be an array to register the same script/matcher on multiple events:
 
 ```json
 {
   "hooks": {
     "claude-code": [
       {
-        "event": "PostToolUseFailure",
+        "events": "PostToolUseFailure",
         "matcher": "Read|Write|Edit|Bash",
         "script": "shadowfax-hook.sh"
       },
       {
-        "event": "SessionStart",
+        "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"],
         "matcher": "*",
         "script": "nono-trajectory.sh"
       }
@@ -233,11 +233,11 @@ Multi-hook form (use when one target needs more than one script — e.g. one for
 
 Inheritance: when a child profile declares `hooks.<target>`, it replaces the base profile's entry for that target. To keep base hooks alongside child-specific ones, restate the base entries in the child's array.
 
-| Field     | Type   | Description |
-|-----------|--------|-------------|
-| `event`   | string | Trigger event name. |
-| `matcher` | string | Regex for tool name matching. |
-| `script`  | string | Script filename from embedded hooks. |
+| Field     | Type             | Description |
+|-----------|------------------|-------------|
+| `events`  | string \| array  | Trigger event name, or an array of event names for multi-event hooks. |
+| `matcher` | string           | Regex for tool name matching. |
+| `script`  | string           | Script filename from embedded hooks. |
 
 ### rollback (alias: undo)
 
