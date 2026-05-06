@@ -96,8 +96,8 @@ fn trajectory_hook_emits_conformant_stream() {
     let home: PathBuf = tmp.path().to_path_buf();
     let session_id = "int-test-1";
     let out = home
-        .join(".nono")
-        .join("trajectory")
+        .join(".cache")
+        .join("nono-trajectory")
         .join(format!("session-{session_id}.jsonl"));
 
     let events = [
@@ -247,7 +247,7 @@ fn trajectory_hook_emits_conformant_stream() {
     // + nono. The fix derives counters from the JSONL itself, which means
     // the trajectory dir should contain *only* the JSONL — no dotfiles at
     // all. A re-introduction of any sidecar would be visible here.
-    let traj_dir = home.join(".nono").join("trajectory");
+    let traj_dir = home.join(".cache").join("nono-trajectory");
     let leftovers: Vec<_> = std::fs::read_dir(&traj_dir)
         .expect("read trajectory dir")
         .filter_map(|e| e.ok())
@@ -300,7 +300,7 @@ fn trajectory_hook_noop_without_nono_env() {
         "hook should exit 0 when nono inactive"
     );
 
-    let traj_root = home.join(".nono").join("trajectory");
+    let traj_root = home.join(".cache").join("nono-trajectory");
     assert!(
         !traj_root.exists(),
         "hook must not create files when nono inactive"
@@ -338,7 +338,7 @@ fn trajectory_hook_rejects_path_traversal_in_session_id() {
     assert!(out.status.success());
 
     // Nothing should have been written.
-    let traj_root = home.join(".nono").join("trajectory");
+    let traj_root = home.join(".cache").join("nono-trajectory");
     if traj_root.exists() {
         let entries: Vec<_> = std::fs::read_dir(&traj_root)
             .expect("read traj root")
@@ -373,8 +373,8 @@ fn trajectory_hook_serializes_sequence_under_concurrency() {
     let home: PathBuf = tmp.path().to_path_buf();
     let session_id = "concur-test-1";
     let out = home
-        .join(".nono")
-        .join("trajectory")
+        .join(".cache")
+        .join("nono-trajectory")
         .join(format!("session-{session_id}.jsonl"));
 
     // SessionStart first to establish the file and counter sidecars before

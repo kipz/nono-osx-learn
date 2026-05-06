@@ -8,7 +8,14 @@
 # tooling is missing, so it is safe to leave registered outside nono.
 #
 # Output: one JSONL line per event appended to
-#   $HOME/.nono/trajectory/session-<claude_session_id>.jsonl
+#   ${XDG_CACHE_HOME:-$HOME/.cache}/nono-trajectory/session-<claude_session_id>.jsonl
+#
+# Why ~/.cache and not ~/.nono: nono's protected_paths.rs emits Seatbelt
+# rules of the form `(deny file-read-data (subpath ~/.nono))` so the agent
+# can't tamper with audit state. The trajectory hook runs in the agent's
+# sandbox, so anything it writes under ~/.nono it can't read back — which
+# breaks the JSONL-derived seq/turn counters below. ~/.cache is outside
+# the protected root and fully accessible from inside the sandbox.
 #
 # Spec: DataDog/trajectory-spec v0.1 (standard capture level).
 # Deliberate non-conformance (see docs/2026-04-23-adopt-trajectory-spec.md §6):
@@ -54,7 +61,7 @@ if [ "${#session_id}" -gt 128 ]; then
     exit 0
 fi
 
-traj_root="$HOME/.nono/trajectory"
+traj_root="${XDG_CACHE_HOME:-$HOME/.cache}/nono-trajectory"
 out="$traj_root/session-$session_id.jsonl"
 
 mkdir -p "$traj_root" || exit 0
