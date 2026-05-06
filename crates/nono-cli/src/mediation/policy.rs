@@ -3021,6 +3021,7 @@ mod tests {
             session_token: String::new(),
             env: env_kc,
             pid: 0,
+            ..Default::default()
         };
         let (kc_resp, _) = apply_capture(
             kc_req,
@@ -3053,6 +3054,7 @@ mod tests {
             session_token: String::new(),
             env: env_gh,
             pid: 0,
+            ..Default::default()
         };
         let (gh_resp, _) = apply_capture(
             gh_req,
@@ -4380,6 +4382,7 @@ mod tests {
             session_token: String::new(),
             env: std::collections::HashMap::new(),
             pid: 0,
+            ..Default::default()
         };
         let gate = MockApprovalGate::deny(); // would deny if asked, but must not be asked
         let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
@@ -4416,6 +4419,7 @@ mod tests {
             session_token: String::new(),
             env: std::collections::HashMap::new(), // agent
             pid: 0,
+            ..Default::default()
         };
         let gate = MockApprovalGate::deny();
         let gate_for_apply: Arc<dyn ApprovalGate + Send + Sync> = gate.clone();
@@ -4453,6 +4457,7 @@ mod tests {
             session_token: String::new(),
             env: std::collections::HashMap::new(),
             pid: 0,
+            ..Default::default()
         };
         let gate = MockApprovalGate::allow_once();
         let allowlist = TestAllowlistStore::new();
@@ -4497,6 +4502,7 @@ mod tests {
             session_token: String::new(),
             env: std::collections::HashMap::new(),
             pid: 0,
+            ..Default::default()
         };
         let gate = MockApprovalGate::allow_always();
         let allowlist = TestAllowlistStore::new();
@@ -4541,6 +4547,7 @@ mod tests {
             session_token: String::new(),
             env: std::collections::HashMap::new(),
             pid: 0,
+            ..Default::default()
         };
         let gate = MockApprovalGate::allow_always();
         let allowlist = TestAllowlistStore::new();
@@ -4598,6 +4605,7 @@ mod tests {
             session_token: String::new(),
             env,
             pid: 0,
+            ..Default::default()
         };
         let gate = MockApprovalGate::allow_always();
         let allowlist = TestAllowlistStore::new();
