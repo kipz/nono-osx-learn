@@ -240,6 +240,29 @@ fn trajectory_hook_emits_conformant_stream() {
     let last = lines.last().expect("non-empty");
     assert_eq!(last["event_type"], "session_end");
     assert_eq!(last["exit_reason"], "user_exit");
+
+    // Regression guard for PR #18 bug: every event had sequence_number=0
+    // because the .seq-/.turn-/.pending-tool-<sid> sidecar dotfiles were
+    // silently being lost between hook invocations under real Claude Code
+    // + nono. The fix derives counters from the JSONL itself, which means
+    // the trajectory dir should contain *only* the JSONL — no dotfiles at
+    // all. A re-introduction of any sidecar would be visible here.
+    let traj_dir = home.join(".nono").join("trajectory");
+    let leftovers: Vec<_> = std::fs::read_dir(&traj_dir)
+        .expect("read trajectory dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter(|n| {
+            let s = n.to_string_lossy();
+            !s.starts_with("session-") || !s.ends_with(".jsonl")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "trajectory dir must contain only session-*.jsonl after a clean run; \
+         dotfile sidecars are a regression to the lost-counter approach: {:?}",
+        leftovers,
+    );
 }
 
 #[test]

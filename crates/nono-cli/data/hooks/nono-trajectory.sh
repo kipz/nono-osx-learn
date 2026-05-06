@@ -56,9 +56,6 @@ fi
 
 traj_root="$HOME/.nono/trajectory"
 out="$traj_root/session-$session_id.jsonl"
-seq_file="$traj_root/.seq-$session_id"
-turn_file="$traj_root/.turn-$session_id"
-pending_tool_file="$traj_root/.pending-tool-$session_id"
 
 mkdir -p "$traj_root" || exit 0
 chmod 700 "$traj_root" 2>/dev/null || true
@@ -98,18 +95,26 @@ release_lock() {
 }
 trap release_lock EXIT
 
-seq=$(cat "$seq_file" 2>/dev/null || echo 0)
-case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
-next_seq=$((seq + 1))
-# Detect write failure (e.g. permission, disk full, fs corruption) and drop
-# the event rather than emit a stale sequence_number that violates I9. With
-# `set -u` but no `set -e`, an unchecked redirection failure was silently
-# leaving seq_file at "0" forever, repeating sequence_number=0 on every event.
-if ! printf '%s' "$next_seq" > "$seq_file" 2>/dev/null; then
-    exit 0
+# Derive sequence_number and turn_id from the output JSONL itself rather
+# than from sidecar files. Earlier revisions kept .seq-<sid>, .turn-<sid>,
+# and .pending-tool-<sid> dotfiles next to the JSONL; under real Claude
+# Code + nono they were silently being lost between hook invocations
+# (sequence_number stayed at 0 across every event in every session — see
+# PR #18 review). Root cause was never RCA'd. The output JSONL itself is
+# what we ultimately care about and *does* persist (because it is opened
+# O_APPEND, never truncated), so making it the single source of truth is
+# self-healing and immune to whatever was wiping the dotfiles.
+#
+# We hold the per-session lock around both the read (line count) and the
+# write (emit), so concurrent invocations cannot observe the same count
+# and produce a duplicate sequence_number.
+seq=0
+turn=0
+if [ -s "$out" ]; then
+    seq=$(wc -l < "$out" | tr -d ' \t')
+    turn=$(grep -c '"event_type":"input_prompt"' "$out" 2>/dev/null || true)
 fi
-
-turn=$(cat "$turn_file" 2>/dev/null || echo 0)
+case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
 case "$turn" in ''|*[!0-9]*) turn=0 ;; esac
 
 # RFC 3339 UTC timestamp with millisecond precision. BSD `date` (macOS) does
@@ -172,20 +177,17 @@ case "$event_name" in
                 client_source: (if $source == "" then null else $source end)
             } | del(..|nulls)')
         emit session_start "$extra"
-        # Fresh session: no turn has started yet.
-        printf '0' > "$turn_file" 2>/dev/null || true
         ;;
 
     UserPromptSubmit)
-        # Each new user prompt starts a new turn. Bump first so this prompt and
-        # any tool_use events Claude emits while responding share the same turn_id.
-        # The prompt text itself is not captured — see privacy note in header.
+        # Each new user prompt starts a new turn. `turn` was derived from the
+        # JSONL above as the count of input_prompt events already on disk;
+        # bumping by one assigns this prompt the next turn_id and the
+        # tool_use events Claude emits while responding will read the same
+        # value (since they re-count the JSONL, which now includes this
+        # prompt). The prompt text itself is not captured — see privacy
+        # note in header.
         turn=$((turn + 1))
-        # Drop the event if turn_file write fails, otherwise the next invocation
-        # would re-read the stale value and emit a duplicated turn_id.
-        if ! printf '%s' "$turn" > "$turn_file" 2>/dev/null; then
-            exit 0
-        fi
         extra=$(jq -nc --argjson tid "$turn" '{turn_id: $tid}')
         emit input_prompt "$extra"
         ;;
@@ -205,16 +207,19 @@ case "$event_name" in
             --argjson inp "$input" \
             '{turn_id: $tid, tool_use_id: $tuid, tool_name: $tn, phase: "pre", input: $inp}')
         emit tool_use "$extra"
-        # Record the last tool_use_id so PostToolUse can pair even when Claude
-        # does not echo it back on the post event.
-        printf '%s\n%s' "$tuid" "$tool" > "$pending_tool_file"
         ;;
 
     PostToolUse)
         tool=$(printf '%s' "$payload" | jq -r '.tool_name // "unknown"')
         tuid=$(printf '%s' "$payload" | jq -r '.tool_use_id // empty')
-        if [ -z "$tuid" ] && [ -f "$pending_tool_file" ]; then
-            tuid=$(sed -n '1p' "$pending_tool_file")
+        # Pair with the most recent pre tool_use in the JSONL when Claude
+        # does not echo tool_use_id on the post event. With concurrent
+        # tools in flight, the *last* pre line is the right one to match —
+        # Claude fires post events in completion order, and we only fall
+        # through to this branch when no id was provided.
+        if [ -z "$tuid" ] && [ -s "$out" ]; then
+            tuid=$(grep '"phase":"pre"' "$out" 2>/dev/null | tail -1 \
+                | jq -r '.tool_use_id // empty' 2>/dev/null)
         fi
         if [ -z "$tuid" ]; then
             tuid="$session_id:$seq"
@@ -233,7 +238,6 @@ case "$event_name" in
             --argjson succ "$success" \
             '{turn_id: $tid, tool_use_id: $tuid, tool_name: $tn, phase: "post", success: $succ}')
         emit tool_use "$extra"
-        rm -f "$pending_tool_file" 2>/dev/null || true
         ;;
 
     SessionEnd)
@@ -249,9 +253,8 @@ case "$event_name" in
             --argjson tt "$turn" \
             '{exit_reason: $er, total_turns: $tt}')
         emit session_end "$extra"
-        # Clean up sidecars; leave the JSONL output in place. The lock file
-        # (or lock dir) is released by the EXIT trap and removed below.
-        rm -f "$seq_file" "$turn_file" "$pending_tool_file" "$traj_root/.lock-$session_id" 2>/dev/null || true
+        # Lock file is released and removed by the EXIT trap. JSONL stays.
+        rm -f "$traj_root/.lock-$session_id" 2>/dev/null || true
         ;;
 
     *)

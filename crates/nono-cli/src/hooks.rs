@@ -430,13 +430,29 @@ mod tests {
             !script.contains("flock 9\n"),
             "trajectory hook must not call flock without a timeout"
         );
-        // Sequence-number write must be failure-detecting. A silent redirect
-        // failure leaves seq_file at "0" forever and produces a stream of
-        // sequence_number=0 events that violate spec I9.
+        // sequence_number and turn_id must be derived from the output
+        // JSONL itself, not from sidecar files (.seq-<sid>, .turn-<sid>).
+        // Earlier revisions used sidecars; in real Claude Code + nono they
+        // were silently being lost between hook invocations, leaving every
+        // event at sequence_number=0. The output file is opened O_APPEND
+        // and *does* persist, so it is the single source of truth now.
         assert!(
-            script.contains("if ! printf '%s' \"$next_seq\" > \"$seq_file\""),
-            "trajectory hook must check seq_file write success"
+            script.contains("wc -l < \"$out\""),
+            "trajectory hook must derive sequence_number from JSONL line count"
         );
+        assert!(
+            script.contains("grep -c '\"event_type\":\"input_prompt\"' \"$out\""),
+            "trajectory hook must derive turn_id from JSONL input_prompt count"
+        );
+        // The sidecar dotfiles must be gone — any reference is a regression
+        // back to the broken approach.
+        for sidecar in ["seq_file", "turn_file", "pending_tool_file"] {
+            assert!(
+                !script.contains(sidecar),
+                "trajectory hook must not reference sidecar variable `{}` (replaced by JSONL-derived counters)",
+                sidecar,
+            );
+        }
         // session_id must be on every event (in the base emit composition),
         // not just session_start, so downstream log search can filter a
         // single Claude Code session out of the combined stream.
