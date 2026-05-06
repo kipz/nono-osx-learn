@@ -143,6 +143,17 @@ fn trajectory_hook_emits_conformant_stream() {
         );
     }
 
+    // session_id present on every event (not just session_start), so
+    // downstream log search can filter a single Claude Code session out of
+    // the combined stream.
+    for line in &lines {
+        assert_eq!(
+            line["session_id"].as_str().expect("session_id"),
+            session_id,
+            "every event must carry session_id: {line}",
+        );
+    }
+
     // I6: timestamps non-decreasing, RFC 3339 UTC with millisecond precision.
     let mut prev_ts = String::new();
     for line in &lines {

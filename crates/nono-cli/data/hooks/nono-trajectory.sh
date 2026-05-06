@@ -132,16 +132,20 @@ fi
 
 # emit <event_type> <extra-json-object>
 # Composes the base fields with an event-specific JSON fragment and appends
-# one line to the output file.
+# one line to the output file. session_id is included on every event so
+# downstream log search can filter a single Claude Code session out of the
+# combined stream — the JSONL filename also encodes it, but Datadog log
+# pipelines key off message fields, not filenames.
 emit() {
     local et="$1"
     local extra="$2"
     printf '%s' "$payload" | jq -c \
         --arg et "$et" \
         --arg ts "$ts" \
+        --arg sid "$session_id" \
         --argjson sn "$seq" \
         --argjson extra "$extra" \
-        '{event_type: $et, timestamp: $ts, sequence_number: $sn} + $extra' \
+        '{event_type: $et, timestamp: $ts, sequence_number: $sn, session_id: $sid} + $extra' \
         >> "$out"
 }
 
@@ -153,15 +157,14 @@ case "$event_name" in
         model="${NONO_AGENT_MODEL:-unknown}"
         cwd=$(printf '%s' "$payload" | jq -r '.cwd // ""')
         source=$(printf '%s' "$payload" | jq -r '.source // ""')
+        # session_id comes from the base emit fields; no need to repeat it here.
         extra=$(jq -nc \
-            --arg sid "$session_id" \
             --arg started "$ts" \
             --arg model "$model" \
             --arg cwd "$cwd" \
             --arg source "$source" \
             '{
                 format_version: 1,
-                session_id: $sid,
                 started_at: $started,
                 model: ("nono-sandbox/" + $model),
                 capture_level: "standard",

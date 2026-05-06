@@ -437,6 +437,13 @@ mod tests {
             script.contains("if ! printf '%s' \"$next_seq\" > \"$seq_file\""),
             "trajectory hook must check seq_file write success"
         );
+        // session_id must be on every event (in the base emit composition),
+        // not just session_start, so downstream log search can filter a
+        // single Claude Code session out of the combined stream.
+        assert!(
+            script.contains("session_id: $sid"),
+            "trajectory hook must emit session_id on every event from the base emit composition"
+        );
     }
 
     #[test]
