@@ -18,6 +18,24 @@ use std::sync::Arc;
 use tracing::debug;
 use zeroize::Zeroizing;
 
+/// Reserved route-prefix namespace for nono-internal routes.
+///
+/// Any prefix starting with this string is reserved for nono itself
+/// (e.g. the OAuth-capture intercept routes injected at proxy startup).
+/// User-supplied profiles that try to declare a prefix in this namespace
+/// are rejected at config-load time so a colliding user route cannot
+/// shadow or disable an internal one.
+pub const RESERVED_PREFIX_NAMESPACE: &str = "__nono_";
+
+/// Returns true if `prefix` (raw or with surrounding slashes) lives in
+/// the reserved [`RESERVED_PREFIX_NAMESPACE`].
+#[must_use]
+pub fn is_reserved_prefix(prefix: &str) -> bool {
+    prefix
+        .trim_matches('/')
+        .starts_with(RESERVED_PREFIX_NAMESPACE)
+}
+
 /// Route-level configuration loaded at proxy startup.
 ///
 /// Contains everything needed to forward and filter a request for a route,
@@ -41,6 +59,43 @@ pub struct LoadedRoute {
     /// Built once at startup from the route's `tls_ca` certificate file.
     /// When `None`, the shared default connector (webpki roots only) is used.
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
+
+    /// Mirrors `RouteConfig.tls_intercept`. When true, CONNECT requests
+    /// targeting this route's upstream host are TLS-terminated by the
+    /// proxy's session CA (`crate::intercept`) so the proxy can read
+    /// and rewrite plaintext HTTP. Used by the OAuth-capture path
+    /// (Layer 1 of `2026-04-27-capture-anthropic-auth.md`).
+    pub tls_intercept: bool,
+
+    /// OAuth-capture URL match patterns, present when this route's
+    /// `inject_mode` is [`crate::config::InjectMode::OauthCapture`].
+    /// `None` for any other inject mode. The TLS-intercept body
+    /// rewriter consults these to decide whether to buffer + rewrite
+    /// a response or pass it through.
+    pub oauth_capture: Option<OauthCaptureMatch>,
+}
+
+/// Per-route OAuth-capture configuration resolved at proxy startup.
+///
+/// Both fields are exact-match URL paths (case-sensitive, matched
+/// against the request's path component only — query string excluded).
+/// Identical strings are valid, since most OAuth providers serve both
+/// initial authorization-code exchange and refresh-token exchange at
+/// the same endpoint, distinguished only by `grant_type` in the
+/// request body.
+#[derive(Debug, Clone)]
+pub struct OauthCaptureMatch {
+    pub token_url_match: String,
+    pub refresh_url_match: String,
+}
+
+impl OauthCaptureMatch {
+    /// Returns true iff `path` matches either the token-issuance or
+    /// refresh URL exactly.
+    #[must_use]
+    pub fn matches(&self, path: &str) -> bool {
+        path == self.token_url_match || path == self.refresh_url_match
+    }
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -50,6 +105,8 @@ impl std::fmt::Debug for LoadedRoute {
             .field("upstream_host_port", &self.upstream_host_port)
             .field("endpoint_rules", &self.endpoint_rules)
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
+            .field("tls_intercept", &self.tls_intercept)
+            .field("oauth_capture", &self.oauth_capture)
             .finish()
     }
 }
@@ -105,6 +162,17 @@ impl RouteStore {
 
             let upstream_host_port = extract_host_port(&route.upstream);
 
+            let oauth_capture = match &route.inject_mode {
+                crate::config::InjectMode::OauthCapture {
+                    token_url_match,
+                    refresh_url_match,
+                } => Some(OauthCaptureMatch {
+                    token_url_match: token_url_match.clone(),
+                    refresh_url_match: refresh_url_match.clone(),
+                }),
+                _ => None,
+            };
+
             loaded.insert(
                 normalized_prefix,
                 LoadedRoute {
@@ -112,6 +180,8 @@ impl RouteStore {
                     upstream_host_port,
                     endpoint_rules,
                     tls_connector,
+                    tls_intercept: route.tls_intercept,
+                    oauth_capture,
                 },
             );
         }
@@ -156,6 +226,47 @@ impl RouteStore {
                 .upstream_host_port
                 .as_ref()
                 .is_some_and(|hp| *hp == normalised)
+        })
+    }
+
+    /// Check whether `host_port` matches the upstream of a route that
+    /// has `tls_intercept: true`. Used by the CONNECT dispatcher to
+    /// branch into the TLS-intercept path instead of opening a
+    /// transparent tunnel.
+    #[must_use]
+    pub fn is_intercept_upstream(&self, host_port: &str) -> bool {
+        let normalised = host_port.to_lowercase();
+        self.routes.values().any(|route| {
+            route.tls_intercept
+                && route
+                    .upstream_host_port
+                    .as_ref()
+                    .is_some_and(|hp| *hp == normalised)
+        })
+    }
+
+    /// Look up the OAuth-capture match config for an intercepted host.
+    ///
+    /// Returns `Some` only when the matched route has both
+    /// `tls_intercept: true` *and* `inject_mode: OauthCapture`. The
+    /// body rewriter consults this to decide whether to buffer + parse
+    /// a response or stream it through unchanged.
+    #[must_use]
+    pub fn oauth_capture_for(&self, host_port: &str) -> Option<&OauthCaptureMatch> {
+        let normalised = host_port.to_lowercase();
+        self.routes.values().find_map(|route| {
+            if !route.tls_intercept {
+                return None;
+            }
+            if route
+                .upstream_host_port
+                .as_ref()
+                .is_some_and(|hp| *hp == normalised)
+            {
+                route.oauth_capture.as_ref()
+            } else {
+                None
+            }
         })
     }
 
@@ -372,6 +483,43 @@ mod tests {
     }
 
     #[test]
+    fn test_is_reserved_prefix_accepts_namespace() {
+        // Bare reserved-namespace names and the canonical OAuth-capture
+        // names must report as reserved.
+        assert!(is_reserved_prefix("__nono_"));
+        assert!(is_reserved_prefix("__nono_oauth_anthropic"));
+        assert!(is_reserved_prefix("__nono_oauth_claudeai"));
+        assert!(is_reserved_prefix("__nono_oauth_platform"));
+    }
+
+    #[test]
+    fn test_is_reserved_prefix_normalises_slashes() {
+        // The proxy normalises route prefixes by trimming surrounding
+        // slashes; the helper must match that normalisation so a user
+        // cannot bypass the check by writing "/__nono_evil" or
+        // "__nono_evil/".
+        assert!(is_reserved_prefix("/__nono_evil"));
+        assert!(is_reserved_prefix("__nono_evil/"));
+        assert!(is_reserved_prefix("/__nono_evil/"));
+    }
+
+    #[test]
+    fn test_is_reserved_prefix_rejects_lookalikes() {
+        // Common ordinary route names must NOT match.
+        assert!(!is_reserved_prefix(""));
+        assert!(!is_reserved_prefix("openai"));
+        assert!(!is_reserved_prefix("anthropic"));
+        assert!(!is_reserved_prefix("claude-oauth"));
+        // "nono_" without the leading "__" is not in the reserved
+        // namespace; only the double-underscore prefix is reserved.
+        assert!(!is_reserved_prefix("nono_compat"));
+        assert!(!is_reserved_prefix("_nono_one_underscore"));
+        // A single-underscore-prefixed name that *contains* `nono_` as
+        // a substring further in is also not reserved.
+        assert!(!is_reserved_prefix("my_nono_helper"));
+    }
+
+    #[test]
     fn test_load_routes_without_credentials() {
         // Routes without credential_key should still be loaded into RouteStore
         let routes = vec![RouteConfig {
@@ -400,6 +548,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            tls_intercept: false,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -435,6 +584,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            tls_intercept: false,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -461,6 +611,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            tls_intercept: false,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -488,6 +639,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             },
             RouteConfig {
                 prefix: "anthropic".to_string(),
@@ -506,6 +658,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             },
         ];
 
@@ -514,6 +667,169 @@ mod tests {
         assert!(hosts.contains("api.openai.com:443"));
         assert!(hosts.contains("api.anthropic.com:443"));
         assert_eq!(hosts.len(), 2);
+    }
+
+    #[test]
+    fn test_is_intercept_upstream_only_matches_intercept_routes() {
+        // Two routes with the same prefix shape — one with
+        // tls_intercept: true, one with the default (false). Only the
+        // first should be reported as an intercept upstream.
+        let routes = vec![
+            RouteConfig {
+                prefix: "claude-oauth".to_string(),
+                upstream: "https://claude.ai".to_string(),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                tls_intercept: true,
+            },
+            RouteConfig {
+                prefix: "openai".to_string(),
+                upstream: "https://api.openai.com".to_string(),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                tls_intercept: false,
+            },
+        ];
+
+        let store = RouteStore::load(&routes).unwrap();
+
+        // Both upstreams are recognised as routes.
+        assert!(store.is_route_upstream("claude.ai:443"));
+        assert!(store.is_route_upstream("api.openai.com:443"));
+
+        // Only the intercept-flagged route is an intercept upstream.
+        assert!(store.is_intercept_upstream("claude.ai:443"));
+        assert!(!store.is_intercept_upstream("api.openai.com:443"));
+
+        // Unknown hosts are not intercept upstreams either.
+        assert!(!store.is_intercept_upstream("github.com:443"));
+
+        // Case-insensitive, mirroring is_route_upstream.
+        assert!(store.is_intercept_upstream("CLAUDE.AI:443"));
+    }
+
+    #[test]
+    fn test_loaded_route_carries_tls_intercept_flag() {
+        let routes = vec![RouteConfig {
+            prefix: "claude-oauth".to_string(),
+            upstream: "https://claude.ai".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            tls_intercept: true,
+        }];
+
+        let store = RouteStore::load(&routes).unwrap();
+        let route = store
+            .get("claude-oauth")
+            .expect("route should be loaded by normalised prefix");
+        assert!(route.tls_intercept);
+    }
+
+    #[test]
+    fn test_oauth_capture_match_resolved_for_intercept_route() {
+        let routes = vec![RouteConfig {
+            prefix: "claude-oauth".to_string(),
+            upstream: "https://claude.ai".to_string(),
+            credential_key: None,
+            inject_mode: crate::config::InjectMode::OauthCapture {
+                token_url_match: "/api/oauth/token".to_string(),
+                refresh_url_match: "/api/oauth/refresh".to_string(),
+            },
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            tls_intercept: true,
+        }];
+
+        let store = RouteStore::load(&routes).unwrap();
+        let oauth = store
+            .oauth_capture_for("claude.ai:443")
+            .expect("intercept route with OauthCapture mode should resolve");
+        assert_eq!(oauth.token_url_match, "/api/oauth/token");
+        assert_eq!(oauth.refresh_url_match, "/api/oauth/refresh");
+
+        // matches() honours both URL fields and rejects everything else.
+        assert!(oauth.matches("/api/oauth/token"));
+        assert!(oauth.matches("/api/oauth/refresh"));
+        assert!(!oauth.matches("/api/oauth/authorize"));
+        assert!(!oauth.matches("/api/oauth/token/extra"));
+    }
+
+    #[test]
+    fn test_oauth_capture_for_returns_none_when_intercept_disabled() {
+        // Even with OauthCapture inject_mode, a route without
+        // tls_intercept does not enter the capture path — the rewriter
+        // is only safe to run on intercepted (TLS-terminated) traffic.
+        let routes = vec![RouteConfig {
+            prefix: "claude-oauth".to_string(),
+            upstream: "https://claude.ai".to_string(),
+            credential_key: None,
+            inject_mode: crate::config::InjectMode::OauthCapture {
+                token_url_match: "/api/oauth/token".to_string(),
+                refresh_url_match: "/api/oauth/token".to_string(),
+            },
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            tls_intercept: false,
+        }];
+
+        let store = RouteStore::load(&routes).unwrap();
+        assert!(store.oauth_capture_for("claude.ai:443").is_none());
     }
 
     #[test]
@@ -555,6 +871,8 @@ mod tests {
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             tls_connector: None,
+            tls_intercept: false,
+            oauth_capture: None,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));
@@ -825,6 +1143,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             tls_client_cert: Some(cert_path.to_str().unwrap().to_string()),
             tls_client_key: Some(key_path.to_str().unwrap().to_string()),
             oauth2: None,
+            tls_intercept: false,
         }];
 
         let store = RouteStore::load(&routes).expect("should load mTLS route");

@@ -8,12 +8,14 @@
 //! Other methods  -> [`reverse`] handler (credential injection)
 
 use crate::audit;
+use crate::broker::TokenResolver;
 use crate::config::ProxyConfig;
 use crate::connect;
 use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
 use crate::external;
 use crate::filter::ProxyFilter;
+use crate::intercept::{self, InterceptCa};
 use crate::reverse;
 use crate::route::RouteStore;
 use crate::token;
@@ -163,6 +165,28 @@ impl ProxyHandle {
     }
 }
 
+/// Runtime-only inputs to [`start_with_runtime`] that are not part of
+/// the JSON-serializable [`ProxyConfig`].
+///
+/// New seams (token broker, intercept CA, future shared resources)
+/// live here so the on-disk config schema stays untouched and
+/// `ProxyConfig` can keep its `Serialize` / `Deserialize` derives.
+#[derive(Default, Clone)]
+pub struct ProxyRuntime {
+    /// Optional credential broker the proxy can call into. Populated by
+    /// the CLI from its in-process `TokenBroker` when OAuth capture is
+    /// enabled (Layer 1 of `2026-04-27-capture-anthropic-auth.md`).
+    /// `None` means OAuth-capture features are inert.
+    pub token_resolver: Option<Arc<dyn TokenResolver>>,
+
+    /// Optional session CA used by the TLS-intercept dispatcher. When
+    /// `Some`, CONNECTs whose target host matches a route with
+    /// `tls_intercept: true` are TLS-terminated by this CA instead of
+    /// passing through as a transparent tunnel. `None` disables the
+    /// intercept path even if routes are flagged.
+    pub intercept_ca: Option<Arc<InterceptCa>>,
+}
+
 /// Shared state for the proxy server.
 struct ProxyState {
     filter: ProxyFilter,
@@ -182,16 +206,36 @@ struct ProxyState {
     /// Matcher for hosts that bypass the external proxy and route direct.
     /// Built once at startup from `ExternalProxyConfig.bypass_hosts`.
     bypass_matcher: external::BypassMatcher,
+    /// Shared credential broker. `None` when OAuth capture is not in
+    /// use; the TLS-intercept dispatcher checks this before activating
+    /// the body-rewriter path.
+    token_resolver: Option<Arc<dyn TokenResolver>>,
+    /// Per-session TLS-interception CA. When `Some` *and* a CONNECT
+    /// target matches a route with `tls_intercept: true`, the
+    /// dispatcher hands off to [`crate::intercept::handle_intercept`]
+    /// instead of opening a transparent tunnel.
+    intercept_ca: Option<Arc<InterceptCa>>,
 }
 
-/// Start the proxy server.
+/// Start the proxy server with default runtime inputs (no token
+/// broker, etc.). Equivalent to
+/// `start_with_runtime(config, ProxyRuntime::default())`.
+pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
+    start_with_runtime(config, ProxyRuntime::default()).await
+}
+
+/// Start the proxy server with explicit runtime inputs.
 ///
 /// Binds to `config.bind_addr:config.bind_port` (port 0 = OS-assigned),
 /// generates a session token, and begins accepting connections.
 ///
+/// `runtime` carries non-config handles (e.g. a shared
+/// [`TokenResolver`]) that cannot live in the JSON-serializable
+/// [`ProxyConfig`].
+///
 /// Returns a `ProxyHandle` with the assigned port and session token.
 /// The server runs until the handle is dropped or `shutdown()` is called.
-pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
+pub async fn start_with_runtime(config: ProxyConfig, runtime: ProxyRuntime) -> Result<ProxyHandle> {
     // Generate session token
     let session_token = token::generate_session_token()?;
 
@@ -324,6 +368,8 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
         active_connections: AtomicUsize::new(0),
         audit_log: Arc::clone(&audit_log),
         bypass_matcher,
+        token_resolver: runtime.token_resolver,
+        intercept_ca: runtime.intercept_ca,
     });
 
     // Spawn accept loop as a task within the current runtime.
@@ -459,6 +505,60 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         .rsplit_once(':')
                         .map(|(h, p)| (h, p.parse::<u16>().unwrap_or(443)))
                         .unwrap_or((&host_port, 443));
+
+                    // Intercept-eligible route + a configured CA → hand
+                    // off to the TLS-intercept dispatcher instead of the
+                    // 403 below. Layer 1.3 of the OAuth-capture design.
+                    if state.route_store.is_intercept_upstream(&host_port) {
+                        if let Some(ca) = state.intercept_ca.clone() {
+                            let check = state.filter.check_host(host, port).await?;
+                            if !check.result.is_allowed() {
+                                let reason = check.result.reason();
+                                audit::log_denied(
+                                    Some(&state.audit_log),
+                                    audit::ProxyMode::Connect,
+                                    host,
+                                    port,
+                                    &reason,
+                                );
+                                let response = format!(
+                                    "HTTP/1.1 403 Forbidden: {}\r\nContent-Length: 0\r\n\r\n",
+                                    reason
+                                );
+                                stream.write_all(response.as_bytes()).await?;
+                                return Ok(());
+                            }
+                            // Look up the OAuth-capture match config
+                            // (if any) and clone the resolver handle so
+                            // they can be moved into the per-request
+                            // forwarder closure.
+                            let oauth_capture =
+                                state.route_store.oauth_capture_for(&host_port).cloned();
+                            let token_resolver = state.token_resolver.clone();
+                            return intercept::handle_intercept(
+                                stream,
+                                host,
+                                port,
+                                &check.resolved_addrs,
+                                ca,
+                                state.tls_connector.clone(),
+                                oauth_capture.as_ref(),
+                                token_resolver,
+                                Some(&state.audit_log),
+                            )
+                            .await;
+                        }
+                        // Route is intercept-eligible but no CA was
+                        // provided to the proxy — operator-side
+                        // misconfiguration. Fall through to the
+                        // existing block-403 so behaviour stays safe;
+                        // emit a loud log so the cause is visible.
+                        warn!(
+                            "intercept-eligible route {} matched but no intercept CA configured — blocking",
+                            host_port
+                        );
+                    }
+
                     debug!(
                         "Blocked CONNECT to route upstream {} — use reverse proxy path instead",
                         authority
@@ -550,6 +650,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             filter: &state.filter,
             tls_connector: &state.tls_connector,
             audit_log: Some(&state.audit_log),
+            token_resolver: state.token_resolver.clone(),
         };
         reverse::handle_reverse_proxy(first_line, &mut stream, &header_bytes, &ctx, &buffered).await
     } else {
@@ -622,6 +723,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             }],
             ..Default::default()
         };
@@ -667,6 +769,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             }],
             ..Default::default()
         };
@@ -721,6 +824,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             }],
             ..Default::default()
         };
@@ -781,6 +885,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    tls_intercept: false,
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -799,6 +904,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    tls_intercept: false,
                 },
             ],
             ..Default::default()
@@ -861,6 +967,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             }],
             ..Default::default()
         };
@@ -895,6 +1002,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             }],
             ..Default::default()
         };
@@ -946,6 +1054,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             }],
             ..Default::default()
         };
@@ -984,6 +1093,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                tls_intercept: false,
             }],
             ..Default::default()
         };

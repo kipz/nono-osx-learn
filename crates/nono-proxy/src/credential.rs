@@ -163,8 +163,20 @@ impl CredentialStore {
                             base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
                         Zeroizing::new(format!("Basic {}", encoded))
                     }
-                    // For url_path and query_param, header_value is not used
+                    // For url_path and query_param, header_value is not used.
                     InjectMode::UrlPath | InjectMode::QueryParam => Zeroizing::new(String::new()),
+                    // OauthCapture is a *response*-side mode: secrets
+                    // are captured at runtime by the TLS-intercept body
+                    // rewriter, not pre-loaded from the keystore. If a
+                    // route mixes OauthCapture with credential_key it's
+                    // a misconfiguration; warn and emit no header_value.
+                    InjectMode::OauthCapture { .. } => {
+                        warn!(
+                            "Route '{}' has inject_mode=oauth_capture together with credential_key='{}': credential_key is ignored for OauthCapture routes",
+                            normalized_prefix, key
+                        );
+                        Zeroizing::new(String::new())
+                    }
                 };
 
                 credentials.insert(
@@ -444,6 +456,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            tls_intercept: false,
         }];
         let store = CredentialStore::load(&routes, &tls);
         assert!(store.is_ok());
@@ -546,6 +559,7 @@ mod tests {
                 client_secret: "env://TEST_OAUTH2_CLIENT_SECRET".to_string(),
                 scope: String::new(),
             }),
+            tls_intercept: false,
         }];
 
         let store = CredentialStore::load(&routes, &tls);

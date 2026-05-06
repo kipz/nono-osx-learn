@@ -1005,6 +1005,15 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         }
     }
 
+    if profile.oauth_capture {
+        println!();
+        println!(
+            "  {} {}",
+            theme::fg("OAuth capture:", t.subtext).bold(),
+            theme::fg("enabled", t.text)
+        );
+    }
+
     Ok(())
 }
 
@@ -1151,6 +1160,10 @@ fn profile_to_json(
 
     if !profile.unsafe_macos_seatbelt_rules.is_empty() {
         val["unsafe_macos_seatbelt_rules"] = serde_json::json!(profile.unsafe_macos_seatbelt_rules);
+    }
+
+    if profile.oauth_capture {
+        val["oauth_capture"] = serde_json::json!(true);
     }
 
     val
@@ -2492,6 +2505,17 @@ fn resolve_to_manifest(
             profile::InjectMode::UrlPath => manifest::InjectMode::UrlPath,
             profile::InjectMode::QueryParam => manifest::InjectMode::QueryParam,
             profile::InjectMode::BasicAuth => manifest::InjectMode::BasicAuth,
+            profile::InjectMode::OauthCapture { .. } => {
+                // OauthCapture is only valid on built-in tls_intercept
+                // routes (Layer 1 of the OAuth-capture design); custom
+                // credentials in user profiles cannot use it. The
+                // profile validator already rejects this combination,
+                // so reaching this branch indicates corrupted state.
+                return Err(NonoError::ConfigParse(format!(
+                    "custom credential '{}' has unsupported inject_mode=oauth_capture",
+                    name
+                )));
+            }
         };
 
         let endpoint_rules: Vec<manifest::EndpointRule> = cred

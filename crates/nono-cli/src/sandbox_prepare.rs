@@ -354,14 +354,17 @@ pub(crate) fn should_auto_enable_claude_launch_services(
 
     match load_claude_oauth_state() {
         Ok(Some(oauth)) => {
+            // A `nono_`-prefixed value is an OAuth-capture broker nonce, not a
+            // real token — treat it the same as "no credential" so LaunchServices
+            // gets auto-enabled and the user can complete a fresh /login.
             let has_access = oauth
                 .access_token
                 .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
+                .is_some_and(|v| !v.trim().is_empty() && !v.starts_with("nono_"));
             let has_refresh = oauth
                 .refresh_token
                 .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
+                .is_some_and(|v| !v.trim().is_empty() && !v.starts_with("nono_"));
             !has_access || !has_refresh
         }
         Ok(None) => true,
@@ -437,6 +440,11 @@ pub(crate) struct PreparedSandbox {
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     #[allow(dead_code)]
     pub(crate) mediation: crate::mediation::MediationConfig,
+    /// Profile-driven opt-in for the OAuth-capture proxy path. When true,
+    /// the proxy installs intercept routes for the Anthropic OAuth token
+    /// endpoints, wires the broker, and rewrites response bodies to
+    /// substitute real tokens with `nono_<hex>` nonces.
+    pub(crate) oauth_capture: bool,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1013,6 +1021,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 override_deny_paths: Vec::new(),
                 allowed_env_vars: None,
                 mediation: crate::mediation::MediationConfig::default(),
+                oauth_capture: false,
             },
             args,
             silent,
@@ -1075,6 +1084,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         };
 
         precreate(&home_path.join(".claude.json.lock"), false);
+        precreate(&home_path.join(".cache/claude"), true);
         precreate(&home_path.join(".cache/claude-cli-nodejs"), true);
 
         // Claude Code writes ~/.claude.json atomically via temp files named
@@ -1259,6 +1269,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|p| p.mediation.clone())
         .unwrap_or_default();
+    let profile_oauth_capture = loaded_profile
+        .as_ref()
+        .map(|p| p.oauth_capture)
+        .unwrap_or(false);
     let profile_secrets = loaded_profile
         .map(|profile| profile.env_credentials.mappings)
         .unwrap_or_default();
@@ -1287,6 +1301,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             override_deny_paths,
             allowed_env_vars: profile_allowed_env_vars,
             mediation: profile_mediation,
+            oauth_capture: profile_oauth_capture,
         },
         args,
         silent,

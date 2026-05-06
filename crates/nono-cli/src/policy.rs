@@ -134,6 +134,8 @@ pub struct ProfileDef {
     pub unsafe_macos_seatbelt_rules: Vec<String>,
     #[serde(default)]
     pub mediation: crate::mediation::MediationConfig,
+    #[serde(default)]
+    pub oauth_capture: bool,
 }
 
 impl ProfileDef {
@@ -172,6 +174,7 @@ impl ProfileDef {
             command_args: self.command_args.clone(),
             unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
             mediation: self.mediation.clone(),
+            oauth_capture: self.oauth_capture,
         }
     }
 }
