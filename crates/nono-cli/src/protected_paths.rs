@@ -521,8 +521,10 @@ mod tests {
             &policy_group_denies,
         );
 
-        let merged_strs: Vec<String> =
-            merged.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let merged_strs: Vec<String> = merged
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert!(
             merged_strs.iter().any(|p| p.ends_with("/.nono")),
             "expected state root in merged set, got: {:?}",

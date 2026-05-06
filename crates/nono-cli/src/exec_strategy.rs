@@ -681,26 +681,26 @@ pub fn execute_supervised(
                 protected_paths,
                 cgroup_id,
             )
-                .map_err(|e| {
-                    let detail = match e {
-                        nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => {
-                            "bpf is not in /sys/kernel/security/lsm. The host kernel \
+            .map_err(|e| {
+                let detail = match e {
+                    nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => {
+                        "bpf is not in /sys/kernel/security/lsm. The host kernel \
                              must boot with lsm=...,bpf in the cmdline (add it to the \
                              grub cmdline or equivalent for your platform)."
-                                .to_string()
-                        }
-                        other => format!(
-                            "{other}. If you expected BPF-LSM to be active, verify \
+                            .to_string()
+                    }
+                    other => format!(
+                        "{other}. If you expected BPF-LSM to be active, verify \
                              CAP_BPF is in the broker's effective capability set \
                              (e.g. `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
                              /usr/bin/nono`)."
-                        ),
-                    };
-                    nono::error::NonoError::SandboxInit(format!(
-                        "BPF-LSM mediation filter required for mediation but install \
+                    ),
+                };
+                nono::error::NonoError::SandboxInit(format!(
+                    "BPF-LSM mediation filter required for mediation but install \
                          failed: {detail}"
-                    ))
-                })?;
+                ))
+            })?;
             info!(
                 "BPF-LSM mediation filter active: cgroup_id={} deny_entries={} \
                  protected_entries={} (sole enforcement path for mediated commands; \

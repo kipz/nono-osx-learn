@@ -448,8 +448,10 @@ mod tests {
         write_executable(&real, b"#!/bin/sh\necho real\n");
         std::fs::write(sources_dir.join("yarn"), real.display().to_string()).expect("sidecar");
 
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(sources_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert_eq!(resolved.as_deref(), Some(real.as_path()));
     }
 
@@ -463,14 +465,12 @@ mod tests {
 
         let real = bin_dir.join("yarn");
         write_executable(&real, b"#!/bin/sh\n");
-        std::fs::write(
-            sources_dir.join("yarn"),
-            format!("{}\n", real.display()),
-        )
-        .expect("sidecar");
+        std::fs::write(sources_dir.join("yarn"), format!("{}\n", real.display())).expect("sidecar");
 
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(sources_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert_eq!(resolved.as_deref(), Some(real.as_path()));
     }
 
@@ -481,8 +481,10 @@ mod tests {
         std::fs::create_dir_all(&sources_dir).expect("sources dir");
         std::fs::write(sources_dir.join("yarn"), "/nonexistent/yarn").expect("sidecar");
 
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(sources_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert!(resolved.is_none());
     }
 
@@ -502,8 +504,10 @@ mod tests {
 
         std::fs::write(sources_dir.join("yarn"), real.display().to_string()).expect("sidecar");
 
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(sources_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert!(resolved.is_none());
     }
 
@@ -516,8 +520,10 @@ mod tests {
     #[test]
     fn sources_sidecar_returns_none_when_sidecar_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(tmp.path().to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(tmp.path().to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert!(resolved.is_none());
     }
 
@@ -537,8 +543,11 @@ mod tests {
             shim_dir.to_string_lossy(),
             real_dir.to_string_lossy()
         );
-        let resolved =
-            resolve_from_path_at(&path_var, Some(shim_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_path_at(
+            &path_var,
+            Some(shim_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert_eq!(resolved.as_deref(), Some(real_dir.join("yarn").as_path()));
     }
 

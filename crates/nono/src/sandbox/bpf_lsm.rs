@@ -370,8 +370,7 @@ mod imp {
         // dentry walker follows `d_parent` (the source filesystem
         // tree, not the mount tree), so for paths reached through
         // a bind mount we need the source's inode in the map too.
-        let protected_entries =
-            collect_protected_root_entries(protected_paths)?;
+        let protected_entries = collect_protected_root_entries(protected_paths)?;
         if protected_entries.len() > MAX_PROTECTED_ROOTS {
             return Err(BpfLsmError::TooManyProtectedRoots {
                 got: protected_entries.len(),
@@ -382,11 +381,7 @@ mod imp {
         for entry in &protected_entries {
             let key_bytes: [u8; std::mem::size_of::<DenyKey>()] =
                 unsafe { std::mem::transmute(*entry) };
-            protected_map.update(
-                &key_bytes,
-                std::slice::from_ref(&one),
-                MapFlags::ANY,
-            )?;
+            protected_map.update(&key_bytes, std::slice::from_ref(&one), MapFlags::ANY)?;
         }
 
         // Populate the scope map. The BPF program reads this and

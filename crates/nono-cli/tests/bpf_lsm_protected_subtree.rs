@@ -134,16 +134,13 @@ impl ProtectedHarness {
         std::fs::create_dir_all(&nono_dir).expect("create nono dir");
 
         // Pre-existing files used by individual tests.
-        std::fs::write(workdir.join("allowed.txt"), b"OK")
-            .expect("create workdir/allowed.txt");
+        std::fs::write(workdir.join("allowed.txt"), b"OK").expect("create workdir/allowed.txt");
         std::fs::write(protected_dir.join("secret.txt"), b"SECRET")
             .expect("create protected/secret.txt");
-        std::fs::write(nono_dir.join("state.db"), b"NONO_STATE")
-            .expect("create .nono/state.db");
+        std::fs::write(nono_dir.join("state.db"), b"NONO_STATE").expect("create .nono/state.db");
 
         let profile = tmp.path().join("profile.json");
-        std::fs::write(&profile, profile_json(&home, &protected_dir))
-            .expect("write profile");
+        std::fs::write(&profile, profile_json(&home, &protected_dir)).expect("write profile");
 
         Self {
             _tmp: tmp,
@@ -288,7 +285,8 @@ fn write_protected_file_denied() {
     let out = h.run_nono(&["sh", "-c", &format!("echo HACKED > {target}")]);
     let body = std::fs::read_to_string(&target).unwrap_or_default();
     assert_eq!(
-        body, "SECRET",
+        body,
+        "SECRET",
         "protected file was overwritten despite deny; got {body:?}; {}",
         out.combined()
     );
@@ -373,11 +371,7 @@ fn rename_into_protected_denied() {
     skip_unless_mediation_capable!();
     let h = ProtectedHarness::new();
     let src = h.workdir.join("allowed.txt").display().to_string();
-    let dst = h
-        .protected_dir
-        .join("smuggled.txt")
-        .display()
-        .to_string();
+    let dst = h.protected_dir.join("smuggled.txt").display().to_string();
     let out = h.run_nono(&["mv", &src, &dst]);
     assert!(
         h.workdir.join("allowed.txt").exists(),
@@ -411,11 +405,7 @@ fn rename_out_of_protected_denied() {
 fn create_in_protected_denied() {
     skip_unless_mediation_capable!();
     let h = ProtectedHarness::new();
-    let target = h
-        .protected_dir
-        .join("new_file.txt")
-        .display()
-        .to_string();
+    let target = h.protected_dir.join("new_file.txt").display().to_string();
     let out = h.run_nono(&["sh", "-c", &format!("echo data > {target}")]);
     assert!(
         !h.protected_dir.join("new_file.txt").exists(),
@@ -449,8 +439,7 @@ fn read_via_bind_mount_denied() {
     let h = ProtectedHarness::new();
     let bind_src = h._tmp.path().join("bind_src");
     std::fs::create_dir_all(&bind_src).expect("create bind source");
-    std::fs::write(bind_src.join("via_bind.txt"), b"BIND_LEAK")
-        .expect("create bind file");
+    std::fs::write(bind_src.join("via_bind.txt"), b"BIND_LEAK").expect("create bind file");
 
     // Bind-mount over a subdir of the protected root.
     let bind_target = h.protected_dir.join("bound");
@@ -537,7 +526,8 @@ fn session_starts_with_parent_grant_and_opt_in() {
     // pre-flight rejects the parent grant; Phase 2.4 lifts the gate.
     let out = h.run_nono(&["true"]);
     assert_eq!(
-        out.exit_code, 0,
+        out.exit_code,
+        0,
         "session should start cleanly with allow_parent_of_protected; {}",
         out.combined()
     );

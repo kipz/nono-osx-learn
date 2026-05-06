@@ -986,7 +986,7 @@ mod tests {
                 proxy_port,
                 proxy_bind_ports,
                 mediation_deny_set: Vec::new(),
-            mediation_protected_paths: Vec::new(),
+                mediation_protected_paths: Vec::new(),
                 mediation_shim_dir: None,
                 mediation_audit_log_dir: None,
             }
