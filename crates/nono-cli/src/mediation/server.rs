@@ -339,10 +339,10 @@ async fn recv_three_fds(
             let mut fds = [-1i32; 3];
             // SAFETY: CMSG_DATA points at the fd payload for this header.
             unsafe {
-                for i in 0..n {
+                for (i, fd) in fds[..n].iter_mut().enumerate() {
                     std::ptr::copy_nonoverlapping(
                         libc::CMSG_DATA(cmsg).add(i * fd_size),
-                        (&mut fds[i] as *mut RawFd).cast::<u8>(),
+                        (fd as *mut RawFd).cast::<u8>(),
                         fd_size,
                     );
                 }

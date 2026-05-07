@@ -18,6 +18,17 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{extension_consume, extension_issue_file, extension_release};
 
+// BPF-LSM exec filter loader. Always module-visible so callers
+// can reference the API without target-cfg guards; the
+// off-Linux / feature-disabled build provides stubs that return
+// `Unsupported`.
+pub mod bpf_lsm;
+
+// Userspace audit reader for the BPF-LSM ring buffer. Linux+feature
+// only; non-Linux builds elide this module entirely.
+#[cfg(all(target_os = "linux", feature = "bpf-lsm"))]
+pub mod bpf_audit;
+
 // Re-export Linux Landlock ABI detection
 #[cfg(target_os = "linux")]
 pub use linux::{detect_abi, DetectedAbi};
