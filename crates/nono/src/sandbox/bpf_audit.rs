@@ -55,10 +55,10 @@ const REASON_PROTECTED_MUTATE_DENY: u8 = 4;
 /// - `reason` (only on deny): `"exec_deny"` / `"open_deny"` /
 ///   `"protected_open_deny"` / `"protected_mutate_deny"`.
 /// - `exit_code`: `Some(126)` on deny; absent on allow.
-/// - `path`: canonical resolved path of the binary; populated for
-///   deny events (the inode is in the deny set so the broker has
-///   the path); absent on allow_unmediated (an arbitrary inode
-///   the broker has no entry for).
+/// - `path`: path of the binary; for deny events resolved from the
+///   broker's deny-set table (canonical); for allow_unmediated
+///   bprm events taken from `bprm->filename` as captured by the
+///   BPF program.
 ///
 /// The shim's own `mediation::AuditEvent` shape (in `nono-cli`)
 /// also lands in the same JSONL file; consumers distinguish by
@@ -84,9 +84,10 @@ pub struct FilterAuditEvent {
 /// in-kernel C struct layout, so the Rust side is `#[repr(C)]`
 /// with the same field order and padding.
 ///
-/// Path resolution is userspace-side: the BPF program emits
-/// (dev, ino) and the reader maps that to a canonical path via
-/// the broker's deny set table.
+/// For `bprm_check_security` events the `filename` field carries
+/// the path as-passed to execve (copied from `bprm->filename` by
+/// `bpf_probe_read_kernel_str`). For `file_open` events it is
+/// zeroed. Always NUL-terminated; decode up to the first `\0`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct AuditRecord {
@@ -98,6 +99,7 @@ struct AuditRecord {
     pid: u32,
     dev: u64,
     ino: u64,
+    filename: [u8; 256],
 }
 
 const AUDIT_RECORD_SIZE: usize = std::mem::size_of::<AuditRecord>();
@@ -251,11 +253,26 @@ fn handle_record(
         unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<AuditRecord>()) };
 
     // Resolve (dev, ino) → canonical path via the broker's deny
-    // set table. `None` means the agent ran something the broker
-    // doesn't know about (typical for allow_unmediated events).
+    // set table. For allow_unmediated bprm events the inode won't
+    // be in the deny set, so fall back to the filename the BPF
+    // program copied from bprm->filename.
+    let bpf_path = if raw_record.source == SRC_BPRM {
+        let nul = raw_record
+            .filename
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(256);
+        std::str::from_utf8(&raw_record.filename[..nul])
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
     let resolved_path = inode_to_path
         .get(&(raw_record.dev, raw_record.ino))
-        .cloned();
+        .cloned()
+        .or(bpf_path);
     let path_str = resolved_path
         .as_ref()
         .map(|p| p.display().to_string())

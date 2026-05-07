@@ -108,19 +108,18 @@ char LICENSE[] SEC("license") = "GPL";
  * `~/.nono/sessions/audit.jsonl`. Layout is Rust-side mirrored
  * in `crates/nono/src/sandbox/bpf_audit.rs`.
  *
- * Path resolution happens userspace-side: for deny events the
- * (dev, ino) is one of the canonicalized `mediation.commands`
- * entries the broker already knows about, and the userspace
- * reader maps (dev, ino) → canonical path via that table. For
- * allow_unmediated bprm events the path is left unresolved —
- * these are audit decoration only, not security-relevant.
+ * Path resolution: for deny events the (dev, ino) is one of the
+ * canonicalized `mediation.commands` entries the broker already
+ * knows about, and the userspace reader maps (dev, ino) → canonical
+ * path via that table. For allow_unmediated bprm events `filename`
+ * carries the path as-passed to execve, copied from `bprm->filename`
+ * via bpf_probe_read_kernel_str. This avoids a racy userspace lookup
+ * for the common case.
  *
- * We intentionally don't call `bpf_d_path()` from the BPF
- * program: the verifier rejects `&bprm->file->f_path` as a
- * non-trusted pointer in BPF-LSM context, and the simpler
- * stack-copy workaround adds verifier complexity without
- * security benefit since userspace can resolve the deny-set
- * case from its own bookkeeping.
+ * We intentionally don't call `bpf_d_path()`: the verifier rejects
+ * `&bprm->file->f_path` as a non-trusted pointer in BPF-LSM context.
+ * `bprm->filename` is a direct field on the trusted `bprm` parameter
+ * and is safe to read with bpf_probe_read_kernel_str.
  */
 struct audit_record {
     __u64 ts_ns;
@@ -131,6 +130,7 @@ struct audit_record {
     __u32 pid;
     __u64 dev;
     __u64 ino;
+    char  filename[256];
 };
 
 /* Identity key for a binary's underlying inode. */
@@ -365,6 +365,8 @@ int BPF_PROG(check_exec, struct linux_binprm *bprm, int ret)
             r->verdict = AUDIT_VERDICT_ALLOW;
             r->reason = AUDIT_REASON_NONE;
         }
+        const char *fname = BPF_CORE_READ(bprm, filename);
+        bpf_probe_read_kernel_str(r->filename, sizeof(r->filename), fname);
         bpf_ringbuf_submit(r, 0);
     }
 

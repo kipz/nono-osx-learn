@@ -687,6 +687,36 @@ fn audit_emits_open_deny_for_blocked_read() {
     );
 }
 
+/// `allow_unmediated` audit records must carry a populated `command`
+/// and `path` field. Prior to the fix, the BPF audit record carried
+/// only `(dev, ino)` and userspace had no inode→path mapping for
+/// non-deny-set binaries, leaving both fields empty.
+#[test]
+fn allow_unmediated_audit_records_have_command() {
+    skip_unless_mediation_capable!();
+    let h = MediationHarness::new();
+    let _ = h.run_nono(&["sh", "-c", "/bin/ls /bin > /dev/null"]);
+    let event = h.wait_for_audit_event(|e| {
+        e.get("action_type").and_then(|v| v.as_str()) == Some("allow_unmediated")
+            && e.get("command").and_then(|v| v.as_str()) == Some("ls")
+    });
+    assert!(
+        event.is_some(),
+        "expected allow_unmediated event with command=\"ls\"; events={:?}",
+        h.read_audit_events()
+    );
+    let evt = event.expect("checked Some above");
+    let path = evt.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !path.is_empty(),
+        "allow_unmediated event must have a non-empty path field; evt={evt:?}"
+    );
+    assert!(
+        path.ends_with("/ls"),
+        "path must point to the ls binary; got path={path:?}; evt={evt:?}"
+    );
+}
+
 /// PATH-based shim invocations must NOT produce a BPF
 /// `allow_unmediated` event for the shim's own exec — the
 /// userspace audit reader filters those out via the shim_dir
