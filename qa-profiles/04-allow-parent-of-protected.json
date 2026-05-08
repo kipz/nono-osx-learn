@@ -1,0 +1,19 @@
+{
+    "meta": {
+        "name": "qa-allow-parent-of-protected",
+        "description": "Exercises the BPF-LSM filesystem deny-within-allow path on Linux (Seatbelt deny rules on macOS). Grants a parent ($HOME) and lists a child as add_deny_access; expects the child to be inaccessible at runtime even though its parent is granted. The opt-in `allow_parent_of_protected: true` is required — without it, the broad parent grant would be rejected at sandbox init because it overlaps nono's own state directory ~/.nono."
+    },
+    "allow_parent_of_protected": true,
+    "policy": {
+        "add_deny_access": [
+            "$HOME/.config/qa-secret"
+        ]
+    },
+    "filesystem": {
+        "allow": [
+            "$HOME"
+        ]
+    },
+    "network": { "block": false },
+    "workdir": { "access": "readwrite" }
+}

@@ -102,6 +102,11 @@ pub(crate) struct ExecutionFlags {
     pub(crate) proxy: ProxyLaunchOptions,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) mediation: crate::mediation::MediationConfig,
+    /// BPF-LSM protected_roots paths: nono's state root plus profile
+    /// `filesystem.deny` entries. Threaded down to
+    /// `install_mediation_filter` to populate the kernel deny map.
+    /// Empty on non-Linux. Empty when no protected paths are needed.
+    pub(crate) protected_paths: Vec<PathBuf>,
 }
 
 impl ExecutionFlags {
@@ -126,6 +131,7 @@ impl ExecutionFlags {
             proxy: ProxyLaunchOptions::default(),
             allowed_env_vars: None,
             mediation: crate::mediation::MediationConfig::default(),
+            protected_paths: Vec::new(),
         })
     }
 }
@@ -254,6 +260,7 @@ pub(crate) fn prepare_run_launch_plan(
             proxy,
             allowed_env_vars: prepared.allowed_env_vars,
             mediation: prepared.mediation,
+            protected_paths: prepared.protected_paths,
         },
     })
 }

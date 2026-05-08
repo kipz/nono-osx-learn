@@ -437,6 +437,12 @@ pub(crate) struct PreparedSandbox {
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     #[allow(dead_code)]
     pub(crate) mediation: crate::mediation::MediationConfig,
+    /// Paths that the BPF-LSM `protected_roots` map should cover for
+    /// this session: nono's own state root (~/.nono) plus any
+    /// `filesystem.deny` entries from the profile. Linux-only;
+    /// on macOS the same paths are denied by Seatbelt rules emitted via
+    /// `caps.platform_rules()` instead, so this is empty.
+    pub(crate) protected_paths: Vec<PathBuf>,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1014,6 +1020,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 bypass_protection_paths: Vec::new(),
                 allowed_env_vars: None,
                 mediation: crate::mediation::MediationConfig::default(),
+                protected_paths: Vec::new(),
             },
             args,
             silent,
@@ -1250,6 +1257,20 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     )?;
     protected_paths::emit_protected_root_deny_rules(protected_roots.as_paths(), &mut caps)?;
 
+    // Compute the BPF-LSM protected_roots set: nono's state roots plus
+    // any filesystem.deny entries the profile declares. Linux-only at
+    // runtime — on macOS this returns empty; the same paths are covered
+    // by Seatbelt rules emitted above and by emit_protected_root_deny_rules.
+    let profile_filesystem_deny: Vec<String> = loaded_profile
+        .as_ref()
+        .map(|p| p.filesystem.deny.clone())
+        .unwrap_or_default();
+    let bpf_protected_paths = protected_paths::bpf_lsm_protected_roots_for_session(
+        protected_roots.as_paths(),
+        &profile_filesystem_deny,
+        &prepared_deny_paths,
+    );
+
     if needs_unlink_overrides {
         policy::apply_unlink_overrides(&mut caps);
     }
@@ -1290,6 +1311,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             bypass_protection_paths,
             allowed_env_vars: profile_allowed_env_vars,
             mediation: profile_mediation,
+            protected_paths: bpf_protected_paths,
         },
         args,
         silent,

@@ -250,6 +250,7 @@ mod tests {
             bypass_protection_paths: Vec::new(),
             allowed_env_vars: None,
             mediation: mediation::MediationConfig::default(),
+            protected_paths: Vec::new(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -294,6 +295,7 @@ mod tests {
             bypass_protection_paths: Vec::new(),
             allowed_env_vars: None,
             mediation: mediation::MediationConfig::default(),
+            protected_paths: Vec::new(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
