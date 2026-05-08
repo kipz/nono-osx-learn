@@ -262,25 +262,32 @@ pub async fn apply(
                 }
             }
 
-            // Buffered intercept paths: the passed stdio fds are not used —
-            // the duplicated fds drop here, leaving the originals open in the
-            // shim so it can write the buffered response to them.
-            drop(stdin_fd);
-            drop(stdout_fd);
-            drop(stderr_fd);
-
             return match &rule.action {
-                ResolvedAction::Respond { stdout } => (
-                    ShimResponse {
-                        stdout: stdout.clone(),
-                        stderr: String::new(),
-                        exit_code: rule.exit_code,
-                    },
-                    "respond",
-                ),
+                ResolvedAction::Respond { stdout } => {
+                    // Static response — stdio fds are unused. Drop the duplicates
+                    // so the originals stay open in the shim for it to write the
+                    // buffered response to them.
+                    drop(stdin_fd);
+                    drop(stdout_fd);
+                    drop(stderr_fd);
+                    (
+                        ShimResponse {
+                            stdout: stdout.clone(),
+                            stderr: String::new(),
+                            exit_code: rule.exit_code,
+                        },
+                        "respond",
+                    )
+                }
                 ResolvedAction::Capture { script } => {
+                    // Capture issues a nonce in place of the real credential, so
+                    // it must buffer the binary's stdout to inspect it. Drop the
+                    // shim's fds — the binary runs with null stdin / piped stdout.
+                    drop(stdin_fd);
+                    drop(stdout_fd);
+                    drop(stderr_fd);
                     let result = match script {
-                        Some(sh) => exec_script(sh, &request.env, &broker).await,
+                        Some(sh) => exec_script(sh, &request.env, &broker, None).await,
                         None => {
                             // No per-command sandbox during capture — the real binary needs
                             // full access to system resources (e.g. Keychain) to fetch the credential.
@@ -312,16 +319,28 @@ pub async fn apply(
                     )
                 }
                 ResolvedAction::Approve { script } => {
-                    // Run the real binary (or script) and return the actual output.
-                    // Typically used with admin: true to gate behind approval.
+                    // Run the real binary (or script) unsandboxed and stream its
+                    // stdio through the shim's fds. Streaming (rather than
+                    // buffering into ShimResponse) is required for binaries that
+                    // need to read the caller's real stdin — notably the Docker
+                    // credential-helper protocol, which writes the registry
+                    // hostname on stdin and expects JSON creds back on stdout.
                     //
                     // No per-command sandbox is applied (None). The real binary
                     // needs unrestricted access to system resources (e.g. macOS
-                    // Keychain via mach-lookup to securityd) that a Seatbelt
-                    // sandbox would block. Protection comes from the profile
-                    // author's deliberate choice of which commands get `approve`.
+                    // Keychain via mach-lookup to securityd) that a sandbox
+                    // would block. Protection comes from the profile author's
+                    // deliberate choice of which commands get `approve`.
                     let resp = match script {
-                        Some(sh) => exec_script(sh, &request.env, &broker).await,
+                        Some(sh) => {
+                            exec_script(
+                                sh,
+                                &request.env,
+                                &broker,
+                                Some((stdin_fd, stdout_fd, stderr_fd)),
+                            )
+                            .await
+                        }
                         None => {
                             exec_passthrough(
                                 cmd,
@@ -331,7 +350,7 @@ pub async fn apply(
                                 None,
                                 ctx,
                                 commands,
-                                None,
+                                Some((stdin_fd, stdout_fd, stderr_fd)),
                                 request.cwd.as_deref(),
                             )
                             .await
@@ -484,6 +503,7 @@ async fn exec_script(
     script: &str,
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
+    stdio_fds: Option<(OwnedFd, OwnedFd, OwnedFd)>,
 ) -> ShimResponse {
     let env = build_exec_env(sandbox_env, broker);
     let script = script.to_string();
@@ -491,24 +511,44 @@ async fn exec_script(
     let result = tokio::task::spawn_blocking(move || -> Result<ShimResponse> {
         use std::process::{Command, Stdio};
 
-        let child = Command::new("sh")
-            .args(["-c", &script])
-            .env_clear()
-            .envs(&env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(NonoError::CommandExecution)?;
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]).env_clear().envs(&env);
 
-        let output = child
-            .wait_with_output()
-            .map_err(NonoError::CommandExecution)?;
-        Ok(ShimResponse {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            exit_code: output.status.code().unwrap_or(1),
-        })
+        match stdio_fds {
+            Some((stdin_fd, stdout_fd, stderr_fd)) => {
+                // Streaming mode: inherit the shim's fds so the script can read
+                // real stdin from the agent and write directly to its stdout/stderr.
+                // The response carries empty stdout/stderr; only the exit code is meaningful.
+                command
+                    .stdin(Stdio::from(stdin_fd))
+                    .stdout(Stdio::from(stdout_fd))
+                    .stderr(Stdio::from(stderr_fd));
+                let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
+                let status = child.wait().map_err(NonoError::CommandExecution)?;
+                Ok(ShimResponse {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: status.code().unwrap_or(1),
+                })
+            }
+            None => {
+                // Buffered mode: stdout/stderr are captured for inspection
+                // (e.g. Capture's nonce-issuing path).
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let child = command.spawn().map_err(NonoError::CommandExecution)?;
+                let output = child
+                    .wait_with_output()
+                    .map_err(NonoError::CommandExecution)?;
+                Ok(ShimResponse {
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    exit_code: output.status.code().unwrap_or(1),
+                })
+            }
+        }
     })
     .await;
 
