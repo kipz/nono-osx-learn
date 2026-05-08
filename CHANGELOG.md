@@ -2,9 +2,15 @@
 
 ## [Unreleased]
 
+<<<<<<< kipz/fix-mediation-socket-with-allow-domain
+### Bug Fixes
+
+- *(sandbox/macos)* Mediation sockets now reachable when `network.allow_domain` is set. Seatbelt classifies AF_UNIX `connect(2)` as `network-outbound`; under `NetworkMode::ProxyOnly` the base `(deny network*)` blocked the audit/mediation shim's connect to `<session_dir>/{mediation,control,audit}.sock`. Adds a directory-scoped `UnixSocketCapability` for the session dir alongside the existing `FsCapability`. Fixes #33.
+=======
 ### Features
 
 - *(profile)* Mediation now merges across `extends` chains (per-field, with restrictive-wins on `caller_policy.agent_allowed`, `caller_policy.allowed_parents`, and `command_sandbox.network.block`/`keychain_access`). Previously a child profile that declared any `mediation` block fully replaced the base — silently dropping every mediated command the base set up.
+>>>>>>> develop
 
 ## [0.47.0] - 2026-05-05
 
