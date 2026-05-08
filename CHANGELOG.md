@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Bug Fixes
+
+- *(sandbox/macos)* Mediation sockets now reachable when `network.allow_domain` is set. Seatbelt classifies AF_UNIX `connect(2)` as `network-outbound`; under `NetworkMode::ProxyOnly` the base `(deny network*)` blocked the audit/mediation shim's connect to `<session_dir>/{mediation,control,audit}.sock`. Adds a directory-scoped `UnixSocketCapability` for the session dir alongside the existing `FsCapability`. Fixes #33.
+
 ## [0.47.0] - 2026-05-05
 
 ### Bug Fixes
