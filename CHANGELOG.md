@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- *(profile)* Mediation now merges across `extends` chains (per-field, with restrictive-wins on `caller_policy.agent_allowed`, `caller_policy.allowed_parents`, and `command_sandbox.network.block`/`keychain_access`). Previously a child profile that declared any `mediation` block fully replaced the base — silently dropping every mediated command the base set up.
+
 ## [0.47.0] - 2026-05-05
 
 ### Bug Fixes
