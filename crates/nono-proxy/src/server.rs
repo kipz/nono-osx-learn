@@ -197,18 +197,21 @@ impl ProxyHandle {
         // system trust store + the ephemeral session CA, so standard
         // runtimes see a superset of the trust they had before nono.
         //
-        // `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` are
-        // **replacement** semantics — they swap out the default trust
-        // store entirely. `NODE_EXTRA_CA_CERTS` is **additive** — Node
-        // trusts default + this file. Pointing all four at the same bundle
-        // is fine: Node will see the system roots twice (harmless), and
-        // the other runtimes get the union of trust they need.
+        // Replacement semantics (swap out the default store entirely):
+        //   SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, GIT_SSL_CAINFO
+        // Additive semantics (default + this file):
+        //   NODE_EXTRA_CA_CERTS
+        //
+        // Pointing all five at the same bundle is safe: Node sees system
+        // roots twice (harmless), and all other runtimes get the union of
+        // trust they need.
         if let Some(path) = self.intercept_ca_path.as_deref() {
             let path_str = path.to_string_lossy().to_string();
             vars.push(("SSL_CERT_FILE".to_string(), path_str.clone()));
             vars.push(("REQUESTS_CA_BUNDLE".to_string(), path_str.clone()));
             vars.push(("NODE_EXTRA_CA_CERTS".to_string(), path_str.clone()));
-            vars.push(("CURL_CA_BUNDLE".to_string(), path_str));
+            vars.push(("CURL_CA_BUNDLE".to_string(), path_str.clone()));
+            vars.push(("GIT_SSL_CAINFO".to_string(), path_str));
         }
 
         vars
