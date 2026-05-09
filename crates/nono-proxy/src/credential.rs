@@ -134,6 +134,14 @@ impl CredentialStore {
                         );
                         continue;
                     }
+                    Err(nono::NonoError::KeystoreAccess(msg)) => {
+                        warn!(
+                            "Credential '{}' for route '{}' could not be loaded: {}. \
+                             Requests will proceed without credential injection.",
+                            key, normalized_prefix, msg
+                        );
+                        continue;
+                    }
                     Err(e) => return Err(ProxyError::Credential(e.to_string())),
                 };
 
@@ -207,7 +215,8 @@ impl CredentialStore {
                 let client_id =
                     match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, &oauth2.client_id) {
                         Ok(s) => s,
-                        Err(nono::NonoError::SecretNotFound(msg)) => {
+                        Err(nono::NonoError::SecretNotFound(msg))
+                        | Err(nono::NonoError::KeystoreAccess(msg)) => {
                             warn!(
                                 "OAuth2 client_id not available for route '{}': {}. \
                                  Managed-credential requests on this route will be denied.",
@@ -223,7 +232,8 @@ impl CredentialStore {
                     &oauth2.client_secret,
                 ) {
                     Ok(s) => s,
-                    Err(nono::NonoError::SecretNotFound(msg)) => {
+                    Err(nono::NonoError::SecretNotFound(msg))
+                    | Err(nono::NonoError::KeystoreAccess(msg)) => {
                         warn!(
                             "OAuth2 client_secret not available for route '{}': {}. \
                              Managed-credential requests on this route will be denied.",
