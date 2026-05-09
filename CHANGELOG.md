@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.51.0] - 2026-05-09
+
+### Bug Fixes
+
+- *(tls_intercept)* Add authority key identifier to leaf certs
+
+
+### Features
+
+- *(proxy)* Extend ca trust to git clients
+
+- *(proxy)* Enhance audit context for managed auth and harden tls ca dir
+
+- *(audit)* Add structured context to network audit events
+
+- *(proxy)* Add tls interception for l7-bearing connect routes
+
 ## [0.50.1] - 2026-05-08
 
 ### Bug Fixes
