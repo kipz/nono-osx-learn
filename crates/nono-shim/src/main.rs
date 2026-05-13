@@ -295,8 +295,92 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
     response.exit_code
 }
 
+/// Maximum number of nested audit-shim entries permitted for a single command
+/// name before refusing to exec. See `check_and_bump_audit_depth`.
+const AUDIT_DEPTH_LIMIT: u32 = 8;
+
+/// Env-var prefix for the per-name audit-shim depth counter.
+const AUDIT_DEPTH_PREFIX: &str = "NONO_SHIM_AUDIT_DEPTH_";
+
+/// Build the env-var name used to track audit-mode recursion depth for a
+/// command. The command name is uppercased and any non-alphanumeric byte is
+/// replaced with `_` so the resulting identifier is shell-safe.
+fn audit_depth_var(command_name: &str) -> String {
+    let mut s = String::with_capacity(AUDIT_DEPTH_PREFIX.len() + command_name.len());
+    s.push_str(AUDIT_DEPTH_PREFIX);
+    for c in command_name.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_uppercase());
+        } else {
+            s.push('_');
+        }
+    }
+    s
+}
+
+/// Compute the next audit-mode depth counter value, given the current value.
+/// Returns `Ok(new_depth)` when the counter is within bounds, or
+/// `Err(new_depth)` when it would exceed the limit.
+///
+/// Why this exists: in audit mode the shim fork+waits the resolved real
+/// binary. If that binary is itself a runtime-manager shim (e.g. `pyenv`,
+/// `rbenv`, `nodenv`, `asdf`, `jenv`) whose `system` codepath re-resolves the
+/// interpreter via a fresh PATH walk, it can land back on this shim again and
+/// loop. Because the parent process (e.g. a hook invoked by an editor) blocks
+/// on the shim's exit, this manifests as the host fork-bombing instead of
+/// just hanging. A per-name counter catches the class without needing to
+/// know which managers are involved.
+///
+/// Pure on `current` so tests can exercise the bounds logic without touching
+/// process env. The env wrapper lives in `check_and_bump_audit_depth`.
+fn next_audit_depth(current: u32) -> Result<u32, u32> {
+    let next = current.saturating_add(1);
+    if next > AUDIT_DEPTH_LIMIT {
+        Err(next)
+    } else {
+        Ok(next)
+    }
+}
+
+/// Read the current audit-depth counter for `command_name` from the process
+/// environment (treating missing or non-numeric values as 0), bump it via
+/// `next_audit_depth`, and return the env-var name plus stringified new
+/// value. The caller passes both to `Command::env` so the bumped count is
+/// inherited only by the spawned child — we deliberately avoid
+/// `std::env::set_var` because it mutates process-global state and is
+/// unsound in the presence of any thread reading env concurrently.
+fn check_and_bump_audit_depth(command_name: &str) -> Result<(String, String), u32> {
+    let var = audit_depth_var(command_name);
+    let current: u32 = std::env::var(&var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    next_audit_depth(current).map(|next| (var, next.to_string()))
+}
+
 /// Audit mode: fork+wait the real binary, then send completion audit event.
 fn run_audit(command_name: &str, args: &[String]) -> i32 {
+    // Guard against pathological self-recursion (see
+    // `check_and_bump_audit_depth`). Done before resolving the real binary so
+    // we abort cheaply on the second-or-later recursive entry rather than
+    // walking PATH again.
+    let (depth_var, depth_value) = match check_and_bump_audit_depth(command_name) {
+        Ok(pair) => pair,
+        Err(depth) => {
+            eprintln!(
+                "nono-shim: refusing to exec '{}': audit-shim recursion depth {} exceeds limit {}. \
+A re-entrant shim chain (e.g. a runtime-manager `system` fallback that re-walks PATH) is \
+likely looping back through this shim. Pin the underlying tool to a non-`system` version, \
+invoke it via an absolute path, or unset {} to override.",
+                command_name,
+                depth,
+                AUDIT_DEPTH_LIMIT,
+                audit_depth_var(command_name),
+            );
+            return 127;
+        }
+    };
+
     // Resolve the real binary
     let real_binary = match resolve_real_binary(command_name) {
         Some(p) => p,
@@ -306,8 +390,14 @@ fn run_audit(command_name: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Fork+wait so we can capture the exit code for audit logging
-    let exit_code = match std::process::Command::new(&real_binary).args(args).status() {
+    // Fork+wait so we can capture the exit code for audit logging. The depth
+    // counter is set on the child only so any re-entry through the shim sees
+    // a higher count and the parent process env stays untouched.
+    let exit_code = match std::process::Command::new(&real_binary)
+        .args(args)
+        .env(&depth_var, &depth_value)
+        .status()
+    {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             eprintln!(
@@ -448,8 +538,10 @@ mod tests {
         write_executable(&real, b"#!/bin/sh\necho real\n");
         std::fs::write(sources_dir.join("yarn"), real.display().to_string()).expect("sidecar");
 
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(sources_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert_eq!(resolved.as_deref(), Some(real.as_path()));
     }
 
@@ -463,14 +555,12 @@ mod tests {
 
         let real = bin_dir.join("yarn");
         write_executable(&real, b"#!/bin/sh\n");
-        std::fs::write(
-            sources_dir.join("yarn"),
-            format!("{}\n", real.display()),
-        )
-        .expect("sidecar");
+        std::fs::write(sources_dir.join("yarn"), format!("{}\n", real.display())).expect("sidecar");
 
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(sources_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert_eq!(resolved.as_deref(), Some(real.as_path()));
     }
 
@@ -481,8 +571,10 @@ mod tests {
         std::fs::create_dir_all(&sources_dir).expect("sources dir");
         std::fs::write(sources_dir.join("yarn"), "/nonexistent/yarn").expect("sidecar");
 
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(sources_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert!(resolved.is_none());
     }
 
@@ -502,8 +594,10 @@ mod tests {
 
         std::fs::write(sources_dir.join("yarn"), real.display().to_string()).expect("sidecar");
 
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(sources_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert!(resolved.is_none());
     }
 
@@ -516,8 +610,10 @@ mod tests {
     #[test]
     fn sources_sidecar_returns_none_when_sidecar_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(tmp.path().to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_sources_sidecar_at(
+            Some(tmp.path().to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert!(resolved.is_none());
     }
 
@@ -537,8 +633,11 @@ mod tests {
             shim_dir.to_string_lossy(),
             real_dir.to_string_lossy()
         );
-        let resolved =
-            resolve_from_path_at(&path_var, Some(shim_dir.to_str().expect("path is utf-8")), "yarn");
+        let resolved = resolve_from_path_at(
+            &path_var,
+            Some(shim_dir.to_str().expect("path is utf-8")),
+            "yarn",
+        );
         assert_eq!(resolved.as_deref(), Some(real_dir.join("yarn").as_path()));
     }
 
@@ -551,5 +650,54 @@ mod tests {
             "definitely-not-a-real-command",
         );
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn audit_depth_var_uppercases_and_sanitizes() {
+        assert_eq!(audit_depth_var("python3"), "NONO_SHIM_AUDIT_DEPTH_PYTHON3");
+        assert_eq!(audit_depth_var("ruby"), "NONO_SHIM_AUDIT_DEPTH_RUBY");
+        // Non-alphanumerics become `_` so the result is a valid env-var name
+        // even when the command name contains hyphens or dots.
+        assert_eq!(
+            audit_depth_var("foo.bar-baz"),
+            "NONO_SHIM_AUDIT_DEPTH_FOO_BAR_BAZ"
+        );
+    }
+
+    #[test]
+    fn next_audit_depth_starts_at_one_from_zero() {
+        assert_eq!(next_audit_depth(0), Ok(1));
+    }
+
+    #[test]
+    fn next_audit_depth_increments_under_limit() {
+        // Counter monotonically increases until it hits the limit.
+        for current in 1..AUDIT_DEPTH_LIMIT {
+            assert_eq!(next_audit_depth(current), Ok(current + 1));
+        }
+    }
+
+    #[test]
+    fn next_audit_depth_allows_landing_exactly_at_limit() {
+        assert_eq!(
+            next_audit_depth(AUDIT_DEPTH_LIMIT - 1),
+            Ok(AUDIT_DEPTH_LIMIT)
+        );
+    }
+
+    #[test]
+    fn next_audit_depth_refuses_past_limit() {
+        assert_eq!(
+            next_audit_depth(AUDIT_DEPTH_LIMIT),
+            Err(AUDIT_DEPTH_LIMIT + 1)
+        );
+    }
+
+    #[test]
+    fn next_audit_depth_saturates_at_u32_max() {
+        // `saturating_add` keeps the counter well-defined even if a child
+        // process inherits a tampered `u32::MAX` value — we still hit the
+        // refusal branch instead of wrapping.
+        assert_eq!(next_audit_depth(u32::MAX), Err(u32::MAX));
     }
 }
