@@ -1,6 +1,8 @@
 //! Pack command handlers.
 
-use crate::cli::{ListArgs, OutdatedArgs, PinArgs, PullArgs, RemoveArgs, SearchArgs, UnpinArgs, UpdateArgs};
+use crate::cli::{
+    ListArgs, OutdatedArgs, PinArgs, PullArgs, RemoveArgs, SearchArgs, UnpinArgs, UpdateArgs,
+};
 use crate::package::{
     self, ArtifactEntry, ArtifactType, LockedArtifact, LockedPackage, PackageManifest,
     PackageProvenance, PackageRef, PullResponse,
@@ -305,10 +307,7 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
                 skipped = skipped.saturating_add(1);
             }
             Some("ahead") => {
-                eprintln!(
-                    "  {key} {} is ahead of registry — skipped",
-                    pkg.version
-                );
+                eprintln!("  {key} {} is ahead of registry — skipped", pkg.version);
                 skipped = skipped.saturating_add(1);
             }
             Some("yanked") => {
@@ -565,10 +564,7 @@ pub fn run_outdated(args: OutdatedArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<40} {:<12} {:<12} {}",
-        "PACK", "INSTALLED", "LATEST", "STATUS"
-    );
+    println!("{:<40} {:<12} {:<12} STATUS", "PACK", "INSTALLED", "LATEST");
     for entry in &entries {
         let latest_display = entry.latest.as_deref().unwrap_or("-");
         let mut status_display = entry.status.clone();

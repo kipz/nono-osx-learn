@@ -88,14 +88,13 @@ impl RegistryClient {
                         url, e
                     ))
                 })?;
-            let yanked: YankedErrorResponse = serde_json::from_str(&body).unwrap_or_else(|_| {
-                YankedErrorResponse {
+            let yanked: YankedErrorResponse =
+                serde_json::from_str(&body).unwrap_or(YankedErrorResponse {
                     error: None,
                     yanked: true,
                     yank_reason: None,
                     advisory: None,
-                }
-            });
+                });
             let mut msg = format!(
                 "{}/{}@{} has been yanked",
                 package_ref.namespace, package_ref.name, version
