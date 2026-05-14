@@ -20,7 +20,6 @@
 //! - `network.block` is OR (sticky-restrictive — a base deny stays).
 //! - `network.allowed_hosts` and the `fs_*` / `allow_commands` lists union via
 //!   `dedup_append` (base first, child appended).
-//! - `keychain_access` is OR.
 //!
 //! Within a `CallerPolicy` (security exceptions):
 //! - `agent_allowed` is AND. Default is `true`; OR would silently re-enable a
@@ -119,7 +118,7 @@ fn merge_intercept_rules(
 }
 
 /// Recursive merge of a [`CommandSandbox`]. Restrictive-wins on security gates
-/// (`network.block`, `keychain_access`); list fields union.
+/// (`network.block`); list fields union.
 fn merge_command_sandbox(base: CommandSandbox, child: CommandSandbox) -> CommandSandbox {
     CommandSandbox {
         network: NetworkConfig {
@@ -131,7 +130,6 @@ fn merge_command_sandbox(base: CommandSandbox, child: CommandSandbox) -> Command
         fs_write: dedup_append(&base.fs_write, &child.fs_write),
         fs_write_file: dedup_append(&base.fs_write_file, &child.fs_write_file),
         allow_commands: dedup_append(&base.allow_commands, &child.allow_commands),
-        keychain_access: base.keychain_access || child.keychain_access,
     }
 }
 
@@ -471,30 +469,6 @@ mod tests {
             sb.allow_commands,
             vec!["xdg-open".to_string(), "pbcopy".to_string()]
         );
-    }
-
-    #[test]
-    fn test_merge_mediation_command_sandbox_keychain_access_is_or() {
-        let mut base_gh = cmd("gh");
-        base_gh.sandbox = Some(CommandSandbox {
-            keychain_access: true,
-            ..Default::default()
-        });
-        let mut child_gh = cmd("gh");
-        child_gh.sandbox = Some(CommandSandbox::default());
-
-        let merged = merge_mediation(
-            MediationConfig {
-                commands: vec![base_gh],
-                ..Default::default()
-            },
-            MediationConfig {
-                commands: vec![child_gh],
-                ..Default::default()
-            },
-        );
-        let sb = merged.commands[0].sandbox.as_ref().unwrap();
-        assert!(sb.keychain_access);
     }
 
     #[test]
