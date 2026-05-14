@@ -1,12 +1,73 @@
 use crate::cli::SandboxArgs;
 use crate::launch_runtime::ProxyLaunchOptions;
+use crate::mediation::broker::TokenBroker;
 use crate::network_policy;
 use crate::sandbox_prepare::{PreparedSandbox, validate_external_proxy_bypass};
 #[cfg(not(target_os = "macos"))]
 use nono::AccessMode;
 use nono::{CapabilitySet, NonoError, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Env var that opts in to the OAuth-capture wiring (plan step 14).
+///
+/// When unset (the default), `start_proxy_runtime` behaves exactly as
+/// before: no token broker on the proxy side, no Anthropic
+/// OAuth-capture routes synthesised. Set to `1` / `true` / `yes` / `on`
+/// to enable. Step 15 of the plan replaces this env-var trigger with
+/// the profile-level `oauth_capture: true` flag.
+const OAUTH_CAPTURE_ENV: &str = "NONO_OAUTH_CAPTURE";
+
+fn oauth_capture_enabled() -> bool {
+    matches!(
+        std::env::var(OAUTH_CAPTURE_ENV).ok().as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Synthesise the three Anthropic OAuth-capture routes the CLI injects
+/// when OAuth capture is active.
+///
+/// Binary analysis of Claude Code 2.1.x shows the OAuth code-exchange
+/// `TOKEN_URL` lives at `platform.claude.com`, but the agent also talks
+/// to `api.anthropic.com` (API requests) and `claude.ai` (Pro/Max
+/// flow). All three get OAuth-capture routes so capture fires
+/// regardless of which host the client picks. Both URL-match patterns
+/// point at the same path because the OAuth endpoint serves both
+/// initial-token-issuance and refresh exchanges from one URL.
+fn oauth_capture_routes() -> Vec<nono_proxy::config::RouteConfig> {
+    use nono_proxy::config::{InjectMode, RouteConfig};
+    let hosts = [
+        ("anthropic-oauth", "https://api.anthropic.com"),
+        ("claude-ai-oauth", "https://claude.ai"),
+        ("platform-claude-oauth", "https://platform.claude.com"),
+    ];
+    hosts
+        .into_iter()
+        .map(|(prefix, upstream)| RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: upstream.to_string(),
+            credential_key: None,
+            inject_mode: InjectMode::OauthCapture {
+                token_url_match: "/api/oauth/token".to_string(),
+                refresh_url_match: "/api/oauth/token".to_string(),
+            },
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+        })
+        .collect()
+}
 
 pub(crate) struct ActiveProxyRuntime {
     pub(crate) env_vars: Vec<(String, String)>,
@@ -206,13 +267,46 @@ pub(crate) fn start_proxy_runtime(
         proxy_config.intercept_parent_ca_pems = read_parent_ssl_cert_file();
     }
 
+    // OAuth-capture wiring (plan step 14). Opt-in via `NONO_OAUTH_CAPTURE`
+    // so the live test surfaces a regression with a single env-var
+    // toggle; the default path stays identical to today's behaviour.
+    // The CA materialisation and `NODE_EXTRA_CA_CERTS` env injection
+    // that the original `1df4acc` had to do by hand are now handled by
+    // upstream's `intercept_ca_dir` + `ProxyHandle::env_vars()` — this
+    // block only adds the OAuth-specific bits: synthetic routes that
+    // trigger `requires_intercept` for the Anthropic hosts, and a
+    // session-scoped `TokenBroker` handed to the proxy as
+    // `Arc<dyn TokenResolver>`.
+    let oauth_capture_active = oauth_capture_enabled();
+    let proxy_runtime = if oauth_capture_active {
+        // Idempotent: skip any route whose prefix already exists (the
+        // operator may have wired it declaratively).
+        for route in oauth_capture_routes() {
+            if !proxy_config.routes.iter().any(|r| r.prefix == route.prefix) {
+                proxy_config.routes.push(route);
+            }
+        }
+        let resolver: Arc<dyn nono_proxy::TokenResolver> = Arc::new(TokenBroker::new());
+        info!(
+            "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker",
+            oauth_capture_routes().len()
+        );
+        nono_proxy::ProxyRuntime {
+            token_resolver: Some(resolver),
+        }
+    } else {
+        nono_proxy::ProxyRuntime::default()
+    };
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy runtime: {}", e)))?;
     let handle = rt
-        .block_on(async { nono_proxy::server::start(proxy_config.clone()).await })
+        .block_on(async {
+            nono_proxy::server::start_with_runtime(proxy_config.clone(), proxy_runtime).await
+        })
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy: {}", e)))?;
 
     let port = handle.port;
@@ -245,10 +339,19 @@ pub(crate) fn start_proxy_runtime(
             );
         }
     }
-    caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
-        port,
-        bind_ports: proxy.allow_bind_ports.clone(),
-    });
+    // OAuth capture requires the sandboxed child to bind a localhost
+    // port for the browser-redirect callback server (Claude Code 2.1.x
+    // spawns one for the OAuth flow). Inject a sentinel bind port (0)
+    // when capture is active and the operator hasn't already granted
+    // one. On macOS, Seatbelt's `(allow network-bind)` is blanket — it
+    // can't filter by port — so any non-empty bind_ports list suffices
+    // to enable bind() at all.
+    let bind_ports = if oauth_capture_active && proxy.allow_bind_ports.is_empty() {
+        vec![0]
+    } else {
+        proxy.allow_bind_ports.clone()
+    };
+    caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly { port, bind_ports });
 
     // Grant the sandboxed child a read capability on the ephemeral
     // trust bundle so `SSL_CERT_FILE` etc. are actually openable after
@@ -421,5 +524,41 @@ mod tests {
         assert!(matches!(err, NonoError::SandboxInit(_)));
         assert!(err.to_string().contains("TLS-intercept dir"));
         Ok(())
+    }
+
+    #[test]
+    fn oauth_capture_routes_targets_three_hosts() {
+        // Binary analysis of Claude Code 2.1.x shows the OAuth code-
+        // exchange `TOKEN_URL` lives at platform.claude.com, but the
+        // agent also talks to api.anthropic.com and claude.ai. All
+        // three must have OAuth-capture routes so capture fires
+        // regardless of which host the client picks.
+        let routes = oauth_capture_routes();
+        let upstreams: Vec<&str> = routes.iter().map(|r| r.upstream.as_str()).collect();
+        assert!(upstreams.contains(&"https://api.anthropic.com"));
+        assert!(upstreams.contains(&"https://claude.ai"));
+        assert!(upstreams.contains(&"https://platform.claude.com"));
+        assert_eq!(routes.len(), 3);
+    }
+
+    #[test]
+    fn oauth_capture_routes_use_inject_mode_oauth_capture() {
+        // Every synthesised route must carry the OauthCapture inject
+        // mode so `LoadedRoute::requires_intercept` trips and the
+        // dispatcher TLS-terminates the CONNECT for these hosts.
+        for route in oauth_capture_routes() {
+            assert!(
+                matches!(
+                    route.inject_mode,
+                    nono_proxy::config::InjectMode::OauthCapture { .. }
+                ),
+                "route '{}' must use OauthCapture inject_mode",
+                route.prefix
+            );
+            assert!(
+                route.credential_key.is_none(),
+                "OauthCapture routes carry no pre-loaded credential"
+            );
+        }
     }
 }

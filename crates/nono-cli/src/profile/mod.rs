@@ -519,10 +519,19 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
                 // Credential value is expected to be "username:password" format
             }
             InjectMode::OauthCapture { .. } => {
-                // OauthCapture routes don't validate against credential_key
-                // — the secret is captured at runtime from the response
-                // body, not pre-loaded from the keystore. credential.rs
-                // warns when both are set; profile-load just accepts.
+                // OauthCapture is reserved for the CLI's synthetic
+                // Anthropic intercept routes (see
+                // `proxy_runtime::oauth_capture_routes`). Surface it as
+                // a `custom_credentials.inject_mode` in a profile would
+                // give an arbitrary user-defined route response-rewrite
+                // behaviour, which is not a supported user-facing
+                // feature. Reject loudly rather than silently accept.
+                return Err(NonoError::ProfileParse(format!(
+                    "custom credential '{name}' uses inject_mode \
+                     'oauth_capture', which is reserved for the CLI's \
+                     built-in Anthropic OAuth-capture routes. Set \
+                     `oauth_capture: true` at the profile level instead."
+                )));
             }
         }
     }
@@ -646,9 +655,14 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
             }
         }
         InjectMode::OauthCapture { .. } => {
-            // OauthCapture has no proxy-side phantom-token shape to
-            // validate; the `proxy` block's fields (inject_header,
-            // path_pattern, query_param_name) don't apply.
+            // See note on the parallel arm in `validate_credential`:
+            // OauthCapture is rejected on the custom-credential path
+            // upstream of this point, so we never reach here with it.
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{name}' proxy override uses \
+                 inject_mode 'oauth_capture', which is reserved for \
+                 the CLI's built-in Anthropic OAuth-capture routes."
+            )));
         }
     }
 
