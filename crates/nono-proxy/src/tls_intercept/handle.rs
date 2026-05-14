@@ -44,6 +44,10 @@ pub struct InterceptCtx<'a> {
     pub tls_connector: &'a tokio_rustls::TlsConnector,
     pub filter: &'a ProxyFilter,
     pub audit_log: Option<&'a audit::SharedAuditLog>,
+    /// Optional in-process credential broker used by OAuth-capture
+    /// routes. `None` when OAuth capture is not configured for this
+    /// proxy session; the capture path is then inert.
+    pub token_resolver: Option<&'a Arc<dyn crate::broker::TokenResolver>>,
 }
 
 /// Handle a CONNECT request that matched a route requiring L7 visibility.
@@ -317,10 +321,35 @@ where
         return Ok(());
     }
 
+    // --- Detect OAuth capture (Layer 1 response-body rewrite) ---
+    //
+    // Route flagged with `InjectMode::OauthCapture` + inbound path
+    // matches one of the configured token/refresh URLs + the proxy
+    // session was started with a `TokenResolver`. When all three hold,
+    // we set up `oauth_capture_active` so:
+    //   1. Accept-Encoding is stripped from the upstream request (so the
+    //      upstream returns plaintext JSON we can parse), and
+    //   2. a response-body rewriter is supplied to `forward_request`
+    //      which swaps `access_token` / `refresh_token` for nonces
+    //      minted by the broker.
+    let oauth_capture_active = match (route, ctx.token_resolver) {
+        (Some(rt), Some(_resolver)) => rt
+            .oauth_capture_match
+            .as_ref()
+            .is_some_and(|oc| path == oc.token_url_match || path == oc.refresh_url_match),
+        _ => false,
+    };
+
     // --- Read body (Content-Length only; chunked is rare in API requests
     // and matches the existing reverse-proxy contract). ---
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = reverse::filter_headers(&header_bytes, strip_header);
+    let mut filtered_headers = reverse::filter_headers(&header_bytes, strip_header);
+    if oauth_capture_active {
+        // Force identity encoding so the OAuth-rewriter sees plaintext
+        // JSON rather than gzip/br/etc. Pass-through-on-error keeps
+        // /login working if the upstream returns non-JSON anyway.
+        filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
+    }
     let content_length = reverse::extract_content_length(&header_bytes);
     let body = match reverse::read_request_body(tls_stream, content_length, &buffered).await? {
         Some(b) => b,
@@ -399,12 +428,55 @@ where
         method: &method,
         path: &path,
     };
+
+    // Build the OAuth response hook if capture is active. The closure
+    // owns an `Arc<dyn TokenResolver>` clone so it can mint nonces
+    // when the upstream response arrives. Pass-through-on-error: when
+    // `rewrite_oauth_json_body` returns `NotJson` or `NoTokenFields`,
+    // the hook returns `None` and `forward_request` forwards the
+    // original bytes unchanged.
+    let response_hook: Option<forward::ResponseBodyRewriter<'_>> = if oauth_capture_active {
+        ctx.token_resolver.map(|resolver| {
+                let resolver = Arc::clone(resolver);
+                let hook: forward::ResponseBodyRewriter<'_> = Box::new(move |body: &[u8]| {
+                    match crate::oauth_rewrite::rewrite_oauth_json_body(body, resolver.as_ref()) {
+                        crate::oauth_rewrite::OauthRewriteOutcome::Rewritten {
+                            bytes,
+                            substituted,
+                        } => {
+                            debug!(
+                                "oauth-capture (tls_intercept): rewrote {} token field(s)",
+                                substituted
+                            );
+                            Some(bytes.to_vec())
+                        }
+                        crate::oauth_rewrite::OauthRewriteOutcome::NotJson => {
+                            warn!(
+                                "oauth-capture (tls_intercept): response not JSON; forwarding unchanged"
+                            );
+                            None
+                        }
+                        crate::oauth_rewrite::OauthRewriteOutcome::NoTokenFields => {
+                            debug!(
+                                "oauth-capture (tls_intercept): no token fields; forwarding unchanged"
+                            );
+                            None
+                        }
+                    }
+                });
+                hook
+            })
+    } else {
+        None
+    };
+
     if let Err(e) = forward::forward_request(
         tls_stream,
         request.as_bytes(),
         &body,
         upstream_spec,
         audit_ctx,
+        response_hook,
     )
     .await
     {

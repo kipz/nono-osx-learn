@@ -23,6 +23,7 @@ use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrat
 use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -101,6 +102,10 @@ pub struct ReverseProxyCtx<'a> {
     pub tls_connector: &'a TlsConnector,
     /// Shared network audit sink for session metadata capture
     pub audit_log: Option<&'a audit::SharedAuditLog>,
+    /// Optional in-process credential broker used by OAuth-capture
+    /// routes. `None` when OAuth capture is not configured for this
+    /// proxy session; the capture path is then inert.
+    pub token_resolver: Option<&'a Arc<dyn crate::broker::TokenResolver>>,
 }
 
 /// Handle a non-CONNECT HTTP request (reverse proxy mode).
@@ -363,8 +368,27 @@ pub async fn handle_reverse_proxy(
         }
     };
 
+    // OAuth capture detection (Layer 1 in the reverse-proxy path).
+    // Active when the route's inject_mode is OauthCapture, the request
+    // path matches one of the configured token URLs, and the proxy was
+    // started with a TokenResolver. ANTHROPIC_BASE_URL redirects the
+    // OAuth callback through this plain-HTTP reverse path (rather than
+    // through CONNECT), so the same capture-and-rewrite logic that the
+    // TLS-intercept handler uses must apply here too.
+    let oauth_capture_active = match (&route.oauth_capture_match, ctx.token_resolver) {
+        (Some(oc), Some(_)) => {
+            upstream_path == oc.token_url_match || upstream_path == oc.refresh_url_match
+        }
+        _ => false,
+    };
+
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = filter_headers(remaining_header, strip_header);
+    let mut filtered_headers = filter_headers(remaining_header, strip_header);
+    if oauth_capture_active {
+        // Force identity encoding so the OAuth-rewriter sees plaintext
+        // JSON rather than gzip/br/etc.
+        filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
+    }
     let content_length = extract_content_length(remaining_header);
     let body = match read_request_body(stream, content_length, buffered_body).await? {
         Some(body) => body,
@@ -416,8 +440,47 @@ pub async fn handle_reverse_proxy(
         method: &method,
         path: &upstream_path,
     };
-    if let Err(e) =
-        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+
+    // Build the OAuth response hook if capture is active. See the
+    // identical block in `tls_intercept/handle.rs::forward_inner_request`
+    // for the design rationale (pass-through-on-error invariant).
+    let response_hook: Option<forward::ResponseBodyRewriter<'_>> = if oauth_capture_active {
+        ctx.token_resolver.map(|resolver| {
+            let resolver = Arc::clone(resolver);
+            let hook: forward::ResponseBodyRewriter<'_> = Box::new(move |body: &[u8]| {
+                match crate::oauth_rewrite::rewrite_oauth_json_body(body, resolver.as_ref()) {
+                    crate::oauth_rewrite::OauthRewriteOutcome::Rewritten { bytes, substituted } => {
+                        debug!(
+                            "oauth-capture (reverse): rewrote {} token field(s)",
+                            substituted
+                        );
+                        Some(bytes.to_vec())
+                    }
+                    crate::oauth_rewrite::OauthRewriteOutcome::NotJson => {
+                        warn!("oauth-capture (reverse): response not JSON; forwarding unchanged");
+                        None
+                    }
+                    crate::oauth_rewrite::OauthRewriteOutcome::NoTokenFields => {
+                        debug!("oauth-capture (reverse): no token fields; forwarding unchanged");
+                        None
+                    }
+                }
+            });
+            hook
+        })
+    } else {
+        None
+    };
+
+    if let Err(e) = forward::forward_request(
+        stream,
+        request.as_bytes(),
+        &body,
+        upstream_spec,
+        audit_ctx,
+        response_hook,
+    )
+    .await
     {
         warn!("Upstream connection failed: {}", e);
         send_error(stream, 502, "Bad Gateway").await?;
@@ -597,8 +660,15 @@ async fn handle_oauth2_credential(
         method,
         path: upstream_path,
     };
-    if let Err(e) =
-        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+    if let Err(e) = forward::forward_request(
+        stream,
+        request.as_bytes(),
+        &body,
+        upstream_spec,
+        audit_ctx,
+        None,
+    )
+    .await
     {
         warn!("Upstream connection failed: {}", e);
         send_error(stream, 502, "Bad Gateway").await?;

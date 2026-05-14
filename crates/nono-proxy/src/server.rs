@@ -341,9 +341,9 @@ struct ProxyState {
     /// dispatch even for routes that would otherwise require L7).
     cert_cache: Option<Arc<CertCache>>,
     /// Shared credential broker. `None` when OAuth capture is not in
-    /// use; the TLS-intercept dispatcher (Layer 1.2) checks this before
+    /// use; the TLS-intercept dispatcher (Layer 1.2) and the
+    /// reverse-proxy capture path (Layer 1) both check this before
     /// activating the capture path.
-    #[allow(dead_code)]
     token_resolver: Option<Arc<dyn TokenResolver>>,
 }
 
@@ -776,6 +776,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             tls_connector: &state.tls_connector,
                             filter: &state.filter,
                             audit_log: Some(&state.audit_log),
+                            token_resolver: state.token_resolver.as_ref(),
                         };
                         return tls_intercept::handle_intercept_connect(&mut stream, ctx).await;
                     }
@@ -882,6 +883,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             filter: &state.filter,
             tls_connector: &state.tls_connector,
             audit_log: Some(&state.audit_log),
+            token_resolver: state.token_resolver.as_ref(),
         };
         reverse::handle_reverse_proxy(first_line, &mut stream, &header_bytes, &ctx, &buffered).await
     } else {

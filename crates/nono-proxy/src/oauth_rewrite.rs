@@ -26,10 +26,6 @@ use zeroize::Zeroizing;
 /// unchanged" — they are kept distinct only so the caller can log at the
 /// appropriate level (`warn!` for malformed upstream responses, `debug!`
 /// for the routine "no token here" case).
-// Unused until plan step 11 wires this helper into `forward.rs`'s
-// response hook; the 8 unit tests in this module exercise it but
-// don't count for the non-test dead-code lint.
-#[allow(dead_code)]
 pub(crate) enum OauthRewriteOutcome {
     /// Body did not parse as JSON. Forward original bytes; this is
     /// upstream-side weirdness worth logging at warn level.
@@ -53,8 +49,6 @@ pub(crate) enum OauthRewriteOutcome {
 /// persist them together for cross-session resume. When only one is
 /// present, the single-token [`TokenResolver::issue`] path is used (no
 /// persistence — pair semantics are lost without the matching half).
-// See note on `OauthRewriteOutcome` above.
-#[allow(dead_code)]
 pub(crate) fn rewrite_oauth_json_body(
     body: &[u8],
     resolver: &(dyn TokenResolver + 'static),

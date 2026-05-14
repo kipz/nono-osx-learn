@@ -68,6 +68,28 @@ pub struct UpstreamSpec<'a> {
     pub tls_connector: &'a TlsConnector,
 }
 
+/// Response-side body rewriter.
+///
+/// When supplied, [`forward_request`] departs from the default
+/// chunk-by-chunk streaming behaviour: it buffers the full upstream
+/// response, splits headers from body at the first `\r\n\r\n`, and
+/// invokes the closure on the body bytes.
+///
+/// - `Some(new_body)`: forward modified headers (Content-Length
+///   replaced; Transfer-Encoding / Content-Encoding dropped) + the new
+///   body bytes.
+/// - `None`: forward the original response unchanged. The closure
+///   signals this when there's nothing to rewrite — e.g. body wasn't
+///   JSON, no token fields present.
+///
+/// Used by OAuth-capture routes (plan step 11) to swap
+/// `access_token` / `refresh_token` JSON fields for broker-issued
+/// nonces before the sandboxed client sees them.
+///
+/// Pass `None` at the `forward_request` call site to keep the
+/// historical streaming behaviour intact for non-capture routes.
+pub type ResponseBodyRewriter<'a> = Box<dyn FnOnce(&[u8]) -> Option<Vec<u8>> + Send + 'a>;
+
 /// Audit-emission context.
 pub struct AuditCtx<'a> {
     pub log: Option<&'a audit::SharedAuditLog>,
@@ -92,6 +114,7 @@ pub async fn forward_request<S>(
     body: &[u8],
     upstream: UpstreamSpec<'_>,
     audit: AuditCtx<'_>,
+    response_hook: Option<ResponseBodyRewriter<'_>>,
 ) -> Result<u16>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -100,12 +123,12 @@ where
         UpstreamScheme::Https => {
             let mut tls_stream = open_https_upstream(&upstream).await?;
             write_request(&mut tls_stream, request_bytes, body).await?;
-            stream_response(&mut tls_stream, inbound).await?
+            stream_response(&mut tls_stream, inbound, response_hook).await?
         }
         UpstreamScheme::Http => {
             let mut tcp_stream = open_http_upstream(&upstream).await?;
             write_request(&mut tcp_stream, request_bytes, body).await?;
-            stream_response(&mut tcp_stream, inbound).await?
+            stream_response(&mut tcp_stream, inbound, response_hook).await?
         }
     };
 
@@ -231,10 +254,38 @@ where
 
 /// Stream the upstream response back to the inbound sink.
 ///
-/// Returns the HTTP status code parsed from the first chunk. Streams
-/// chunked / SSE / HTTP-streaming bodies transparently because we never
-/// buffer the body — each upstream read is mirrored to the inbound write.
-async fn stream_response<U, I>(upstream: &mut U, inbound: &mut I) -> Result<u16>
+/// Returns the HTTP status code parsed from the first chunk.
+///
+/// With `response_hook == None` (default for every non-OAuth-capture
+/// caller): streams chunked / SSE / HTTP-streaming bodies transparently
+/// — each upstream read is mirrored to the inbound write without
+/// buffering.
+///
+/// With `response_hook == Some(rewriter)`: buffers the full upstream
+/// response, hands the body bytes to `rewriter`, and — if the rewriter
+/// returns `Some(new_body)` — rebuilds framing with the new
+/// Content-Length (and drops Transfer-Encoding / Content-Encoding).
+/// On any framing-parse failure or a rewriter that returns `None`, the
+/// original bytes are forwarded unchanged — pass-through-on-error
+/// preserves `/login` behaviour even when the rewriter has bugs or the
+/// upstream returns a non-JSON body.
+async fn stream_response<U, I>(
+    upstream: &mut U,
+    inbound: &mut I,
+    response_hook: Option<ResponseBodyRewriter<'_>>,
+) -> Result<u16>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+    I: AsyncWrite + Unpin,
+{
+    match response_hook {
+        None => stream_response_passthrough(upstream, inbound).await,
+        Some(rewriter) => stream_response_buffered(upstream, inbound, rewriter).await,
+    }
+}
+
+/// Historical chunk-by-chunk pass-through (no buffering).
+async fn stream_response_passthrough<U, I>(upstream: &mut U, inbound: &mut I) -> Result<u16>
 where
     U: AsyncRead + AsyncWrite + Unpin,
     I: AsyncWrite + Unpin,
@@ -262,6 +313,76 @@ where
         inbound.flush().await?;
     }
 
+    Ok(status_code)
+}
+
+/// Buffered path that applies a body rewriter. See [`stream_response`].
+async fn stream_response_buffered<U, I>(
+    upstream: &mut U,
+    inbound: &mut I,
+    rewriter: ResponseBodyRewriter<'_>,
+) -> Result<u16>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+    I: AsyncWrite + Unpin,
+{
+    let mut raw = Vec::new();
+    if let Err(e) = upstream.read_to_end(&mut raw).await {
+        debug!("Upstream read error while buffering for rewriter: {}", e);
+        // Fall through and forward whatever we managed to read.
+    }
+    let status_code = parse_response_status(&raw);
+
+    // Locate the header/body split. Tolerate the rare LF-only separator
+    // (some non-conformant origins) by falling back to `\n\n`.
+    let header_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| raw.windows(2).position(|w| w == b"\n\n").map(|i| i + 2));
+
+    let Some(body_start) = header_end else {
+        debug!("response-hook: no header/body separator; forwarding unchanged");
+        inbound.write_all(&raw).await?;
+        inbound.flush().await?;
+        return Ok(status_code);
+    };
+
+    let header_bytes = &raw[..body_start];
+    let body_bytes = &raw[body_start..];
+
+    let Some(new_body) = rewriter(body_bytes) else {
+        debug!("response-hook: rewriter returned None; forwarding unchanged");
+        inbound.write_all(&raw).await?;
+        inbound.flush().await?;
+        return Ok(status_code);
+    };
+
+    // Rebuild headers: drop Content-Length, Transfer-Encoding, and
+    // Content-Encoding (we hold plaintext-rewritten bytes, can't honour
+    // chunked framing or upstream compression), then add the correct
+    // Content-Length and the terminating CRLF.
+    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
+    let mut rebuilt = String::with_capacity(header_bytes.len() + 32);
+    for line in header_str.split("\r\n") {
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("content-length:")
+            || lower.starts_with("transfer-encoding:")
+            || lower.starts_with("content-encoding:")
+        {
+            continue;
+        }
+        rebuilt.push_str(line);
+        rebuilt.push_str("\r\n");
+    }
+    rebuilt.push_str(&format!("Content-Length: {}\r\n\r\n", new_body.len()));
+
+    inbound.write_all(rebuilt.as_bytes()).await?;
+    inbound.write_all(&new_body).await?;
+    inbound.flush().await?;
     Ok(status_code)
 }
 
@@ -305,5 +426,101 @@ mod tests {
         assert_eq!(parse_response_status(b""), 502);
         assert_eq!(parse_response_status(b"garbage"), 502);
         assert_eq!(parse_response_status(b"NOT-HTTP 200 OK"), 502);
+    }
+
+    // Helpers for stream_response_buffered tests: wire an in-memory
+    // upstream (preloaded response bytes) to an inbound sink and run
+    // the buffered path, returning the bytes the inbound saw.
+    async fn run_buffered(
+        upstream_payload: &[u8],
+        rewriter: ResponseBodyRewriter<'_>,
+    ) -> (u16, Vec<u8>) {
+        let (mut upstream_writer, mut upstream_reader) = tokio::io::duplex(8 * 1024);
+        let (mut inbound_writer, mut inbound_reader) = tokio::io::duplex(8 * 1024);
+
+        upstream_writer.write_all(upstream_payload).await.unwrap();
+        drop(upstream_writer); // signal EOF to read_to_end
+
+        let status = stream_response_buffered(&mut upstream_reader, &mut inbound_writer, rewriter)
+            .await
+            .unwrap();
+        drop(inbound_writer);
+
+        let mut sink = Vec::new();
+        inbound_reader.read_to_end(&mut sink).await.unwrap();
+        (status, sink)
+    }
+
+    #[tokio::test]
+    async fn buffered_path_replaces_body_and_rewrites_content_length() {
+        let payload =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello";
+        let rewriter: ResponseBodyRewriter<'_> = Box::new(|body| {
+            assert_eq!(body, b"hello");
+            Some(b"HELLO_REWRITTEN".to_vec())
+        });
+        let (status, sink) = run_buffered(payload, rewriter).await;
+        assert_eq!(status, 200);
+
+        let out = String::from_utf8(sink).unwrap();
+        assert!(
+            out.starts_with("HTTP/1.1 200 OK\r\n"),
+            "status line preserved: {out:?}"
+        );
+        assert!(
+            out.contains("Content-Length: 15\r\n"),
+            "rewritten length: {out:?}"
+        );
+        assert!(
+            !out.contains("Content-Length: 5\r\n"),
+            "old length dropped: {out:?}"
+        );
+        assert!(
+            out.contains("Content-Type: text/plain"),
+            "unrelated headers preserved"
+        );
+        assert!(
+            out.ends_with("HELLO_REWRITTEN"),
+            "new body written: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_path_forwards_unchanged_when_rewriter_returns_none() {
+        // Pass-through-on-error invariant: when the rewriter returns
+        // None (e.g. body wasn't JSON, no token fields), the original
+        // bytes must reach inbound byte-for-byte.
+        let payload = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let rewriter: ResponseBodyRewriter<'_> = Box::new(|_| None);
+        let (status, sink) = run_buffered(payload, rewriter).await;
+        assert_eq!(status, 200);
+        assert_eq!(sink, payload);
+    }
+
+    #[tokio::test]
+    async fn buffered_path_strips_transfer_and_content_encoding() {
+        // When rewriting we hold plaintext bytes, so any chunked or
+        // compressed framing the upstream sent would be wrong.
+        let payload = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Encoding: gzip\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let rewriter: ResponseBodyRewriter<'_> =
+            Box::new(|_| Some(b"plain rewritten body".to_vec()));
+        let (_status, sink) = run_buffered(payload, rewriter).await;
+        let out = String::from_utf8(sink).unwrap();
+        assert!(!out.contains("Transfer-Encoding"), "TE dropped: {out:?}");
+        assert!(!out.contains("Content-Encoding"), "CE dropped: {out:?}");
+        assert!(out.contains("Content-Length: 20"), "CL added: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn buffered_path_forwards_unchanged_on_missing_header_separator() {
+        // Malformed response (no CRLFCRLF). Forward original, never
+        // call the rewriter.
+        let payload = b"HTTP/1.1 200 OK\r\nincomplete";
+        let rewriter: ResponseBodyRewriter<'_> = Box::new(|_| {
+            panic!("rewriter must not run when headers can't be split");
+        });
+        let (status, sink) = run_buffered(payload, rewriter).await;
+        assert_eq!(status, 200);
+        assert_eq!(sink, payload);
     }
 }
