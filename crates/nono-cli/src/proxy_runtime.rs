@@ -2,10 +2,12 @@ use crate::cli::SandboxArgs;
 use crate::launch_runtime::ProxyLaunchOptions;
 use crate::mediation::broker::TokenBroker;
 use crate::network_policy;
+use crate::oauth_preflight;
 use crate::sandbox_prepare::{PreparedSandbox, validate_external_proxy_bypass};
 #[cfg(not(target_os = "macos"))]
 use nono::AccessMode;
 use nono::{CapabilitySet, NonoError, Result};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -249,6 +251,8 @@ pub(crate) fn start_proxy_runtime(
     proxy: &ProxyLaunchOptions,
     caps: &mut CapabilitySet,
     workdir: &std::path::Path,
+    program: &OsStr,
+    silent: bool,
 ) -> Result<ActiveProxyRuntime> {
     if !proxy.active {
         return Ok(ActiveProxyRuntime {
@@ -280,7 +284,7 @@ pub(crate) fn start_proxy_runtime(
     // session-scoped `TokenBroker` handed to the proxy as
     // `Arc<dyn TokenResolver>`.
     let oauth_capture_active = proxy.oauth_capture;
-    let proxy_runtime = if oauth_capture_active {
+    let (proxy_runtime, preflight_env_overrides) = if oauth_capture_active {
         // Idempotent: skip any route whose prefix already exists (the
         // operator may have wired it declaratively).
         for route in oauth_capture_routes() {
@@ -288,16 +292,28 @@ pub(crate) fn start_proxy_runtime(
                 proxy_config.routes.push(route);
             }
         }
-        let resolver: Arc<dyn nono_proxy::TokenResolver> = Arc::new(build_broker());
+        let broker = Arc::new(build_broker());
+        // Pre-flight: detect any existing real Anthropic credential in
+        // the user's keychain / config / env and swap it for a broker-
+        // issued nonce before claude reads it. Without this the OAuth-
+        // capture feature is silently a no-op for already-authenticated
+        // users — see crates/nono-cli/src/oauth_preflight.rs.
+        let preflight = oauth_preflight::run_oauth_preflight(broker.as_ref(), program, silent)?;
+        let resolver: Arc<dyn nono_proxy::TokenResolver> = broker;
         info!(
-            "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker",
-            oauth_capture_routes().len()
+            "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker \
+             (pre-flight swapped {} env-var credential(s))",
+            oauth_capture_routes().len(),
+            preflight.env_overrides.len()
         );
-        nono_proxy::ProxyRuntime {
-            token_resolver: Some(resolver),
-        }
+        (
+            nono_proxy::ProxyRuntime {
+                token_resolver: Some(resolver),
+            },
+            preflight.env_overrides,
+        )
     } else {
-        nono_proxy::ProxyRuntime::default()
+        (nono_proxy::ProxyRuntime::default(), Vec::new())
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -404,6 +420,14 @@ pub(crate) fn start_proxy_runtime(
     }
 
     for (key, value) in handle.credential_env_vars(&proxy_config) {
+        env_vars.push((key, value));
+    }
+
+    // OAuth-capture pre-flight overrides (nonces replacing real bearer
+    // tokens in CLAUDE_CODE_OAUTH_TOKEN etc.). Pushed last so they win
+    // if any preceding entry happens to set the same key — pre-flight
+    // is the authoritative source for these specific variables.
+    for (key, value) in preflight_env_overrides {
         env_vars.push((key, value));
     }
 
