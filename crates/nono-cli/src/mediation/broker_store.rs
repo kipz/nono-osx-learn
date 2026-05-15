@@ -23,35 +23,39 @@
 //! mediation rules a profile uses to gate `security` CLI access already
 //! cover the broker's entry because both share the same service.
 //!
-//! ## Why we shell out to `security add-generic-password -A` on save
+//! ## Why save goes through the `keyring` crate (not `security` CLI)
 //!
-//! Macos keychain entries created via the keyring crate's `set_password`
-//! get a default ACL that restricts subsequent reads to the same code
-//! signature. nono parent rebuilds (dev) or version upgrades (production)
-//! both change the signature → reads then trigger a system password
-//! prompt. The user reported this as a popup on every launch.
+//! Our broker payload is a JSON blob containing two nonces plus two
+//! real OAuth tokens (~270+ bytes for Anthropic-issued tokens). The
+//! macOS `security add-generic-password` CLI has no way to accept a
+//! password of that size without leaking the bytes through argv:
 //!
-//! `security add-generic-password -A` creates the entry with "any
-//! application may access without warning", matching what users get
-//! when they manually run `security add-generic-password -A` to load
-//! credentials for the existing credential-injection feature. Reading
-//! via the keyring crate works for both creation paths.
+//! - `-w <payload>` puts the secret in the child's argv, where it is
+//!   briefly visible to any local process scanning `ps` / sysctl
+//!   `kern.proc.argmax`. Documented as insecure by the tool itself.
+//! - `-w` with no argument is the documented secure path: `security`
+//!   calls `readpassphrase(3)`, which uses a hard-coded 128-byte
+//!   buffer (`_PASSWORD_LEN`). Our payload silently truncates to
+//!   ~127 bytes — the access_nonce survives but the refresh_nonce
+//!   and both real tokens are lost. Verified empirically on 2026-05-14.
 //!
-//! ## Why `-w` is passed without an argument
+//! The `keyring` crate's `set_password` calls `SecItemAdd` directly via
+//! the Security framework, which accepts arbitrary-length values. We
+//! use that for save and keep the legacy `security find-generic-password
+//! -w` path for load (it honours keyring-created ACLs silently when the
+//! reading binary is in the entry's trusted-apps list, which is the
+//! common case for normal usage; rebuilds via `cargo install` may produce
+//! a new binary signature and require the user to allow the entry once).
 //!
-//! `security add-generic-password -w <payload>` writes the password into
-//! the spawned process's argv, where it is briefly visible in `ps` /
-//! `/proc/<pid>/cmdline` for any local process. Per the tool's own help
-//! text ("Use of the -p or -w options is insecure. Specify -w as the
-//! last option to be prompted."), passing `-w` as the final option with
-//! no value makes `security` prompt for the password. With stdin piped
-//! (non-tty), it reads two lines: an initial value and a retype check.
-//! We satisfy that by writing `<payload>\n<payload>\n` to the child's
-//! stdin, keeping the secret out of argv entirely.
+//! Earlier revisions of this module shelled out to `security
+//! add-generic-password -A` to avoid that re-prompt entirely (the `-A`
+//! flag creates an empty trusted-apps list — "any app may access
+//! without warning"). That worked for the original token-injection
+//! credentials, which fit in 128 bytes. The OAuth-capture broker's
+//! payload doesn't.
 
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::process::{Command, Stdio};
 use zeroize::Zeroizing;
 
@@ -161,85 +165,12 @@ impl KeystoreBrokerStore {
         })
     }
 
-    /// macOS-specific save path: shell out to `security add-generic-password
-    /// -U -A` so the entry's ACL allows future reads from any binary
-    /// without a password prompt. Matches the create-flags users typically
-    /// use when manually adding credentials for the existing
-    /// credential-injection feature.
+    /// Save path: write the JSON payload via the `keyring` crate.
     ///
-    /// The payload is supplied via the child's stdin rather than as an
-    /// argv element. `-w` is passed last with no argument, which causes
-    /// `security` to read the password from its prompt (stdin when
-    /// non-tty). The tool re-prompts to confirm, so we feed
-    /// `<payload>\n<payload>\n`. This keeps OAuth tokens out of the
-    /// kernel-visible argument vector during the spawn.
-    #[cfg(target_os = "macos")]
-    fn save_via_security_cli(&self, payload: &str) -> Result<()> {
-        let mut child = Command::new("/usr/bin/security")
-            .args([
-                "add-generic-password",
-                "-U", // update if exists
-                "-A", // any application may access without warning
-                "-s",
-                &self.service,
-                "-a",
-                &self.account,
-                "-w", // MUST be last: no argument → read from stdin
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| NonoError::KeystoreAccess(format!("invoke /usr/bin/security: {e}")))?;
-
-        // Build the stdin payload (initial + retype) in a Zeroizing
-        // buffer so it's wiped on drop. `security`'s confirmation prompt
-        // expects the password twice, separated by newlines. JSON
-        // serialised by serde_json::to_string contains no embedded
-        // newlines, so this format is unambiguous for our payload.
-        let mut stdin_buf = Zeroizing::new(String::with_capacity(payload.len() * 2 + 2));
-        stdin_buf.push_str(payload);
-        stdin_buf.push('\n');
-        stdin_buf.push_str(payload);
-        stdin_buf.push('\n');
-
-        // Take and drop stdin after writing so `security` sees EOF and
-        // wait_with_output below does not deadlock.
-        let write_result = match child.stdin.take() {
-            Some(mut stdin) => stdin.write_all(stdin_buf.as_bytes()),
-            None => {
-                return Err(NonoError::KeystoreAccess(
-                    "security add-generic-password: child stdin handle missing".to_string(),
-                ));
-            }
-        };
-        if let Err(e) = write_result {
-            // The child may already have exited; collect output for
-            // diagnostics rather than reporting only the I/O error.
-            let _ = child.wait();
-            return Err(NonoError::KeystoreAccess(format!(
-                "write payload to security stdin: {e}"
-            )));
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| NonoError::KeystoreAccess(format!("wait for /usr/bin/security: {e}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(NonoError::KeystoreAccess(format!(
-                "security add-generic-password exited with {}: {}",
-                output.status,
-                stderr.trim()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Non-macOS save path: keyring crate handles ACL semantics natively
-    /// (Linux secret-service uses per-collection authorization, no
-    /// equivalent of macOS's per-binary trusted-apps list).
-    #[cfg(not(target_os = "macos"))]
+    /// On macOS this invokes `SecItemAdd` directly (no argv leak, no
+    /// `readpassphrase` 128-byte cap). On Linux it goes to the
+    /// secret-service collection. See the module docs on why we don't
+    /// shell out to `security add-generic-password` for this payload.
     fn save_via_keyring(&self, payload: &str) -> Result<()> {
         let entry = self.entry()?;
         entry.set_password(payload).map_err(|e| {
@@ -280,9 +211,7 @@ impl KeystoreBrokerStore {
             ])
             .stdin(Stdio::null())
             .output()
-            .map_err(|e| {
-                NonoError::KeystoreAccess(format!("invoke /usr/bin/security: {e}"))
-            })?;
+            .map_err(|e| NonoError::KeystoreAccess(format!("invoke /usr/bin/security: {e}")))?;
         if output.status.success() {
             // -w prints the password followed by a single newline; trim it.
             let mut stdout = String::from_utf8(output.stdout).map_err(|e| {
@@ -358,21 +287,11 @@ impl BrokerStore for KeystoreBrokerStore {
     fn save(&self, record: &PersistedRecord) -> Result<()> {
         // Wrap the serialised JSON in `Zeroizing` so the buffer is
         // wiped when this function returns, regardless of branch.
-        // `save_via_security_cli` pipes its own copy through stdin and
-        // does not retain the bytes; the macOS argv path no longer
-        // contains the payload (see the docstring on that fn).
         let json: Zeroizing<String> = Zeroizing::new(
             serde_json::to_string(&PersistedJson::from_record(record))
                 .map_err(|e| NonoError::KeystoreAccess(format!("broker record serialise: {e}")))?,
         );
-        #[cfg(target_os = "macos")]
-        {
-            self.save_via_security_cli(&json)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.save_via_keyring(&json)
-        }
+        self.save_via_keyring(&json)
     }
 
     fn clear(&self) -> Result<()> {
@@ -438,5 +357,38 @@ pub(crate) mod test_support {
             *self.record.lock().expect("MemoryBrokerStore poisoned") = None;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_json_payload_exceeds_readpassphrase_buffer() {
+        // Regression guard for the 2026-05-14 truncation bug. A real
+        // Anthropic OAuth token pair serialised through `PersistedJson`
+        // is well over the 128-byte `readpassphrase(3)` cap that broke
+        // the earlier `security add-generic-password -w` save path.
+        // The current implementation uses `keyring`'s `set_password`
+        // (SecItemAdd) which has no such cap; this test only documents
+        // why the size matters so a future refactor can't silently
+        // reintroduce a 128-byte-bounded backend.
+        let record = PersistedRecord {
+            access_nonce: format!("nono_{}", "a".repeat(64)),
+            refresh_nonce: format!("nono_{}", "b".repeat(64)),
+            // Anthropic OAuth tokens are JWT-shaped, typically 150-300
+            // bytes. Use a representative 200-byte string here.
+            access_token: Zeroizing::new("sk-ant-oat01-".to_string() + &"x".repeat(187)),
+            refresh_token: Zeroizing::new("sk-ant-ort01-".to_string() + &"y".repeat(187)),
+        };
+        let json = serde_json::to_string(&PersistedJson::from_record(&record))
+            .expect("serialise persisted json");
+        assert!(
+            json.len() > 128,
+            "payload must exceed readpassphrase _PASSWORD_LEN (got {} bytes); \
+             update the test or restore an in-process keystore backend",
+            json.len()
+        );
     }
 }
