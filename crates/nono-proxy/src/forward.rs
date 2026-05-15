@@ -351,7 +351,31 @@ where
     let header_bytes = &raw[..body_start];
     let body_bytes = &raw[body_start..];
 
-    let Some(new_body) = rewriter(body_bytes) else {
+    // Decode chunked transfer encoding before invoking the rewriter.
+    // Anthropic's OAuth token endpoint (`platform.claude.com/v1/oauth/token`)
+    // returns chunked-encoded JSON; without this step the rewriter sees
+    // "<hex_size>\r\n{json}\r\n0\r\n\r\n" and `serde_json::from_slice`
+    // rejects it as not-JSON. Pass-through-on-error: if the chunked
+    // payload is malformed we fall back to the raw bytes so the
+    // rewriter still gets a chance (and will just decline if the
+    // bytes aren't sensible JSON).
+    let decoded_body_owned;
+    let body_for_rewriter: &[u8] = if has_chunked_transfer_encoding(header_bytes) {
+        match decode_chunked_body(body_bytes) {
+            Some(decoded) => {
+                decoded_body_owned = decoded;
+                &decoded_body_owned
+            }
+            None => {
+                debug!("response-hook: chunked decode failed; passing raw body to rewriter");
+                body_bytes
+            }
+        }
+    } else {
+        body_bytes
+    };
+
+    let Some(new_body) = rewriter(body_for_rewriter) else {
         debug!("response-hook: rewriter returned None; forwarding unchanged");
         inbound.write_all(&raw).await?;
         inbound.flush().await?;
@@ -384,6 +408,77 @@ where
     inbound.write_all(&new_body).await?;
     inbound.flush().await?;
     Ok(status_code)
+}
+
+/// Return true if the response headers declare `Transfer-Encoding: chunked`.
+///
+/// Header values are matched case-insensitively. Comma-separated token
+/// lists (RFC 7230 §3.3.1, e.g. `gzip, chunked`) are split and each token
+/// compared against `chunked`. Multiple `Transfer-Encoding` header lines
+/// are all considered (the spec permits but discourages this).
+fn has_chunked_transfer_encoding(header_bytes: &[u8]) -> bool {
+    let Ok(header_str) = std::str::from_utf8(header_bytes) else {
+        return false;
+    };
+    header_str.split("\r\n").any(|line| {
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("transfer-encoding:") {
+            value.split(',').any(|token| token.trim() == "chunked")
+        } else {
+            false
+        }
+    })
+}
+
+/// Decode an HTTP/1.1 chunked-transfer-encoded body.
+///
+/// Returns `None` if the body is malformed (bad hex size, truncated
+/// chunk, missing terminator). Callers pass-through the original bytes
+/// on `None` to preserve the response-hook invariant.
+///
+/// Chunk extensions (`;name=value` after the size) are accepted and
+/// ignored, per RFC 7230 §4.1.1. Trailer headers after the 0-size
+/// chunk are not preserved — the rewriter operates on the message
+/// body only and `stream_response_buffered` already strips
+/// `Transfer-Encoding` from the rebuilt response.
+fn decode_chunked_body(body: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(body.len());
+    let mut pos: usize = 0;
+    loop {
+        // Find end of chunk-size line.
+        let rest = body.get(pos..)?;
+        let line_end = rest.iter().position(|&b| b == b'\n')?;
+        let line_end_abs = pos.checked_add(line_end)?;
+        let raw_line = body.get(pos..line_end_abs)?;
+        // Strip trailing \r if CRLF; tolerate LF-only for robustness.
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let line_str = std::str::from_utf8(line).ok()?;
+        // Drop optional chunk extension (`<size>;ext=val`).
+        let size_str = line_str.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_str, 16).ok()?;
+
+        // Advance past the `\n` that terminated the size line.
+        pos = line_end_abs.checked_add(1)?;
+
+        if size == 0 {
+            // Last chunk reached. Trailer headers may follow but are
+            // not part of the message body the rewriter cares about.
+            return Some(decoded);
+        }
+
+        let chunk_end = pos.checked_add(size)?;
+        let chunk = body.get(pos..chunk_end)?;
+        decoded.extend_from_slice(chunk);
+        pos = chunk_end;
+
+        // Skip the CRLF (or lone LF) that terminates the chunk data.
+        if body.get(pos) == Some(&b'\r') {
+            pos = pos.checked_add(1)?;
+        }
+        if body.get(pos) == Some(&b'\n') {
+            pos = pos.checked_add(1)?;
+        }
+    }
 }
 
 /// Parse HTTP status code from the first response chunk.
@@ -522,5 +617,101 @@ mod tests {
         let (status, sink) = run_buffered(payload, rewriter).await;
         assert_eq!(status, 200);
         assert_eq!(sink, payload);
+    }
+
+    #[tokio::test]
+    async fn buffered_path_decodes_chunked_body_before_rewriter() {
+        // Regression test for the live `claude /login` smoke-test bug
+        // (plan 2026-05-14 notes). Anthropic's OAuth token endpoint
+        // returns chunked-encoded JSON; the rewriter must see decoded
+        // bytes, not the raw `<hex_size>\r\n<data>\r\n0\r\n\r\n` frame.
+        let json = br#"{"access_token":"sk-ant-real","refresh_token":"sk-rt-real"}"#;
+        let chunk_size_line = format!("{:x}\r\n", json.len());
+        let mut payload = Vec::from(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+        );
+        payload.extend_from_slice(chunk_size_line.as_bytes());
+        payload.extend_from_slice(json);
+        payload.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let rewriter: ResponseBodyRewriter<'_> = Box::new(move |body| {
+            // The rewriter must receive decoded JSON, not chunked frame.
+            let body_str = std::str::from_utf8(body).expect("decoded body is utf8");
+            assert!(
+                body_str.starts_with('{') && body_str.ends_with('}'),
+                "rewriter saw decoded body: {body_str:?}"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_slice(body).expect("decoded body parses as JSON");
+            assert_eq!(parsed["access_token"], "sk-ant-real");
+            Some(br#"{"access_token":"nono_a","refresh_token":"nono_r"}"#.to_vec())
+        });
+        let (status, sink) = run_buffered(&payload, rewriter).await;
+        assert_eq!(status, 200);
+
+        let out = String::from_utf8(sink).unwrap();
+        assert!(!out.contains("Transfer-Encoding"), "TE dropped: {out:?}");
+        assert!(out.contains("Content-Length: 50"), "CL added: {out:?}");
+        assert!(
+            out.ends_with(r#"{"access_token":"nono_a","refresh_token":"nono_r"}"#),
+            "rewritten body delivered: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_path_passes_raw_body_when_chunked_decode_fails() {
+        // Pass-through-on-error: a malformed chunked body must not
+        // panic or drop the response. The rewriter still gets a chance
+        // (and will typically decline, leading to unchanged forward).
+        let mut payload =
+            Vec::from(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice());
+        // "ZZZ" is not valid hex; decode_chunked_body returns None.
+        payload.extend_from_slice(b"ZZZ\r\ngarbage\r\n0\r\n\r\n");
+        let rewriter: ResponseBodyRewriter<'_> = Box::new(|_| None);
+        let (status, sink) = run_buffered(&payload, rewriter).await;
+        assert_eq!(status, 200);
+        assert_eq!(sink, payload);
+    }
+
+    #[test]
+    fn has_chunked_transfer_encoding_detects_token() {
+        assert!(has_chunked_transfer_encoding(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        ));
+        // Case-insensitive header name + value.
+        assert!(has_chunked_transfer_encoding(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: Chunked\r\n\r\n"
+        ));
+        // Multi-token TE list (RFC 7230 §3.3.1).
+        assert!(has_chunked_transfer_encoding(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"
+        ));
+        // No TE header → false.
+        assert!(!has_chunked_transfer_encoding(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+        ));
+        // Different TE value → false.
+        assert!(!has_chunked_transfer_encoding(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn decode_chunked_body_roundtrips_simple_payload() {
+        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked_body(body), Some(b"hello world".to_vec()));
+    }
+
+    #[test]
+    fn decode_chunked_body_accepts_chunk_extensions() {
+        let body = b"5;name=value\r\nhello\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked_body(body), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn decode_chunked_body_rejects_malformed() {
+        assert_eq!(decode_chunked_body(b"ZZZ\r\nbad\r\n"), None);
+        assert_eq!(decode_chunked_body(b"5\r\nhel"), None); // truncated chunk
+        assert_eq!(decode_chunked_body(b""), None); // no size line
     }
 }
