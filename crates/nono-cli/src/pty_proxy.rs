@@ -1035,7 +1035,7 @@ impl PtyProxy {
     }
     fn filter_client_input(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut forwarded = Vec::with_capacity(bytes.len());
-        for &byte in bytes {
+        for (i, &byte) in bytes.iter().enumerate() {
             if self.maybe_consume_enhanced_detach_byte(byte, &mut forwarded) {
                 continue;
             }
@@ -1058,7 +1058,12 @@ impl PtyProxy {
                 continue;
             }
 
-            if self.should_start_enhanced_detach_match(byte) {
+            // Only buffer \x1b for enhanced CSI-u detach matching when '['
+            // immediately follows in the same read batch. A bare ESC with no
+            // '[' following is a standalone Escape key and must be forwarded immediately.
+            if self.should_start_enhanced_detach_match(byte)
+                && bytes.get(i + 1).copied() == Some(b'[')
+            {
                 self.pending_detach_escape.push(byte);
                 continue;
             }
@@ -2723,6 +2728,27 @@ mod tests {
         assert!(proxy.pending_detach_escape.is_empty());
         let forwarded = proxy.filter_client_input(b"x");
         assert_eq!(forwarded, b"x");
+        assert!(!proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_forwards_bare_esc_immediately() {
+        // Regression test for issue #941: bare ESC must be forwarded right away,
+        // not buffered waiting for a possible CSI-u detach sequence.
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b");
+        assert_eq!(forwarded, b"\x1b");
+        assert!(proxy.pending_detach_escape.is_empty());
+        assert!(!proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_forwards_esc_not_paired_with_next_key() {
+        // ESC followed by a non-'[' byte must both be forwarded as-is, not
+        // delayed and reordered into an Alt+key sequence.
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1ba");
+        assert_eq!(forwarded, b"\x1ba");
         assert!(!proxy.take_detach_request());
     }
 

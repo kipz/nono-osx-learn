@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Bug Fixes
+
+- *(pty)* Forward bare ESC immediately instead of buffering for CSI-u detach match, fixing ESC key in TUI apps inside tmux with `extended-keys-format csi-u` (#941)
+
 ### Notes
 
 - Socket grant state now records explicit socket scope. New subtree socket
