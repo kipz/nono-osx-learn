@@ -3,49 +3,58 @@
 //!
 //! Without this, the OAuth-capture feature is a no-op for any user who
 //! was already authenticated before turning the flag on. Claude reads the
-//! existing real `sk-ant-…` bearer from the macOS keychain entry, from
-//! `~/.claude/.credentials.json`, or from environment variables, and uses
-//! it directly. The proxy never sees a `nono_<hex>` nonce because nothing
-//! minted one. The real token reaches Claude's process memory and can be
-//! exfiltrated by anything running under the same uid.
+//! existing real `sk-ant-…` bearer from the macOS keychain entry (or from
+//! `~/.claude/.credentials.json` on Linux) and uses it directly. The
+//! proxy never sees a `nono_<hex>` nonce because nothing minted one, so
+//! the real token reaches Claude's process memory unchanged.
 //!
-//! This module closes that gap by sweeping every documented credential
-//! surface before the child starts, capturing any real token into the
-//! broker, and rewriting the surface to hold the broker-issued nonce.
-//! Surfaces handled:
+//! ### Surfaces swept
 //!
-//! - macOS keychain entry `Claude Code-credentials` (the `claudeAiOauth`
-//!   JSON blob with `accessToken` / `refreshToken`).
-//! - `~/.claude/.credentials.json` (same JSON shape; primary store on
-//!   Linux, optional fallback on macOS).
-//! - Environment variables that carry OAuth bearers:
-//!   `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`,
-//!   `ANTHROPIC_AUTH_TOKEN`. Each is rewritten with a `nono_<hex>` nonce
-//!   in the child's environment (the parent shell is untouched).
+//! Only the surfaces that cannot be protected by sandbox deny rules alone:
 //!
-//! Surfaces that carry an API key (not an OAuth bearer) are *not*
-//! rewritable because the proxy's TLS-intercept layer translates
-//! `Authorization: Bearer nono_<hex>` but not `x-api-key: nono_<hex>` —
-//! the child would 401 on every request. When any API-key surface is
-//! detected alongside `oauth_capture: true` we fail closed with a clear
-//! message asking the user to clear it or disable the feature:
+//! - **macOS**: keychain entry `Claude Code-credentials` (`claudeAiOauth`
+//!   JSON blob). Deny rules can block `~/Library/Keychains` file paths, but
+//!   Claude reads the entry via `SecItemCopyMatching()` (Mach IPC to
+//!   `com.apple.SecurityServer`), which is allowed by any profile that
+//!   permits Claude to authenticate at all. Selectively denying one entry
+//!   is not possible; the only option is rewriting it to hold nonces.
+//! - **Linux**: `~/.claude/.credentials.json` (the only credential store;
+//!   no keychain). A profile could deny reads on this path, but that breaks
+//!   auth entirely. Rewriting to nonces is the only viable protection.
+//!
+//! ### Surfaces NOT swept (handled elsewhere)
+//!
+//! - **Environment variables** (`CLAUDE_CODE_OAUTH_TOKEN` etc.): the
+//!   profile's `denied_env_vars` strips these at exec time, before the
+//!   child spawns. Pre-flight sweeping them would be redundant.
+//! - **`.credentials.json` on macOS**: `load_claude_oauth_state()` reads
+//!   the keychain first and only falls back to the file when the keychain
+//!   is absent. Once the keychain holds nonces, the file is never reached.
+//!
+//! ### API-key surfaces (fail-closed, not swept)
+//!
+//! Surfaces that carry an API key are *not* swept because the proxy's
+//! TLS-intercept translates `Authorization: Bearer nono_<hex>` but not
+//! `x-api-key: nono_<hex>` — the child would 401 on every request.
+//! When any API-key surface is detected pre-flight fails with a clear
+//! message:
 //!
 //! - environment: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`
+//!   (skipped if the profile's `denied_env_vars` would strip them anyway)
 //! - macOS keychain entry `Claude Code` (no `-credentials` suffix)
 //! - `primaryApiKey` field in `~/.claude.json`
 //!
 //! ### Idempotence
 //!
 //! Pre-flight is run on every nono session with `oauth_capture: true`. A
-//! surface whose value already starts with `nono_` is left untouched, so
-//! the second-run case is a quiet no-op rather than re-capture.
+//! surface whose value already starts with `nono_` is left untouched.
 //!
 //! ### Fail-secure
 //!
-//! Any unexpected error (write failure, broker error, malformed JSON the
-//! surface previously held) returns `Err`. The proxy never starts and the
-//! child never spawns. Better to bail loudly than to half-rewrite the
-//! user's credentials.
+//! Any unexpected error returns `Err`. The proxy never starts and the
+//! child never spawns. Each platform performs exactly one atomic write
+//! (macOS: `SecItemUpdate` via the keyring crate; Linux: `rename(2)`),
+//! so there is no partial-state scenario.
 
 use crate::exec_strategy::is_env_var_denied;
 use crate::mediation::broker::TokenBroker;
@@ -53,19 +62,8 @@ use nono::{NonoError, Result};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use zeroize::Zeroizing;
-
-/// OAuth-bearer environment variables we rewrite. Claude reads each of
-/// these as a long-lived bearer credential and sends it as
-/// `Authorization: Bearer <value>`. The proxy's Layer 1.2 and Layer 2
-/// paths both translate `Bearer nono_<hex>` back to the real bearer, so
-/// substituting a nonce here is safe end-to-end.
-const OAUTH_BEARER_ENV_VARS: &[&str] = &[
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
-    "ANTHROPIC_AUTH_TOKEN",
-];
 
 /// API-key environment variables. The proxy does not rewrite
 /// `x-api-key: nono_<hex>` headers inside the CONNECT tunnel, so
@@ -78,28 +76,16 @@ const API_KEY_ENV_VARS: &[&str] = &[
     "ANTHROPIC_UNIX_SOCKET",
 ];
 
-/// Outcome of a pre-flight pass.
-///
-/// `env_overrides` carries `(key, value)` pairs the caller must inject
-/// into the child's environment with override priority — the proxy
-/// runtime already returns the same shape from
-/// `ActiveProxyRuntime.env_vars`, and exec_strategy's `env_clear` +
-/// per-key `cmd.env()` semantics guarantee these override any inherited
-/// parent value.
 #[derive(Debug, Default)]
-pub(crate) struct PreflightOutcome {
-    pub env_overrides: Vec<(String, String)>,
-}
+pub(crate) struct PreflightOutcome;
 
 /// Run the pre-flight rewrite if the target program is `claude` and
 /// OAuth capture is active. For any other program this is a quiet
 /// no-op — pre-flight is a Claude-Code-specific feature.
 ///
-/// `denied_env_vars` is the profile's env-var deny list (the same list
-/// that strips vars from the child's environment at exec time). Any
-/// API-key var in that list is skipped by the fail-closed check —
-/// if the profile would strip it before the child sees it, it poses
-/// no capture risk.
+/// `denied_env_vars` is the profile's env-var deny list. Any API-key
+/// env var the profile would strip before the child sees it is excluded
+/// from the fail-closed check.
 pub(crate) fn run_oauth_preflight(
     broker: &TokenBroker,
     program: &OsStr,
@@ -108,7 +94,7 @@ pub(crate) fn run_oauth_preflight(
 ) -> Result<PreflightOutcome> {
     if !program_is_claude(program) {
         debug!("oauth_capture: target program is not claude; skipping pre-flight");
-        return Ok(PreflightOutcome::default());
+        return Ok(PreflightOutcome);
     }
 
     if let Some(reason) = detect_blocking_api_key_surface(denied_env_vars)? {
@@ -122,57 +108,14 @@ pub(crate) fn run_oauth_preflight(
         )));
     }
 
-    let mut outcome = PreflightOutcome::default();
-    capture_oauth_env_vars_from(broker, silent, |k| std::env::var_os(k), &mut outcome);
+    // macOS: rewrite keychain only (one atomic SecItemUpdate).
+    // Linux: rewrite .credentials.json only (one atomic rename).
+    // Env vars are handled by the profile's denied_env_vars at exec time.
+    // .credentials.json on macOS is a dead fallback once the keychain holds nonces.
+    rewrite_keychain_oauth_entry(broker, silent)?;
+    rewrite_credentials_file(broker, silent)?;
 
-    // Rewrite surfaces with snapshot-restore: if the keychain write
-    // succeeds but the file write subsequently fails, we restore the
-    // keychain to avoid leaving the user with nonces that nothing can
-    // resolve. Each rewrite function returns the original value when
-    // it actually modified something (None = no-op / already nonces).
-    let keychain_snapshot = rewrite_keychain_oauth_entry(broker, silent)?;
-
-    if let Err(file_err) = rewrite_credentials_file(broker, silent) {
-        #[cfg(target_os = "macos")]
-        if let Some(original) = keychain_snapshot {
-            if let Err(restore_err) = restore_keychain_entry(&original) {
-                warn!(
-                    "oauth_capture pre-flight: file rewrite failed AND keychain restore failed \
-                     ({restore_err}); user may need to run `claude /login` to restore auth"
-                );
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = keychain_snapshot;
-        return Err(file_err);
-    }
-
-    Ok(outcome)
-}
-
-/// Capture OAuth-bearer env vars whose values are real (non-empty,
-/// non-`nono_`-prefixed) into `broker` and push `(key, nonce)`
-/// overrides onto `outcome`. The env-reader is injected so unit tests
-/// can run without mutating process-global env state.
-fn capture_oauth_env_vars_from<F>(
-    broker: &TokenBroker,
-    silent: bool,
-    env_reader: F,
-    outcome: &mut PreflightOutcome,
-) where
-    F: Fn(&str) -> Option<std::ffi::OsString>,
-{
-    for &key in OAUTH_BEARER_ENV_VARS {
-        if let Some(raw) = env_reader(key)
-            && let Some(value) = raw.to_str()
-            && !value.is_empty()
-            && !value.starts_with("nono_")
-        {
-            let nonce = broker.issue(Zeroizing::new(value.to_string()));
-            outcome.env_overrides.push((key.to_string(), nonce));
-            log_capture(silent, &format!("env {key}"));
-        }
-    }
+    Ok(PreflightOutcome)
 }
 
 fn program_is_claude(program: &OsStr) -> bool {
@@ -298,17 +241,10 @@ fn detect_api_key_keychain_macos() -> Result<Option<String>> {
 }
 
 /// Rewrite the macOS keychain `Claude Code-credentials` entry if it
-/// currently holds a real Anthropic OAuth pair.
-///
-/// Returns `Some(original_json)` when the entry was rewritten (the
-/// caller uses this as a rollback snapshot if a later step fails), or
-/// `None` when no modification was made (entry absent, already has
-/// nonces, or no `claudeAiOauth` object).
+/// currently holds a real Anthropic OAuth pair. No-op when the entry is
+/// absent, already nonce-bearing, or has no `claudeAiOauth` object.
 #[cfg(target_os = "macos")]
-fn rewrite_keychain_oauth_entry(
-    broker: &TokenBroker,
-    silent: bool,
-) -> Result<Option<Zeroizing<String>>> {
+fn rewrite_keychain_oauth_entry(broker: &TokenBroker, silent: bool) -> Result<()> {
     let (config_dir, explicit) = claude_config_dir()
         .map_err(|err| NonoError::SandboxInit(format!("oauth_capture pre-flight: {err}")))?;
     let service = claude_keychain_service_name(&config_dir, explicit, "-credentials");
@@ -316,7 +252,7 @@ fn rewrite_keychain_oauth_entry(
 
     let raw = match read_keychain_item(&account, &service) {
         Some(value) if !value.trim().is_empty() => value,
-        _ => return Ok(None),
+        _ => return Ok(()),
     };
 
     let mut parsed: Value = serde_json::from_str(&raw).map_err(|err| {
@@ -335,7 +271,7 @@ fn rewrite_keychain_oauth_entry(
             debug!(
                 "oauth_capture pre-flight: keychain entry has no claudeAiOauth object; nothing to capture"
             );
-            return Ok(None);
+            return Ok(());
         }
     };
 
@@ -351,7 +287,7 @@ fn rewrite_keychain_oauth_entry(
     if access.as_deref().is_none_or(str::is_empty)
         || access.as_deref().is_some_and(|v| v.starts_with("nono_"))
     {
-        return Ok(None);
+        return Ok(());
     }
 
     let access_token = access.ok_or_else(|| {
@@ -393,43 +329,30 @@ fn rewrite_keychain_oauth_entry(
 
     write_keychain_item(&service, &account, &rewritten)?;
     log_capture(silent, &format!("keychain \"{service}\""));
-    Ok(Some(Zeroizing::new(raw)))
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn rewrite_keychain_oauth_entry(
-    _broker: &TokenBroker,
-    _silent: bool,
-) -> Result<Option<Zeroizing<String>>> {
-    Ok(None)
+fn rewrite_keychain_oauth_entry(_broker: &TokenBroker, _silent: bool) -> Result<()> {
+    Ok(())
 }
 
-/// Restore the macOS `Claude Code-credentials` keychain entry to
-/// `original` after a subsequent pre-flight step failed. Best-effort:
-/// logs a warning on failure rather than returning an error (we're
-/// already in an error path).
-#[cfg(target_os = "macos")]
-fn restore_keychain_entry(original: &Zeroizing<String>) -> Result<()> {
-    let (config_dir, explicit) = claude_config_dir()
-        .map_err(|err| NonoError::SandboxInit(format!("oauth_capture restore: {err}")))?;
-    let service = claude_keychain_service_name(&config_dir, explicit, "-credentials");
-    let account = claude_keychain_account_name();
-    write_keychain_item(&service, &account, original)
-}
-
-/// Rewrite `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR/.credentials.json`)
-/// if it holds a real OAuth pair. Cross-platform.
-///
-/// The return value mirrors `rewrite_keychain_oauth_entry`: `Some((path,
-/// original_content))` when the file was rewritten, `None` otherwise.
-/// Not used by the caller today (file is the last step, so there is
-/// nothing to roll back on its failure), but kept symmetric for clarity.
+/// Rewrite `~/.claude/.credentials.json` on Linux (the only credential
+/// store on that platform). On macOS `load_claude_oauth_state()` reads
+/// the keychain first and never reaches the file once the keychain holds
+/// nonces, so sweeping it would be redundant.
+#[cfg(not(target_os = "macos"))]
 fn rewrite_credentials_file(broker: &TokenBroker, silent: bool) -> Result<()> {
     let config_dir = match claude_config_dir_cross_platform() {
         Some(dir) => dir,
         None => return Ok(()),
     };
     rewrite_credentials_file_at(&config_dir, broker, silent)
+}
+
+#[cfg(target_os = "macos")]
+fn rewrite_credentials_file(_broker: &TokenBroker, _silent: bool) -> Result<()> {
+    Ok(())
 }
 
 /// Test-friendly variant: rewrite `<config_dir>/.credentials.json`. The
@@ -580,6 +503,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
 
 /// Resolve the Claude config directory the same way `claude` itself does.
 /// Returns `None` if `HOME` is unset (very rare, like an empty CI env).
+#[cfg(not(target_os = "macos"))]
 fn claude_config_dir_cross_platform() -> Option<PathBuf> {
     if let Some(value) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         return Some(PathBuf::from(value));
@@ -725,9 +649,7 @@ mod tests {
         // Even with a real-token-bearing env var, pre-flight skips when
         // the program isn't claude. (Other binaries don't read these.)
         let broker = TokenBroker::new();
-        let outcome =
-            run_oauth_preflight(&broker, OsStr::new("/usr/bin/codex"), true, None).unwrap();
-        assert!(outcome.env_overrides.is_empty());
+        run_oauth_preflight(&broker, OsStr::new("/usr/bin/codex"), true, None).unwrap();
     }
 
     #[test]
@@ -852,77 +774,6 @@ mod tests {
                 .iter()
                 .find(|(name, _)| *name == k)
                 .map(|(_, v)| std::ffi::OsString::from(*v))
-        }
-    }
-
-    #[test]
-    fn capture_oauth_env_vars_swaps_real_oauth_bearer_for_nonce() {
-        let broker = TokenBroker::new();
-        let mut outcome = PreflightOutcome::default();
-        capture_oauth_env_vars_from(
-            &broker,
-            true,
-            fake_env(&[("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-real")]),
-            &mut outcome,
-        );
-
-        assert_eq!(outcome.env_overrides.len(), 1);
-        let (key, nonce) = &outcome.env_overrides[0];
-        assert_eq!(key, "CLAUDE_CODE_OAUTH_TOKEN");
-        assert!(nonce.starts_with("nono_"));
-        assert_eq!(
-            broker.resolve(nonce).unwrap().as_str(),
-            "sk-ant-oat01-real",
-            "broker must resolve the nonce back to the captured real token"
-        );
-    }
-
-    #[test]
-    fn capture_oauth_env_vars_skips_empty_and_nonce_prefixed_values() {
-        let broker = TokenBroker::new();
-        let mut outcome = PreflightOutcome::default();
-        capture_oauth_env_vars_from(
-            &broker,
-            true,
-            fake_env(&[
-                ("CLAUDE_CODE_OAUTH_TOKEN", ""),
-                ("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "nono_already_captured"),
-                ("ANTHROPIC_AUTH_TOKEN", "real_value"),
-            ]),
-            &mut outcome,
-        );
-        assert_eq!(
-            outcome.env_overrides.len(),
-            1,
-            "only ANTHROPIC_AUTH_TOKEN should be captured"
-        );
-        assert_eq!(outcome.env_overrides[0].0, "ANTHROPIC_AUTH_TOKEN");
-    }
-
-    #[test]
-    fn capture_oauth_env_vars_handles_all_three_known_bearer_vars() {
-        let broker = TokenBroker::new();
-        let mut outcome = PreflightOutcome::default();
-        capture_oauth_env_vars_from(
-            &broker,
-            true,
-            fake_env(&[
-                ("CLAUDE_CODE_OAUTH_TOKEN", "access_token"),
-                ("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "refresh_token"),
-                ("ANTHROPIC_AUTH_TOKEN", "auth_token"),
-            ]),
-            &mut outcome,
-        );
-        assert_eq!(outcome.env_overrides.len(), 3);
-        // Each captured original must round-trip through the broker.
-        for (key, nonce) in &outcome.env_overrides {
-            let expected = match key.as_str() {
-                "CLAUDE_CODE_OAUTH_TOKEN" => "access_token",
-                "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" => "refresh_token",
-                "ANTHROPIC_AUTH_TOKEN" => "auth_token",
-                other => panic!("unexpected key {other}"),
-            };
-            assert_eq!(broker.resolve(nonce).unwrap().as_str(), expected);
         }
     }
 

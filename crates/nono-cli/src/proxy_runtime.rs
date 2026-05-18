@@ -285,7 +285,7 @@ pub(crate) fn start_proxy_runtime(
     // session-scoped `TokenBroker` handed to the proxy as
     // `Arc<dyn TokenResolver>`.
     let oauth_capture_active = proxy.oauth_capture;
-    let (proxy_runtime, preflight_env_overrides) = if oauth_capture_active {
+    let proxy_runtime = if oauth_capture_active {
         // Idempotent: skip any route whose prefix already exists (the
         // operator may have wired it declaratively).
         for route in oauth_capture_routes() {
@@ -299,7 +299,7 @@ pub(crate) fn start_proxy_runtime(
         // issued nonce before claude reads it. Without this the OAuth-
         // capture feature is silently a no-op for already-authenticated
         // users — see crates/nono-cli/src/oauth_preflight.rs.
-        let preflight = oauth_preflight::run_oauth_preflight(
+        oauth_preflight::run_oauth_preflight(
             broker.as_ref(),
             program,
             silent,
@@ -307,19 +307,14 @@ pub(crate) fn start_proxy_runtime(
         )?;
         let resolver: Arc<dyn nono_proxy::TokenResolver> = broker;
         info!(
-            "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker \
-             (pre-flight swapped {} env-var credential(s))",
+            "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker",
             oauth_capture_routes().len(),
-            preflight.env_overrides.len()
         );
-        (
-            nono_proxy::ProxyRuntime {
-                token_resolver: Some(resolver),
-            },
-            preflight.env_overrides,
-        )
+        nono_proxy::ProxyRuntime {
+            token_resolver: Some(resolver),
+        }
     } else {
-        (nono_proxy::ProxyRuntime::default(), Vec::new())
+        nono_proxy::ProxyRuntime::default()
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -426,14 +421,6 @@ pub(crate) fn start_proxy_runtime(
     }
 
     for (key, value) in handle.credential_env_vars(&proxy_config) {
-        env_vars.push((key, value));
-    }
-
-    // OAuth-capture pre-flight overrides (nonces replacing real bearer
-    // tokens in CLAUDE_CODE_OAUTH_TOKEN etc.). Pushed last so they win
-    // if any preceding entry happens to set the same key — pre-flight
-    // is the authoritative source for these specific variables.
-    for (key, value) in preflight_env_overrides {
         env_vars.push((key, value));
     }
 
