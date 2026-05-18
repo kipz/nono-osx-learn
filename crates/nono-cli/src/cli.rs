@@ -1662,6 +1662,12 @@ pub struct RunArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub no_diagnostics: bool,
 
+    /// Startup timeout in seconds for known interactive agents (e.g. opencode, claude).
+    /// Set to 0 to disable. Only applies when no --profile is specified.
+    /// Default: 5. Overrides NONO_STARTUP_TIMEOUT.
+    #[arg(long = "startup-timeout", value_name = "SECS", env = "NONO_STARTUP_TIMEOUT", help_heading = "OPTIONS")]
+    pub startup_timeout_secs: Option<u64>,
+
     /// Disable the audit trail for this session
     #[arg(
         long,
@@ -1726,6 +1732,12 @@ pub struct ShellArgs {
     #[arg(long, value_name = "NAME", help_heading = "OPTIONS")]
     pub name: Option<String>,
 
+    /// Startup timeout in seconds for known interactive agents (e.g. opencode, claude).
+    /// Set to 0 to disable. Only applies when no --profile is specified.
+    /// Default: 5. Overrides NONO_STARTUP_TIMEOUT.
+    #[arg(long = "startup-timeout", value_name = "SECS", env = "NONO_STARTUP_TIMEOUT", help_heading = "OPTIONS")]
+    pub startup_timeout_secs: Option<u64>,
+
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
@@ -1740,6 +1752,12 @@ pub struct WrapArgs {
     /// Suppress diagnostic footer on command failure
     #[arg(long, help_heading = "OPTIONS")]
     pub no_diagnostics: bool,
+
+    /// Startup timeout in seconds for known interactive agents (e.g. opencode, claude).
+    /// Set to 0 to disable. Only applies when no --profile is specified.
+    /// Default: 5. Overrides NONO_STARTUP_TIMEOUT.
+    #[arg(long = "startup-timeout", value_name = "SECS", env = "NONO_STARTUP_TIMEOUT", help_heading = "OPTIONS")]
+    pub startup_timeout_secs: Option<u64>,
 
     /// Command to run inside the sandbox
     #[arg(required = true, hide = true)]

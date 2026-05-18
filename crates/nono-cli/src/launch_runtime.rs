@@ -106,6 +106,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) redaction_policy: nono::ScrubPolicy,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) startup_timeout_secs: Option<u64>,
 }
 
 impl ExecutionFlags {
@@ -134,6 +135,7 @@ impl ExecutionFlags {
             redaction_policy: nono::ScrubPolicy::secure_default(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            startup_timeout_secs: None,
         })
     }
 }
@@ -154,6 +156,7 @@ pub(crate) fn prepare_run_launch_plan(
     let no_audit_integrity = run_args.no_audit_integrity;
     let audit_sign_key = run_args.audit_sign_key.clone();
     let trust_override = run_args.trust_override;
+    let startup_timeout_secs = run_args.startup_timeout_secs;
 
     if audit_sign_key
         .as_deref()
@@ -267,6 +270,7 @@ pub(crate) fn prepare_run_launch_plan(
             redaction_policy,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
+            startup_timeout_secs,
         },
     })
 }

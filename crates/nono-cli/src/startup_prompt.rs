@@ -1,4 +1,5 @@
 use crate::exec_strategy::StartupTimeoutConfig;
+use crate::output::format_startup_blocked;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use std::io::{self, IsTerminal, Write};
@@ -15,51 +16,27 @@ pub(crate) fn print_terminal_safe_stderr(message: &str) {
 }
 
 fn prompt_startup_termination(timeout_cfg: StartupTimeoutConfig<'_>, has_output: bool) -> bool {
-    let description = if has_output {
-        format!(
-            "[nono] Startup appears blocked: `{}` has not become interactive after {} seconds.",
-            timeout_cfg.program,
-            timeout_cfg.timeout.as_secs()
-        )
-    } else {
-        format!(
-            "[nono] Startup appears blocked: `{}` produced no terminal output after {} seconds.",
-            timeout_cfg.program,
-            timeout_cfg.timeout.as_secs()
-        )
-    };
+    let lines = format_startup_blocked(
+        timeout_cfg.program,
+        timeout_cfg.timeout.as_secs(),
+        has_output,
+        timeout_cfg.recommended_profile,
+    );
 
     let mut tty_out = match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
         Ok(file) => file,
         Err(_) => {
-            print_terminal_safe_stderr(&format!(
-                "{}\n[nono] `{}` usually needs the built-in `{}` profile.\n[nono] Try: nono run --profile {} -- {}\n[nono] Terminating startup-blocked process so diagnostics can show denied paths.",
-                description,
-                timeout_cfg.program,
-                timeout_cfg.profile,
-                timeout_cfg.profile,
-                timeout_cfg.program,
-            ));
+            for line in &lines {
+                print_terminal_safe_stderr(line);
+            }
             return true;
         }
     };
 
     let _ = writeln!(tty_out);
-    let _ = writeln!(tty_out, "{}", description);
-    let _ = writeln!(
-        tty_out,
-        "[nono] `{}` usually needs the built-in `{}` profile.",
-        timeout_cfg.program, timeout_cfg.profile
-    );
-    let _ = writeln!(
-        tty_out,
-        "[nono] Try: nono run --profile {} -- {}",
-        timeout_cfg.profile, timeout_cfg.program
-    );
-    let _ = writeln!(
-        tty_out,
-        "[nono] Terminating startup-blocked process so diagnostics can show denied paths."
-    );
+    for line in &lines {
+        let _ = writeln!(tty_out, "{}", line);
+    }
     let _ = tty_out.flush();
     true
 }

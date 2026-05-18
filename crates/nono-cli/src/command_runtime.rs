@@ -150,6 +150,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             ignored_denial_paths: prepared.ignored_denial_paths,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
+            startup_timeout_secs: args.startup_timeout_secs,
             proxy,
             redaction_policy: load_configured_redaction_policy()?,
             session: SessionLaunchOptions {
@@ -166,6 +167,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     let args: SandboxArgs = wrap_args.sandbox.into();
     let command = wrap_args.command;
     let no_diagnostics = wrap_args.no_diagnostics;
+    let startup_timeout_secs = wrap_args.startup_timeout_secs;
 
     if command.is_empty() {
         return Err(NonoError::NoCommand);
@@ -232,6 +234,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
             ignored_denial_paths: prepared.ignored_denial_paths,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
+            startup_timeout_secs,
             ..ExecutionFlags::defaults(silent)?
         },
     })

@@ -12,8 +12,6 @@ use std::path::Path;
 use std::time::Duration;
 use tracing::{error, info};
 
-const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-
 fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
     caps: &CapabilitySet,
@@ -129,25 +127,6 @@ fn recommended_builtin_profile(program: &Path) -> Option<&'static str> {
     }
 }
 
-fn should_apply_startup_timeout(
-    recommended_profile: Option<&str>,
-    cmd_args: &[impl AsRef<std::ffi::OsStr>],
-) -> bool {
-    recommended_profile.is_some() && cmd_args.is_empty()
-}
-
-fn startup_timeout_profile<'a>(
-    recommended_profile: Option<&'a str>,
-    explicit_profile: Option<&str>,
-) -> Option<&'a str> {
-    let recommended = recommended_profile?;
-    if let Some(explicit) = explicit_profile
-        && (explicit == recommended || explicit == format!("{recommended}-local"))
-    {
-        return None;
-    }
-    Some(recommended)
-}
 
 pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let LaunchPlan {
@@ -190,8 +169,6 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         None
     };
-    let startup_timeout_profile =
-        startup_timeout_profile(known_builtin_profile, flags.session.profile_name.as_deref());
 
     let recommended_program_name = resolved_program
         .file_name()
@@ -329,15 +306,14 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             .as_deref()
             .or(recommended_profile),
         ignored_denial_paths: &flags.ignored_denial_paths,
-        startup_timeout: if should_apply_startup_timeout(startup_timeout_profile, &cmd_args) {
-            startup_timeout_profile.map(|profile| exec_strategy::StartupTimeoutConfig {
-                timeout: PROFILE_HINT_STARTUP_TIMEOUT,
+        startup_timeout: flags
+            .startup_timeout_secs
+            .filter(|&secs| secs > 0)
+            .map(|secs| exec_strategy::StartupTimeoutConfig {
+                timeout: Duration::from_secs(secs),
                 program: recommended_program_name,
-                profile,
-            })
-        } else {
-            None
-        },
+                recommended_profile: known_builtin_profile,
+            }),
         capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,
@@ -432,10 +408,7 @@ fn write_capability_state_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        compute_executable_identity, recommended_builtin_profile, should_apply_startup_timeout,
-        startup_timeout_profile,
-    };
+    use super::{compute_executable_identity, recommended_builtin_profile};
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::Path;
@@ -455,38 +428,6 @@ mod tests {
     #[test]
     fn recommended_builtin_profile_ignores_unknown_commands() {
         assert_eq!(recommended_builtin_profile(Path::new("/usr/bin/env")), None);
-    }
-
-    #[test]
-    fn startup_timeout_applies_only_to_bare_interactive_profiled_tools() {
-        let no_args: [&str; 0] = [];
-        assert!(should_apply_startup_timeout(Some("claude-code"), &no_args));
-        assert!(!should_apply_startup_timeout(
-            Some("claude-code"),
-            &["--version"]
-        ));
-        assert!(!should_apply_startup_timeout(None, &no_args));
-    }
-
-    #[test]
-    fn startup_timeout_profile_ignores_matching_explicit_profile_only() {
-        assert_eq!(
-            startup_timeout_profile(Some("claude-code"), None),
-            Some("claude-code")
-        );
-        assert_eq!(
-            startup_timeout_profile(Some("claude-code"), Some("default")),
-            Some("claude-code")
-        );
-        assert_eq!(
-            startup_timeout_profile(Some("claude-code"), Some("claude-code")),
-            None
-        );
-        assert_eq!(
-            startup_timeout_profile(Some("claude-code"), Some("claude-code-local")),
-            None
-        );
-        assert_eq!(startup_timeout_profile(None, Some("default")), None);
     }
 
     #[test]
