@@ -156,6 +156,7 @@ pub(crate) fn prepare_proxy_launch_options(
         open_url_allow_localhost: prepared.open_url_allow_localhost,
         allow_launch_services_active: prepared.allow_launch_services_active,
         oauth_capture: prepared.oauth_capture,
+        denied_env_vars: prepared.denied_env_vars.clone(),
     })
 }
 
@@ -298,7 +299,12 @@ pub(crate) fn start_proxy_runtime(
         // issued nonce before claude reads it. Without this the OAuth-
         // capture feature is silently a no-op for already-authenticated
         // users — see crates/nono-cli/src/oauth_preflight.rs.
-        let preflight = oauth_preflight::run_oauth_preflight(broker.as_ref(), program, silent)?;
+        let preflight = oauth_preflight::run_oauth_preflight(
+            broker.as_ref(),
+            program,
+            silent,
+            proxy.denied_env_vars.as_deref(),
+        )?;
         let resolver: Arc<dyn nono_proxy::TokenResolver> = broker;
         info!(
             "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker \

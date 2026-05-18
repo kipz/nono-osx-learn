@@ -85,6 +85,10 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) oauth_capture: bool,
+    /// Env-var deny patterns from the resolved profile. Pre-flight uses
+    /// this to skip the API-key fail-closed check for vars the profile
+    /// would strip before the child sees them.
+    pub(crate) denied_env_vars: Option<Vec<String>>,
 }
 
 #[derive(Clone)]

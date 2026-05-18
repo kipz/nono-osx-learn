@@ -47,12 +47,13 @@
 //! child never spawns. Better to bail loudly than to half-rewrite the
 //! user's credentials.
 
+use crate::exec_strategy::is_env_var_denied;
 use crate::mediation::broker::TokenBroker;
 use nono::{NonoError, Result};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 /// OAuth-bearer environment variables we rewrite. Claude reads each of
@@ -93,17 +94,24 @@ pub(crate) struct PreflightOutcome {
 /// Run the pre-flight rewrite if the target program is `claude` and
 /// OAuth capture is active. For any other program this is a quiet
 /// no-op — pre-flight is a Claude-Code-specific feature.
+///
+/// `denied_env_vars` is the profile's env-var deny list (the same list
+/// that strips vars from the child's environment at exec time). Any
+/// API-key var in that list is skipped by the fail-closed check —
+/// if the profile would strip it before the child sees it, it poses
+/// no capture risk.
 pub(crate) fn run_oauth_preflight(
     broker: &TokenBroker,
     program: &OsStr,
     silent: bool,
+    denied_env_vars: Option<&[String]>,
 ) -> Result<PreflightOutcome> {
     if !program_is_claude(program) {
         debug!("oauth_capture: target program is not claude; skipping pre-flight");
         return Ok(PreflightOutcome::default());
     }
 
-    if let Some(reason) = detect_blocking_api_key_surface()? {
+    if let Some(reason) = detect_blocking_api_key_surface(denied_env_vars)? {
         return Err(NonoError::SandboxInit(format!(
             "oauth_capture is enabled but an API-key credential is already configured: {reason}. \
              The OAuth-capture path proxies Authorization: Bearer tokens; \
@@ -117,8 +125,27 @@ pub(crate) fn run_oauth_preflight(
     let mut outcome = PreflightOutcome::default();
     capture_oauth_env_vars_from(broker, silent, |k| std::env::var_os(k), &mut outcome);
 
-    rewrite_keychain_oauth_entry(broker, silent)?;
-    rewrite_credentials_file(broker, silent)?;
+    // Rewrite surfaces with snapshot-restore: if the keychain write
+    // succeeds but the file write subsequently fails, we restore the
+    // keychain to avoid leaving the user with nonces that nothing can
+    // resolve. Each rewrite function returns the original value when
+    // it actually modified something (None = no-op / already nonces).
+    let keychain_snapshot = rewrite_keychain_oauth_entry(broker, silent)?;
+
+    if let Err(file_err) = rewrite_credentials_file(broker, silent) {
+        #[cfg(target_os = "macos")]
+        if let Some(original) = keychain_snapshot {
+            if let Err(restore_err) = restore_keychain_entry(&original) {
+                warn!(
+                    "oauth_capture pre-flight: file rewrite failed AND keychain restore failed \
+                     ({restore_err}); user may need to run `claude /login` to restore auth"
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = keychain_snapshot;
+        return Err(file_err);
+    }
 
     Ok(outcome)
 }
@@ -166,8 +193,14 @@ fn log_capture(silent: bool, surface: &str) {
 /// Returns `Some(reason)` if an API-key credential is present anywhere
 /// pre-flight would otherwise need to handle. The caller treats this as
 /// fatal — see the module docstring.
-fn detect_blocking_api_key_surface() -> Result<Option<String>> {
-    if let Some(reason) = detect_api_key_env_var_from(|k| std::env::var_os(k)) {
+///
+/// `denied_env_vars` is the profile's env-var deny list. Any API-key var
+/// the profile would strip from the child's env is excluded from the
+/// check — it won't reach the child regardless.
+fn detect_blocking_api_key_surface(denied_env_vars: Option<&[String]>) -> Result<Option<String>> {
+    if let Some(reason) =
+        detect_api_key_env_var_from(|k| std::env::var_os(k), denied_env_vars)
+    {
         return Ok(Some(reason));
     }
 
@@ -188,12 +221,20 @@ fn detect_blocking_api_key_surface() -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Test-friendly: scan `API_KEY_ENV_VARS` against an injected env reader.
-fn detect_api_key_env_var_from<F>(env_reader: F) -> Option<String>
+/// Test-friendly: scan `API_KEY_ENV_VARS` against an injected env reader,
+/// skipping any var the profile's deny list would strip before the child
+/// sees it.
+fn detect_api_key_env_var_from<F>(env_reader: F, denied_env_vars: Option<&[String]>) -> Option<String>
 where
     F: Fn(&str) -> Option<std::ffi::OsString>,
 {
     for &key in API_KEY_ENV_VARS {
+        // The profile would deny this var to the child anyway — skip it.
+        if let Some(denied) = denied_env_vars {
+            if is_env_var_denied(key, denied) {
+                continue;
+            }
+        }
         if let Some(value) = env_reader(key)
             && !value.is_empty()
         {
@@ -257,10 +298,17 @@ fn detect_api_key_keychain_macos() -> Result<Option<String>> {
 }
 
 /// Rewrite the macOS keychain `Claude Code-credentials` entry if it
-/// currently holds a real Anthropic OAuth pair. No-op on non-macOS and
-/// when the entry is absent or already nonce-bearing.
+/// currently holds a real Anthropic OAuth pair.
+///
+/// Returns `Some(original_json)` when the entry was rewritten (the
+/// caller uses this as a rollback snapshot if a later step fails), or
+/// `None` when no modification was made (entry absent, already has
+/// nonces, or no `claudeAiOauth` object).
 #[cfg(target_os = "macos")]
-fn rewrite_keychain_oauth_entry(broker: &TokenBroker, silent: bool) -> Result<()> {
+fn rewrite_keychain_oauth_entry(
+    broker: &TokenBroker,
+    silent: bool,
+) -> Result<Option<Zeroizing<String>>> {
     let (config_dir, explicit) = claude_config_dir()
         .map_err(|err| NonoError::SandboxInit(format!("oauth_capture pre-flight: {err}")))?;
     let service = claude_keychain_service_name(&config_dir, explicit, "-credentials");
@@ -268,7 +316,7 @@ fn rewrite_keychain_oauth_entry(broker: &TokenBroker, silent: bool) -> Result<()
 
     let raw = match read_keychain_item(&account, &service) {
         Some(value) if !value.trim().is_empty() => value,
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
 
     let mut parsed: Value = serde_json::from_str(&raw).map_err(|err| {
@@ -287,7 +335,7 @@ fn rewrite_keychain_oauth_entry(broker: &TokenBroker, silent: bool) -> Result<()
             debug!(
                 "oauth_capture pre-flight: keychain entry has no claudeAiOauth object; nothing to capture"
             );
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -303,7 +351,7 @@ fn rewrite_keychain_oauth_entry(broker: &TokenBroker, silent: bool) -> Result<()
     if access.as_deref().is_none_or(str::is_empty)
         || access.as_deref().is_some_and(|v| v.starts_with("nono_"))
     {
-        return Ok(());
+        return Ok(None);
     }
 
     let access_token = access.ok_or_else(|| {
@@ -345,16 +393,37 @@ fn rewrite_keychain_oauth_entry(broker: &TokenBroker, silent: bool) -> Result<()
 
     write_keychain_item(&service, &account, &rewritten)?;
     log_capture(silent, &format!("keychain \"{service}\""));
-    Ok(())
+    Ok(Some(Zeroizing::new(raw)))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn rewrite_keychain_oauth_entry(_broker: &TokenBroker, _silent: bool) -> Result<()> {
-    Ok(())
+fn rewrite_keychain_oauth_entry(
+    _broker: &TokenBroker,
+    _silent: bool,
+) -> Result<Option<Zeroizing<String>>> {
+    Ok(None)
+}
+
+/// Restore the macOS `Claude Code-credentials` keychain entry to
+/// `original` after a subsequent pre-flight step failed. Best-effort:
+/// logs a warning on failure rather than returning an error (we're
+/// already in an error path).
+#[cfg(target_os = "macos")]
+fn restore_keychain_entry(original: &Zeroizing<String>) -> Result<()> {
+    let (config_dir, explicit) = claude_config_dir()
+        .map_err(|err| NonoError::SandboxInit(format!("oauth_capture restore: {err}")))?;
+    let service = claude_keychain_service_name(&config_dir, explicit, "-credentials");
+    let account = claude_keychain_account_name();
+    write_keychain_item(&service, &account, original)
 }
 
 /// Rewrite `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR/.credentials.json`)
 /// if it holds a real OAuth pair. Cross-platform.
+///
+/// The return value mirrors `rewrite_keychain_oauth_entry`: `Some((path,
+/// original_content))` when the file was rewritten, `None` otherwise.
+/// Not used by the caller today (file is the last step, so there is
+/// nothing to roll back on its failure), but kept symmetric for clarity.
 fn rewrite_credentials_file(broker: &TokenBroker, silent: bool) -> Result<()> {
     let config_dir = match claude_config_dir_cross_platform() {
         Some(dir) => dir,
@@ -656,7 +725,8 @@ mod tests {
         // Even with a real-token-bearing env var, pre-flight skips when
         // the program isn't claude. (Other binaries don't read these.)
         let broker = TokenBroker::new();
-        let outcome = run_oauth_preflight(&broker, OsStr::new("/usr/bin/codex"), true).unwrap();
+        let outcome =
+            run_oauth_preflight(&broker, OsStr::new("/usr/bin/codex"), true, None).unwrap();
         assert!(outcome.env_overrides.is_empty());
     }
 
@@ -858,16 +928,61 @@ mod tests {
 
     #[test]
     fn detect_api_key_env_var_flags_first_non_empty_match() {
-        assert_eq!(detect_api_key_env_var_from(fake_env(&[])), None);
+        assert_eq!(detect_api_key_env_var_from(fake_env(&[]), None), None);
         assert_eq!(
-            detect_api_key_env_var_from(fake_env(&[("ANTHROPIC_API_KEY", "")])),
+            detect_api_key_env_var_from(fake_env(&[("ANTHROPIC_API_KEY", "")]), None),
             None,
             "empty value must not count"
         );
         assert_eq!(
-            detect_api_key_env_var_from(fake_env(&[("ANTHROPIC_API_KEY", "sk-ant-api03-xxx")]))
-                .unwrap(),
+            detect_api_key_env_var_from(
+                fake_env(&[("ANTHROPIC_API_KEY", "sk-ant-api03-xxx")]),
+                None
+            )
+            .unwrap(),
             "environment variable ANTHROPIC_API_KEY"
+        );
+    }
+
+    #[test]
+    fn detect_api_key_env_var_skips_vars_denied_by_profile() {
+        // A var the profile would deny to the child should not trigger
+        // the fail-closed check — the child won't see it regardless.
+        let denied = vec!["ANTHROPIC_API_KEY".to_string()];
+        assert_eq!(
+            detect_api_key_env_var_from(
+                fake_env(&[("ANTHROPIC_API_KEY", "sk-ant-api03-real")]),
+                Some(&denied),
+            ),
+            None,
+            "denied var must not trigger fail-closed"
+        );
+        // A different API-key var that is NOT in the deny list should still block.
+        assert!(
+            detect_api_key_env_var_from(
+                fake_env(&[
+                    ("ANTHROPIC_API_KEY", "sk-ant-api03-real"),
+                    ("ANTHROPIC_UNIX_SOCKET", "/tmp/socket"),
+                ]),
+                Some(&denied),
+            )
+            .is_some(),
+            "non-denied API-key var must still trigger fail-closed"
+        );
+    }
+
+    #[test]
+    fn detect_api_key_env_var_respects_glob_patterns_in_deny_list() {
+        // Profile deny lists can use glob-like patterns (e.g. GITHUB_*).
+        // Verify the check delegates to `is_env_var_denied` correctly.
+        let denied = vec!["ANTHROPIC_*".to_string()];
+        assert_eq!(
+            detect_api_key_env_var_from(
+                fake_env(&[("ANTHROPIC_API_KEY", "sk-ant-api03-real")]),
+                Some(&denied),
+            ),
+            None,
+            "glob-matched denied var must not trigger fail-closed"
         );
     }
 
