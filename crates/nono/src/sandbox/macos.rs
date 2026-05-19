@@ -645,20 +645,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(allow file-write* (extension \"com.apple.app-sandbox.read-write\"))\n");
     }
 
-    // SECURITY: Platform deny rules are placed BETWEEN read and write rules.
-    // This matches the research CLI pattern where sensitive path denials come
-    // after read allows but before write allows. In Seatbelt, more specific rules
-    // always win regardless of order; for equal specificity, last-match wins.
-    // Placing deny rules here ensures they override read allows when equally specific,
-    // while write allows below can still override deny-unlink for user-granted paths.
-    for rule in caps.platform_rules() {
-        profile.push_str(rule);
-        profile.push('\n');
-    }
-
     // Add write rules for all capabilities with Write or ReadWrite access.
-    // These come AFTER platform deny rules so user-granted write paths can
-    // override global denials like (deny file-write-unlink).
     // Emits rules for both original and resolved paths when they differ.
     for cap in caps.fs_capabilities() {
         match cap.access {
@@ -671,6 +658,18 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                 // Read-only doesn't need write access
             }
         }
+    }
+
+    // SECURITY: Platform-supplied rules (from groups, add_deny_access, and
+    // unsafe_macos_seatbelt_rules) are emitted AFTER user write allows so
+    // targeted denies actually win. Seatbelt is last-rule-wins for filtered
+    // rules of the same operation, so a deny placed before a broad allow such
+    // as `(allow file-write* (subpath "/"))` is silently overridden.
+    // Unselectored denies like `(deny file-write-unlink)` block regardless of
+    // order, so unlink semantics are preserved.
+    for rule in caps.platform_rules() {
+        profile.push_str(rule);
+        profile.push('\n');
     }
 
     // Network rules
@@ -1058,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_profile_platform_rules_between_reads_and_writes() {
+    fn test_generate_profile_platform_rules_after_writes() {
         let mut caps = CapabilitySet::new();
         caps.add_fs(FsCapability {
             original: PathBuf::from("/test"),
@@ -1067,28 +1066,31 @@ mod tests {
             is_file: false,
             source: CapabilitySource::User,
         });
-        caps.add_platform_rule("(deny file-write-unlink)").unwrap();
+        caps.add_platform_rule("(deny file-write* (subpath \"/test/protected\"))")
+            .unwrap();
 
         let profile = generate_profile(&caps).unwrap();
 
         let read_pos = profile
             .find("(allow file-read* (subpath \"/test\"))")
             .expect("read rule not found");
-        let deny_pos = profile
-            .find("(deny file-write-unlink)")
-            .expect("deny rule not found");
         let write_pos = profile
             .find("(allow file-write* (subpath \"/test\"))")
             .expect("write rule not found");
+        let deny_pos = profile
+            .find("(deny file-write* (subpath \"/test/protected\"))")
+            .expect("deny rule not found");
 
-        // Order: read rules -> platform deny rules -> write rules
+        // Order: read rules -> write rules -> platform rules
+        // Targeted denies must come after broad write allows so they win under
+        // Seatbelt's last-rule-wins semantics for filtered rules.
         assert!(
-            read_pos < deny_pos,
-            "read rules must come before platform deny rules"
+            read_pos < write_pos,
+            "read rules must come before write rules"
         );
         assert!(
-            deny_pos < write_pos,
-            "platform deny rules must come before write rules"
+            write_pos < deny_pos,
+            "platform rules must come after write rules so targeted denies override broad allows"
         );
     }
 
@@ -1129,7 +1131,10 @@ mod tests {
 
     #[test]
     fn test_generate_profile_gpu_rules_ordering() {
-        // GPU rules (as platform rules) should appear between read and write rules
+        // GPU/IOKit rules carried via platform_rules target a different
+        // operation (iokit-get-properties), so they don't interact with file
+        // read/write ordering. They follow the platform_rules emission point
+        // (after write allows) and must still appear in the generated profile.
         let mut caps = CapabilitySet::new();
         caps.add_fs(FsCapability {
             original: PathBuf::from("/test"),
@@ -1146,20 +1151,20 @@ mod tests {
         let read_pos = profile
             .find("(allow file-read* (subpath \"/test\"))")
             .expect("read rule not found");
-        let iokit_pos = profile
-            .find("(allow iokit-get-properties)")
-            .expect("iokit rule not found");
         let write_pos = profile
             .find("(allow file-write* (subpath \"/test\"))")
             .expect("write rule not found");
+        let iokit_pos = profile
+            .find("(allow iokit-get-properties)")
+            .expect("iokit rule not found");
 
         assert!(
-            read_pos < iokit_pos,
-            "read rules must come before GPU/IOKit platform rules"
+            read_pos < write_pos,
+            "read rules must come before write rules"
         );
         assert!(
-            iokit_pos < write_pos,
-            "GPU/IOKit platform rules must come before write rules"
+            write_pos < iokit_pos,
+            "platform rules emit after write rules"
         );
     }
 
