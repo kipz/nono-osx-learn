@@ -221,6 +221,189 @@ Map of application name to hook configuration:
 | `matcher` | string | Regex for tool name matching. |
 | `script`  | string | Script filename from embedded hooks. |
 
+### mediation
+
+Per-command interception of agent invocations. The mediation server runs in the unsandboxed supervisor parent; the sandbox's `PATH` resolves to a shim that forwards the invocation over a Unix socket. Each invocation is dispatched against the matching `CommandEntry`'s intercept list (first-match) and falls back to its required `default` action when no intercept fires.
+
+```json
+{
+  "mediation": {
+    "commands": [
+      {
+        "name": "gh",
+        "default": {
+          "action": { "type": "run" },
+          "sandbox": { "network": { "allowed_hosts": ["github.com", "*.github.com"] } }
+        },
+        "intercept": [
+          {
+            "id": "auth-token",
+            "match": { "all": [
+              { "nth_arg_matches": 0, "regex": "^auth$" },
+              { "nth_arg_matches": 1, "regex": "^token$" }
+            ]},
+            "action": {
+              "type": "capture",
+              "grant_to": ["gh.default"]
+            }
+          }
+        ]
+      }
+    ],
+    "env": {
+      "block": ["GH_TOKEN", "GITHUB_TOKEN"]
+    }
+  }
+}
+```
+
+#### commands[]
+
+| Field           | Type            | Required | Description |
+|-----------------|-----------------|----------|-------------|
+| `name`          | string          | yes      | Command name as the agent invokes it (resolved via `which` at session start). |
+| `binary_path`   | string          | no       | Absolute path to the real binary, bypassing `which`. Use when `which` resolves to a wrapper. |
+| `default`       | DefaultEntry    | yes      | Dispatched when no intercept rule matches. Profile load fails if absent. |
+| `intercept`     | array           | no       | Intercept rules. Checked in order; first match wins. |
+| `sandbox`       | CommandSandbox  | no       | Legacy command-level sandbox. Falls back here when both the matched rule and `default` omit a sandbox. Prefer `default.sandbox`. |
+| `caller_policy` | CallerPolicy    | no       | Gate on who may invoke. Default: any caller. |
+
+#### default (required)
+
+Every command needs a `default` block. It dispatches when no intercept matches and is referenced by capture grants as `<command>.default`.
+
+| Field     | Type            | Required | Description |
+|-----------|-----------------|----------|-------------|
+| `action`  | InterceptAction | yes      | One of `respond`, `run`, or `capture`. |
+| `sandbox` | CommandSandbox  | no       | Fallback sandbox. Intercept rules with no own `sandbox` inherit this. |
+
+Minimal default — let the call through unchanged:
+
+```json
+{ "default": { "action": { "type": "run" } } }
+```
+
+Default with a sandbox that scopes every fall-through run:
+
+```json
+{
+  "default": {
+    "action": { "type": "run" },
+    "sandbox": {
+      "network": { "allowed_hosts": ["github.com", "*.github.com"] },
+      "keychain_access": true
+    }
+  }
+}
+```
+
+#### intercept[]
+
+```json
+{
+  "id": "gitlab-curl",
+  "match": {
+    "all": [
+      { "any_arg_matches": "^https://gitlab\\.ddbuild\\.io" },
+      { "not": { "any_arg_matches": "^-k$" } }
+    ]
+  },
+  "admin": false,
+  "action": { "type": "run" },
+  "sandbox": { "network": { "allowed_hosts": ["gitlab.ddbuild.io"] } }
+}
+```
+
+| Field     | Type            | Required | Description |
+|-----------|-----------------|----------|-------------|
+| `id`      | string          | conditional | Identifier within the command's intercept list. Required when any `Capture.grant_to` references this rule as `<command>.<id>`. The id `"default"` is reserved for the default entry. |
+| `match`   | ArgsMatcher     | yes      | Predicate tree against argv. See "Argv matchers" below. |
+| `admin`   | boolean         | no       | Require user authentication before the action runs. Default: false. |
+| `action`  | InterceptAction | yes      | One of `respond`, `run`, or `capture`. |
+| `sandbox` | tri-state       | no       | Per-invocation sandbox binding. See "Sandbox inheritance" below. |
+
+#### Argv matchers
+
+`match` is a recursive predicate tree. Combinators compose leaves:
+
+| Form                                 | Meaning |
+|--------------------------------------|---------|
+| `{ "all": [ ... ] }`                  | Conjunction. Empty list = vacuously true. |
+| `{ "any": [ ... ] }`                  | Disjunction. Empty list = vacuously false. |
+| `{ "not": <matcher> }`                | Logical NOT. |
+| `{ "any_arg_matches": "<regex>" }`    | At least one argv element matches the regex. |
+| `{ "all_args_match": "<regex>" }`     | Every argv element matches (or argv is empty). |
+| `{ "nth_arg_matches": <n>, "regex": "<re>" }` | argv element at index `n` (0-based, counts flags) matches the regex. |
+
+Regexes use the `regex` crate (linear time, no catastrophic backtracking). Inline flags such as `(?i)` and `(?m)` are supported. The matcher sees only argv — not env, cwd, or stdin.
+
+#### action types
+
+Tagged via `"type"`. Three variants:
+
+| Type      | What it does |
+|-----------|--------------|
+| `respond` | Return a static response without calling the real binary. Fields: `stdout`, `stderr`, `exit_code` (all optional with defaults). |
+| `run`     | Run the real binary, streaming stdio. Optional `script` field runs `sh -c "<script>"` instead. Sandboxed per the resolved binding. |
+| `capture` | Run the real binary (or `script`) in the unsandboxed broker parent, capture trimmed stdout, mint a nonce, and return the nonce to the caller. Use for credential-fetching commands so raw tokens never reach the agent. |
+
+```json
+{ "action": { "type": "respond", "stdout": "", "stderr": "blocked", "exit_code": 1 } }
+{ "action": { "type": "run" } }
+{ "action": { "type": "run", "script": "exec git \"$@\"" } }
+{ "action": { "type": "capture", "grant_to": ["gh.default", "git.default"] } }
+{ "action": { "type": "capture", "script": "ddtool auth gitlab token", "grant_to": ["glab.default"] } }
+```
+
+#### capture grants
+
+Every `capture` action must include `grant_to: [...]`. Each entry is the identifier of a consumer authorised to redeem the nonce, in the form `<command>.<intercept-id>`. Use `<command>.default` to reference the command's `default` block.
+
+- `"grant_to": ["gh.default"]` — only `gh`'s default run may substitute the nonce for the real value.
+- `"grant_to": []` — explicitly never redeemable. The nonce is minted but no consumer can decode it; use for defensive captures whose only purpose is to intercept and discard a credential.
+- Field missing → profile load fails. There is no implicit "anywhere" grant.
+
+Capture rules always run unsandboxed in the broker parent so credential helpers can reach the Keychain, OAuth flows, etc. The `sandbox` field on a `Capture` intercept is ignored.
+
+#### sandbox inheritance
+
+The `sandbox` field on an intercept rule is tri-state, distinguished by JSON presence:
+
+| JSON                       | Meaning |
+|----------------------------|---------|
+| field absent               | Inherit. At exec time, falls back to `cmd.default.sandbox`, then the legacy `cmd.sandbox`, then no sandbox. |
+| `"sandbox": null`           | Explicitly unsandboxed. Opts out of inheritance entirely; the rule runs with no per-command sandbox. |
+| `"sandbox": { ... }`        | Explicit sandbox. Use this exact `CommandSandbox` for the matched call. |
+
+Only `run` rules honour this field. `capture` ignores it (always unsandboxed in the broker). `respond` ignores it (no exec happens).
+
+#### CommandSandbox fields
+
+| Field             | Type            | Description |
+|-------------------|-----------------|-------------|
+| `network`         | NetworkConfig   | `{ "block": bool, "allowed_hosts": [string] }`. If `allowed_hosts` is non-empty, a per-command proxy restricts outbound to those hosts. `block` and `allowed_hosts` are mutually exclusive. |
+| `fs_read`         | array of string | Directories the command may read. |
+| `fs_read_file`    | array of string | Individual files the command may read. |
+| `fs_write`        | array of string | Directories the command may write. |
+| `fs_write_file`   | array of string | Individual files the command may write. |
+| `allow_commands`  | array of string | Commands the sandboxed binary may exec directly (real binary, not shim). |
+| `keychain_access` | boolean         | macOS only. Grant read access to login/metadata keychain databases and skip default mach-lookup denies for security daemons. |
+
+#### caller_policy
+
+| Field             | Type             | Default | Description |
+|-------------------|------------------|---------|-------------|
+| `agent_allowed`   | boolean          | `true`  | Allow invocations from the primary agent sandbox. Set `false` for commands only accessible to mediated parents. |
+| `allowed_parents` | array of string  | `null`  | Restrict mediated-parent callers. Field absent = any mediated parent. Empty array = no mediated parent. Listed = only the named parents. |
+
+Caller policy is evaluated before any intercept or sandbox logic.
+
+#### env
+
+| Field   | Type            | Description |
+|---------|-----------------|-------------|
+| `block` | array of string | Environment variable names stripped from the sandboxed child. Use for raw credentials (e.g. `GH_TOKEN`, `GITLAB_TOKEN`) so they cannot bypass mediation. |
+
 ### rollback (alias: undo)
 
 | Field              | Type            | Description |

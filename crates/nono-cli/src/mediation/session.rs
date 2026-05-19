@@ -9,7 +9,7 @@
 
 use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
-use super::broker::TokenBroker;
+use super::broker::{GrantDescriptor, GrantSet, TokenBroker};
 use super::{
     CallerPolicy, CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo,
 };
@@ -24,19 +24,48 @@ use zeroize::Zeroizing;
 /// The action stored in a resolved intercept rule.
 #[derive(Clone, Debug)]
 pub enum ResolvedAction {
-    Respond { stdout: String },
-    Capture { script: Option<String> },
-    Approve { script: Option<String> },
+    Respond {
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
+    Capture {
+        script: Option<String>,
+        grants: GrantSet,
+    },
+    Run {
+        script: Option<String>,
+    },
 }
 
 /// A resolved intercept rule ready for the mediation server.
 #[derive(Clone, Debug)]
 pub struct ResolvedIntercept {
-    pub args_prefix: Vec<String>,
+    /// Optional identifier carried over from the profile rule. When set,
+    /// this is the redemption-site identifier other rules can reference
+    /// via `Capture.grant_to = ["<command>.<id>"]`.
+    pub id: Option<String>,
+    /// Compiled predicate against the invocation's argv.
+    pub matcher: crate::mediation::matcher::ResolvedArgsMatcher,
     pub action: ResolvedAction,
-    pub exit_code: i32,
     /// If true, requires user authentication before the action executes.
     pub admin: bool,
+    /// Tri-state binding resolved from the profile's `SandboxBinding`. At
+    /// exec time, `policy::apply` collapses this to `Option<CommandSandbox>`:
+    /// `Explicit` → use the rule's sandbox; `ExplicitlyUnsandboxed` → None;
+    /// `InheritFromDefault` → `cmd.default.sandbox` if set, else legacy
+    /// `cmd.sandbox`.
+    pub sandbox: ResolvedSandboxBinding,
+}
+
+/// Resolved counterpart of `mediation::SandboxBinding`. The tri-state is
+/// preserved through profile load so `policy::apply` can decide what to
+/// inherit from at exec time.
+#[derive(Clone, Debug)]
+pub enum ResolvedSandboxBinding {
+    InheritFromDefault,
+    ExplicitlyUnsandboxed,
+    Explicit(crate::mediation::CommandSandbox),
 }
 
 /// A fully resolved command entry ready for the mediation server.
@@ -50,6 +79,17 @@ pub struct ResolvedCommand {
     pub sandbox: Option<CommandSandbox>,
     /// Gate that decides whether a given caller may invoke this command.
     pub caller_policy: CallerPolicy,
+    /// Default entry dispatched when no intercept matches.
+    pub default: ResolvedDefault,
+}
+
+/// A resolved default entry. When present on `ResolvedCommand`, dispatched
+/// after the intercept loop completes without a match — replaces the legacy
+/// implicit fall-through.
+#[derive(Clone, Debug)]
+pub struct ResolvedDefault {
+    pub action: ResolvedAction,
+    pub sandbox: Option<crate::mediation::CommandSandbox>,
 }
 
 /// Handle returned by `setup()`. Dropping this shuts down the runtime.
@@ -182,6 +222,14 @@ pub fn setup(
         blocked_binaries.push(resolved.real_path.clone());
         resolved_commands.push(resolved);
     }
+
+    // -------------------------------------------------------------------------
+    // Profile-load validation of Capture grant_to references and default
+    // actions. Every grant_to entry must resolve to a known
+    // `<command>.default` or `<command>.<intercept-id>`. A command's default
+    // action cannot be `capture` (no intercept id to anchor grants at).
+    // -------------------------------------------------------------------------
+    validate_grant_to_references(&resolved_commands)?;
 
     // -------------------------------------------------------------------------
     // Generate session authentication token and control token
@@ -394,48 +442,47 @@ fn resolve_command(
         ))
     })?;
 
-    // Convert intercept rules, expanding env-var tokens in `args_prefix`
-    // entries at profile-load time so matchers like
-    // `["find-generic-password", "$USER", "Claude Code-credentials"]`
-    // resolve to the current console user instead of requiring profile
-    // authors to pre-substitute placeholders at install time.
+    // Convert intercept rules. Every rule carries a required `match` field
+    // (a predicate tree). Profile load fails if the field is missing.
     let intercepts: Vec<ResolvedIntercept> = entry
         .intercept
         .iter()
-        .map(|rule| {
-            let args_prefix = rule
-                .args_prefix
-                .iter()
-                .map(|arg| crate::profile::expand_str(arg, workdir))
-                .collect::<Result<Vec<String>>>()?;
-            let (action, exit_code) = match &rule.action {
-                InterceptAction::Respond { stdout, exit_code } => (
-                    ResolvedAction::Respond {
-                        stdout: stdout.clone(),
-                    },
-                    *exit_code,
-                ),
-                InterceptAction::Capture { script } => (
-                    ResolvedAction::Capture {
-                        script: script.clone(),
-                    },
-                    0,
-                ),
-                InterceptAction::Approve { script } => (
-                    ResolvedAction::Approve {
-                        script: script.clone(),
-                    },
-                    0,
-                ),
+        .map(|rule| -> Result<ResolvedIntercept> {
+            if matches!(rule.id.as_deref(), Some("default")) {
+                return Err(NonoError::SandboxInit(format!(
+                    "mediation: command '{}': intercept id 'default' is reserved (it refers to the command's default entry)",
+                    entry.name
+                )));
+            }
+            let matcher =
+                crate::mediation::matcher::compile_args_matcher(&rule.matcher, &entry.name)?;
+            let action = resolve_intercept_action(&rule.action)?;
+            let sandbox = match &rule.sandbox {
+                crate::mediation::SandboxBinding::InheritFromDefault => {
+                    ResolvedSandboxBinding::InheritFromDefault
+                }
+                crate::mediation::SandboxBinding::ExplicitlyUnsandboxed => {
+                    ResolvedSandboxBinding::ExplicitlyUnsandboxed
+                }
+                crate::mediation::SandboxBinding::Explicit(sb) => {
+                    ResolvedSandboxBinding::Explicit(sb.clone())
+                }
             };
             Ok(ResolvedIntercept {
-                args_prefix,
+                id: rule.id.clone(),
+                matcher,
                 action,
-                exit_code,
                 admin: rule.admin,
+                sandbox,
             })
         })
         .collect::<Result<Vec<_>>>()?;
+
+    let default_action = resolve_intercept_action(&entry.default.action)?;
+    let default = ResolvedDefault {
+        action: default_action,
+        sandbox: entry.default.sandbox.clone(),
+    };
 
     Ok(Some(ResolvedCommand {
         name: entry.name.clone(),
@@ -443,7 +490,110 @@ fn resolve_command(
         intercepts,
         sandbox: entry.sandbox.clone(),
         caller_policy: entry.caller_policy.clone(),
+        default,
     }))
+}
+
+/// Validate every `Capture` rule's `grant_to` references and the default
+/// action of every command. Called once after all commands are resolved.
+///
+/// Rejects:
+/// - a `grant_to` entry that does not resolve to a known
+///   `<command>.default` or `<command>.<intercept-id>` in the profile;
+/// - a command whose `default.action` is `Capture` (there is no intercept
+///   id to anchor grants at).
+pub(super) fn validate_grant_to_references(commands: &[ResolvedCommand]) -> Result<()> {
+    use std::collections::HashSet;
+
+    let valid_descriptors: HashSet<GrantDescriptor> = commands
+        .iter()
+        .flat_map(|c| {
+            let mut entries = vec![GrantDescriptor {
+                command: c.name.clone(),
+                intercept_id: "default".to_string(),
+            }];
+            for i in &c.intercepts {
+                if let Some(id) = &i.id {
+                    entries.push(GrantDescriptor {
+                        command: c.name.clone(),
+                        intercept_id: id.clone(),
+                    });
+                }
+            }
+            entries
+        })
+        .collect();
+
+    for cmd in commands {
+        for rule in &cmd.intercepts {
+            if let ResolvedAction::Capture {
+                grants: GrantSet::Allow(list),
+                ..
+            } = &rule.action
+            {
+                for d in list {
+                    if !valid_descriptors.contains(d) {
+                        return Err(NonoError::SandboxInit(format!(
+                            "mediation: command '{}' capture rule: grant_to entry '{}.{}' does not resolve to any known intercept or default",
+                            cmd.name, d.command, d.intercept_id
+                        )));
+                    }
+                }
+            }
+        }
+        if matches!(cmd.default.action, ResolvedAction::Capture { .. }) {
+            return Err(NonoError::SandboxInit(format!(
+                "mediation: command '{}': default.action cannot be 'capture'",
+                cmd.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Map a profile `InterceptAction` to a `ResolvedAction`. The `Respond`
+/// variant carries its own `exit_code`, so resolution preserves it directly
+/// on the variant rather than threading a separate rule-level field through
+/// the policy dispatcher. Shared between intercept-rule resolution and
+/// default-entry resolution.
+fn resolve_intercept_action(action: &InterceptAction) -> Result<ResolvedAction> {
+    match action {
+        InterceptAction::Respond {
+            stdout,
+            stderr,
+            exit_code,
+        } => Ok(ResolvedAction::Respond {
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            exit_code: *exit_code,
+        }),
+        InterceptAction::Capture { script, grant_to } => {
+            let grants = if grant_to.is_empty() {
+                GrantSet::None
+            } else {
+                let mut descriptors = Vec::with_capacity(grant_to.len());
+                for s in grant_to {
+                    match GrantDescriptor::parse(s) {
+                        Some(d) => descriptors.push(d),
+                        None => {
+                            return Err(NonoError::SandboxInit(format!(
+                                "mediation: capture rule's grant_to entry '{}' is not in '<command>.<intercept-id>' form",
+                                s
+                            )));
+                        }
+                    }
+                }
+                GrantSet::Allow(descriptors)
+            };
+            Ok(ResolvedAction::Capture {
+                script: script.clone(),
+                grants,
+            })
+        }
+        InterceptAction::Run { script } => Ok(ResolvedAction::Run {
+            script: script.clone(),
+        }),
+    }
 }
 
 /// Find the nono-shim binary.
@@ -632,67 +782,222 @@ mod tests {
         assert!(matches!(*rx.borrow(), AdminModeStatus::Disabled));
     }
 
+    /// A.5: the intercept `id` field cannot be `"default"` — that name is
+    /// reserved for the command's default entry. `resolve_command` returns
+    /// `SandboxInit` for any rule that claims it.
     #[test]
-    fn test_resolve_command_expands_env_vars_in_args_prefix_and_binary_path() {
-        use crate::mediation::{CommandEntry, InterceptAction, InterceptRule};
+    fn intercept_id_default_is_rejected_at_profile_load() {
+        use crate::mediation::{
+            ArgsMatcher, CommandEntry, DefaultEntry, InterceptAction, InterceptRule,
+        };
 
         let tmp = tempfile::tempdir().expect("tmpdir");
-
-        // Create a real binary file so `is_file()` succeeds after expansion.
         let fake_binary = tmp.path().join("fake-cmd");
         std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
-        let binary_env_var = "NONO_TEST_RESOLVE_CMD_BINARY";
-
-        // Create shim dir and a fake shim target next to it so symlink creation
-        // succeeds without needing to spin up the real nono-shim binary.
         let shim_dir = tmp.path().join("shims");
         std::fs::create_dir_all(&shim_dir).expect("shim dir");
         let fake_shim_binary = tmp.path().join("fake-shim");
         std::fs::write(&fake_shim_binary, b"").expect("write shim");
 
-        let _guard = match crate::test_env::ENV_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            (binary_env_var, fake_binary.to_str().expect("utf8")),
-            ("NONO_TEST_RESOLVE_CMD_USER", "test-user"),
-        ]);
-
         let entry = CommandEntry {
             name: "fake-cmd".to_string(),
-            binary_path: Some(format!("${}", binary_env_var)),
+            binary_path: Some(fake_binary.to_string_lossy().into_owned()),
+            default: DefaultEntry {
+                id: "default".to_string(),
+                action: InterceptAction::Run { script: None },
+                sandbox: None,
+            },
             intercept: vec![InterceptRule {
-                args_prefix: vec![
-                    "find-generic-password".to_string(),
-                    "$NONO_TEST_RESOLVE_CMD_USER".to_string(),
-                    "Claude Code-credentials".to_string(),
-                ],
+                id: Some("default".to_string()),
+                matcher: ArgsMatcher::All { all: vec![] },
                 admin: false,
                 action: InterceptAction::Respond {
                     stdout: String::new(),
+                    stderr: String::new(),
                     exit_code: 0,
                 },
+                sandbox: crate::mediation::SandboxBinding::InheritFromDefault,
             }],
             sandbox: None,
             caller_policy: CallerPolicy::default(),
         };
 
-        let workdir = tmp.path();
-        let resolved = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir)
-            .expect("resolve")
-            .expect("command resolved");
+        let err = match resolve_command(&entry, &shim_dir, &fake_shim_binary, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("id='default' must be rejected at profile load"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("intercept id 'default' is reserved"),
+            "unexpected error: {msg}"
+        );
+    }
 
-        assert_eq!(resolved.real_path, fake_binary);
-        let args = &resolved.intercepts[0].args_prefix;
-        assert_eq!(
-            args,
-            &vec![
-                "find-generic-password".to_string(),
-                "test-user".to_string(),
-                "Claude Code-credentials".to_string(),
-            ],
-            "env-var tokens in args_prefix must be expanded at profile-load time"
+    /// Build a minimal `ResolvedCommand` for the validation unit tests.
+    /// `validate_grant_to_references` only inspects names, intercept ids,
+    /// and actions — it does not touch the filesystem or sandbox fields.
+    fn validation_command(
+        name: &str,
+        intercept_ids: &[&str],
+        capture_rules: Vec<(Option<&str>, GrantSet)>,
+        default_action: ResolvedAction,
+    ) -> ResolvedCommand {
+        use crate::mediation::matcher::ResolvedArgsMatcher;
+        let mut intercepts: Vec<ResolvedIntercept> = intercept_ids
+            .iter()
+            .map(|id| ResolvedIntercept {
+                id: Some((*id).to_string()),
+                matcher: ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Run { script: None },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::InheritFromDefault,
+            })
+            .collect();
+        for (id, grants) in capture_rules {
+            intercepts.push(ResolvedIntercept {
+                id: id.map(str::to_string),
+                matcher: ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Capture {
+                    script: None,
+                    grants,
+                },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::InheritFromDefault,
+            });
+        }
+        ResolvedCommand {
+            name: name.to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts,
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: default_action,
+                sandbox: None,
+            },
+        }
+    }
+
+    /// A capture rule's `grant_to` may reference a known intercept's id.
+    #[test]
+    fn validate_grant_to_accepts_known_intercept_id() {
+        let curl = validation_command(
+            "curl",
+            &["gitlab"],
+            vec![],
+            ResolvedAction::Run { script: None },
+        );
+        let ddtool = validation_command(
+            "ddtool",
+            &[],
+            vec![(
+                Some("gitlab-token"),
+                GrantSet::Allow(vec![GrantDescriptor {
+                    command: "curl".to_string(),
+                    intercept_id: "gitlab".to_string(),
+                }]),
+            )],
+            ResolvedAction::Run { script: None },
+        );
+        validate_grant_to_references(&[curl, ddtool]).expect("known intercept must validate");
+    }
+
+    /// A capture rule's `grant_to` may reference `<command>.default`.
+    #[test]
+    fn validate_grant_to_accepts_command_default() {
+        let curl = validation_command("curl", &[], vec![], ResolvedAction::Run { script: None });
+        let ddtool = validation_command(
+            "ddtool",
+            &[],
+            vec![(
+                Some("any-token"),
+                GrantSet::Allow(vec![GrantDescriptor {
+                    command: "curl".to_string(),
+                    intercept_id: "default".to_string(),
+                }]),
+            )],
+            ResolvedAction::Run { script: None },
+        );
+        validate_grant_to_references(&[curl, ddtool]).expect("<command>.default must validate");
+    }
+
+    /// `grant_to` referring to a non-existent command is rejected with
+    /// a profile-friendly error naming both the capture command and the
+    /// unresolved descriptor.
+    #[test]
+    fn validate_grant_to_rejects_unknown_command() {
+        let ddtool = validation_command(
+            "ddtool",
+            &[],
+            vec![(
+                Some("token"),
+                GrantSet::Allow(vec![GrantDescriptor {
+                    command: "nosuchcmd".to_string(),
+                    intercept_id: "default".to_string(),
+                }]),
+            )],
+            ResolvedAction::Run { script: None },
+        );
+        let err =
+            validate_grant_to_references(&[ddtool]).expect_err("unknown command must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("ddtool"), "msg: {msg}");
+        assert!(
+            msg.contains("nosuchcmd.default"),
+            "msg should name the unresolved descriptor: {msg}"
+        );
+    }
+
+    /// `grant_to` referring to a known command but unknown intercept id is
+    /// rejected.
+    #[test]
+    fn validate_grant_to_rejects_unknown_intercept_id() {
+        let curl = validation_command(
+            "curl",
+            &["gitlab"],
+            vec![],
+            ResolvedAction::Run { script: None },
+        );
+        let ddtool = validation_command(
+            "ddtool",
+            &[],
+            vec![(
+                Some("token"),
+                GrantSet::Allow(vec![GrantDescriptor {
+                    command: "curl".to_string(),
+                    intercept_id: "no-such-id".to_string(),
+                }]),
+            )],
+            ResolvedAction::Run { script: None },
+        );
+        let err = validate_grant_to_references(&[curl, ddtool])
+            .expect_err("unknown intercept id must be rejected");
+        assert!(
+            err.to_string().contains("curl.no-such-id"),
+            "msg should name the unresolved descriptor: {err}"
+        );
+    }
+
+    /// `Capture` is not allowed as a command's default action — there is
+    /// no intercept id to anchor grants at.
+    #[test]
+    fn validate_rejects_capture_as_default_action() {
+        let bad = validation_command(
+            "ddtool",
+            &[],
+            vec![],
+            ResolvedAction::Capture {
+                script: None,
+                grants: GrantSet::None,
+            },
+        );
+        let err =
+            validate_grant_to_references(&[bad]).expect_err("Capture as default must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("ddtool"), "msg: {msg}");
+        assert!(
+            msg.contains("default.action cannot be 'capture'"),
+            "msg: {msg}"
         );
     }
 

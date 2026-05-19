@@ -86,6 +86,11 @@ fn merge_command_entry(base: CommandEntry, child: CommandEntry) -> CommandEntry 
     CommandEntry {
         name: child.name,
         binary_path: child.binary_path.or(base.binary_path),
+        // Child's default wins outright. Default actions are scalar policy
+        // choices (respond/run/capture); a "merge" between two scalars has
+        // no obvious meaning. If child wants the base's default they can
+        // copy it explicitly; otherwise the child override stands.
+        default: child.default,
         intercept: merge_intercept_rules(base.intercept, child.intercept),
         sandbox: match (base.sandbox, child.sandbox) {
             (Some(b), Some(c)) => Some(merge_command_sandbox(b, c)),
@@ -98,23 +103,18 @@ fn merge_command_entry(base: CommandEntry, child: CommandEntry) -> CommandEntry 
 }
 
 /// Merge two intercept lists. Child rules are placed first so they shadow
-/// base rules under nono's first-match-wins matching. Base rules with an
-/// `args_prefix` already covered by a child rule are dropped (a child intercept
-/// for the same args prefix is an explicit override).
+/// base rules under nono's first-match-wins matching. No deduplication is
+/// applied: rules use the predicate-tree `match` form which is too rich for
+/// structural equality to be meaningful — authors needing to override a base
+/// rule should use a child rule whose matcher catches the same calls (child
+/// wins by ordering).
 fn merge_intercept_rules(
     base: Vec<InterceptRule>,
     child: Vec<InterceptRule>,
 ) -> Vec<InterceptRule> {
-    let child_prefixes: std::collections::HashSet<Vec<String>> =
-        child.iter().map(|r| r.args_prefix.clone()).collect();
-
-    let mut merged = Vec::with_capacity(base.len() + child.len());
+    let mut merged: Vec<InterceptRule> = Vec::with_capacity(base.len() + child.len());
     merged.extend(child);
-    for base_rule in base {
-        if !child_prefixes.contains(&base_rule.args_prefix) {
-            merged.push(base_rule);
-        }
-    }
+    merged.extend(base);
     merged
 }
 
@@ -175,20 +175,44 @@ mod tests {
         CommandEntry {
             name: name.to_string(),
             binary_path: None,
+            default: crate::mediation::DefaultEntry {
+                id: "default".to_string(),
+                action: InterceptAction::Run { script: None },
+                sandbox: None,
+            },
             intercept: Vec::new(),
             sandbox: None,
             caller_policy: CallerPolicy::default(),
         }
     }
 
+    /// Build a rule whose matcher is an `All([AnyArgMatches("^p$")])` for each
+    /// entry in `prefix`. Equivalent to the legacy positional-prefix matcher
+    /// for the simple cases the merge tests exercise.
     fn rule(prefix: &[&str], stdout: &str) -> InterceptRule {
+        use crate::mediation::ArgsMatcher;
+        let matcher = if prefix.is_empty() {
+            ArgsMatcher::All { all: vec![] }
+        } else {
+            ArgsMatcher::All {
+                all: prefix
+                    .iter()
+                    .map(|p| ArgsMatcher::AnyArgMatches {
+                        any_arg_matches: format!("^{}$", regex::escape(p)),
+                    })
+                    .collect(),
+            }
+        };
         InterceptRule {
-            args_prefix: prefix.iter().map(|s| s.to_string()).collect(),
+            id: Some(prefix.join("-")),
+            matcher,
             admin: false,
             action: InterceptAction::Respond {
                 stdout: stdout.to_string(),
+                stderr: String::new(),
                 exit_code: 0,
             },
+            sandbox: crate::mediation::SandboxBinding::InheritFromDefault,
         }
     }
 
@@ -233,12 +257,16 @@ mod tests {
         assert_eq!(gh.binary_path.as_deref(), Some("/child/gh"));
         // Both intercept rules survive — child first, then base.
         assert_eq!(gh.intercept.len(), 2);
-        assert_eq!(gh.intercept[0].args_prefix, vec!["pr", "view"]);
-        assert_eq!(gh.intercept[1].args_prefix, vec!["auth", "token"]);
+        assert_eq!(gh.intercept[0].id.as_deref(), Some("pr-view"));
+        assert_eq!(gh.intercept[1].id.as_deref(), Some("auth-token"));
     }
 
+    /// Child rules are placed before base rules; both survive because
+    /// predicate-tree matchers are no longer structurally dedup'd. Authors
+    /// override a base rule by ordering: the child rule's matcher fires first
+    /// under nono's first-match-wins semantics.
     #[test]
-    fn test_merge_mediation_intercept_dedup_by_args_prefix_child_first() {
+    fn test_merge_mediation_intercept_child_rules_come_first() {
         let mut base_gh = cmd("gh");
         base_gh.intercept = vec![
             rule(&["auth", "token"], "base-token"),
@@ -259,15 +287,19 @@ mod tests {
             },
         );
         let gh = &merged.commands[0];
-        assert_eq!(gh.intercept.len(), 2);
-        // Child override comes first (first-match-wins).
-        assert_eq!(gh.intercept[0].args_prefix, vec!["auth", "token"]);
+        // Three rules now (no dedup) — child first, then base in original order.
+        assert_eq!(gh.intercept.len(), 3);
+        assert_eq!(gh.intercept[0].id.as_deref(), Some("auth-token"));
         match &gh.intercept[0].action {
             InterceptAction::Respond { stdout, .. } => assert_eq!(stdout, "child-token"),
             _ => panic!("unexpected action"),
         }
-        // Non-overlapping base rule preserved.
-        assert_eq!(gh.intercept[1].args_prefix, vec!["pr", "list"]);
+        assert_eq!(gh.intercept[1].id.as_deref(), Some("auth-token"));
+        match &gh.intercept[1].action {
+            InterceptAction::Respond { stdout, .. } => assert_eq!(stdout, "base-token"),
+            _ => panic!("unexpected action"),
+        }
+        assert_eq!(gh.intercept[2].id.as_deref(), Some("pr-list"));
     }
 
     #[test]
