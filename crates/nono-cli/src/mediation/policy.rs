@@ -222,6 +222,7 @@ pub async fn apply(
             Some((stdin_fd, stdout_fd, stderr_fd)),
             request.cwd.as_deref(),
             "default",
+            cmd.default.promote_filter.as_ref(),
         )
         .await;
         return (result, "passthrough");
@@ -313,6 +314,7 @@ pub async fn apply(
                                 None,
                                 request.cwd.as_deref(),
                                 rule.id.as_deref().unwrap_or(""),
+                                rule.promote_filter.as_ref(),
                             )
                             .await
                         }
@@ -373,6 +375,7 @@ pub async fn apply(
                         Some((stdin_fd, stdout_fd, stderr_fd)),
                         request.cwd.as_deref(),
                         rule.id.as_deref().unwrap_or(""),
+                        rule.promote_filter.as_ref(),
                     )
                     .await;
                     (result, "run")
@@ -433,6 +436,7 @@ pub async fn apply(
                 Some((stdin_fd, stdout_fd, stderr_fd)),
                 request.cwd.as_deref(),
                 "default",
+                default_entry.promote_filter.as_ref(),
             )
             .await;
             (result, "run")
@@ -647,6 +651,7 @@ async fn exec_passthrough(
     stdio_fds: Option<(OwnedFd, OwnedFd, OwnedFd)>,
     request_cwd: Option<&str>,
     consumer_intercept_id: &str,
+    promote_filter: Option<&super::promote::ResolvedPromoteFilter>,
 ) -> ShimResponse {
     let consumer = ConsumerContext {
         command: &cmd.name,
@@ -761,9 +766,17 @@ async fn exec_passthrough(
     // with the broker's resolved value, so headers like
     // `Authorization: Bearer nono_...` expand to the real token before the
     // exec'd command sees them.
+    //
+    // Per-slot scoping: `allows_arg` returns false when `promote_filter` is
+    // None or has no `args` sub-predicate. This is the secure-default switch
+    // — a rule that says nothing about argv promotion gets no argv promotion.
     let args: Vec<String> = args
         .iter()
-        .map(|a| promote_nonces_in_str(a, broker, &consumer))
+        .enumerate()
+        .map(|(i, a)| {
+            let allow = super::promote::ResolvedPromoteFilter::allows_arg(promote_filter, args, i);
+            promote_nonces_in_str(a, broker, &consumer, allow)
+        })
         .collect();
 
     let real_path = cmd.real_path.clone();
@@ -1230,7 +1243,12 @@ fn build_exec_env(
             warn!("mediation: blocked dangerous var {} from sandbox env", key);
             continue;
         }
-        env.insert(key.clone(), promote_nonces_in_str(value, broker, consumer));
+        // Env-key scoping is wired in a subsequent commit. Pass `true` here so
+        // current behaviour is unchanged.
+        env.insert(
+            key.clone(),
+            promote_nonces_in_str(value, broker, consumer, true),
+        );
     }
 
     env
@@ -1240,7 +1258,20 @@ fn build_exec_env(
 /// value. Substrings that look like nonces but were never issued are left in
 /// place verbatim, matching the existing argv behaviour and avoiding a probe
 /// oracle that would only return shape information the caller already has.
-fn promote_nonces_in_str(s: &str, broker: &TokenBroker, consumer: &ConsumerContext) -> String {
+///
+/// `allow` is the per-slot decision computed one scope up by
+/// `ResolvedPromoteFilter::allows_arg` / `allows_env`. When `false`, returns
+/// the original string unchanged so the call site does not have to branch.
+fn promote_nonces_in_str(
+    s: &str,
+    broker: &TokenBroker,
+    consumer: &ConsumerContext,
+    allow: bool,
+) -> String {
+    if !allow {
+        return s.to_string();
+    }
+
     const PREFIX: &[u8] = b"nono_";
     const HEX_LEN: usize = 64;
     const NONCE_LEN: usize = PREFIX.len() + HEX_LEN;
@@ -2962,7 +2993,7 @@ mod tests {
         let broker = TokenBroker::new();
         let nonce = broker.issue(Zeroizing::new("real-token".to_string()), test_grants());
         assert_eq!(
-            promote_nonces_in_str(&nonce, &broker, &test_consumer()),
+            promote_nonces_in_str(&nonce, &broker, &test_consumer(), true),
             "real-token"
         );
     }
@@ -2973,7 +3004,7 @@ mod tests {
         let nonce = broker.issue(Zeroizing::new("real-token".to_string()), test_grants());
         let arg = format!("X-Token: {}", nonce);
         assert_eq!(
-            promote_nonces_in_str(&arg, &broker, &test_consumer()),
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), true),
             "X-Token: real-token"
         );
     }
@@ -2985,7 +3016,7 @@ mod tests {
         let b = broker.issue(Zeroizing::new("BBB".to_string()), test_grants());
         let arg = format!("first={} second={}", a, b);
         assert_eq!(
-            promote_nonces_in_str(&arg, &broker, &test_consumer()),
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), true),
             "first=AAA second=BBB"
         );
     }
@@ -2995,17 +3026,17 @@ mod tests {
         let broker = TokenBroker::new();
         // Too few hex chars after the prefix — not a valid nonce shape.
         let arg = "nono_abc123";
-        assert_eq!(promote_nonces_in_str(arg, &broker, &test_consumer()), arg);
+        assert_eq!(promote_nonces_in_str(arg, &broker, &test_consumer(), true), arg);
         // Prefix followed by non-hex characters in the 64-char window.
         let arg2 = format!("nono_{}", "z".repeat(64));
         assert_eq!(
-            promote_nonces_in_str(&arg2, &broker, &test_consumer()),
+            promote_nonces_in_str(&arg2, &broker, &test_consumer(), true),
             arg2
         );
         // Uppercase hex must not match — broker only emits lowercase.
         let arg3 = format!("nono_{}", "A".repeat(64));
         assert_eq!(
-            promote_nonces_in_str(&arg3, &broker, &test_consumer()),
+            promote_nonces_in_str(&arg3, &broker, &test_consumer(), true),
             arg3
         );
     }
@@ -3015,7 +3046,7 @@ mod tests {
         let broker = TokenBroker::new();
         // Shape is valid but the nonce was never issued.
         let arg = format!("nono_{}", "a".repeat(64));
-        assert_eq!(promote_nonces_in_str(&arg, &broker, &test_consumer()), arg);
+        assert_eq!(promote_nonces_in_str(&arg, &broker, &test_consumer(), true), arg);
     }
 
     #[test]
@@ -3024,7 +3055,7 @@ mod tests {
         let nonce = broker.issue(Zeroizing::new("XYZ".to_string()), test_grants());
         let arg = format!("prefix-{}-suffix", nonce);
         assert_eq!(
-            promote_nonces_in_str(&arg, &broker, &test_consumer()),
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), true),
             "prefix-XYZ-suffix"
         );
     }
@@ -3033,10 +3064,30 @@ mod tests {
     fn promote_nonces_no_match_returns_original() {
         let broker = TokenBroker::new();
         assert_eq!(
-            promote_nonces_in_str("plain string", &broker, &test_consumer()),
+            promote_nonces_in_str("plain string", &broker, &test_consumer(), true),
             "plain string"
         );
-        assert_eq!(promote_nonces_in_str("", &broker, &test_consumer()), "");
+        assert_eq!(promote_nonces_in_str("", &broker, &test_consumer(), true), "");
+    }
+
+    /// `allow=false` short-circuits before any nonce scanning. Used by the
+    /// per-arg / per-env-key filter wiring so the per-slot decision happens
+    /// one scope up.
+    #[test]
+    fn promote_nonces_allow_false_returns_input_verbatim() {
+        let broker = TokenBroker::new();
+        let nonce = broker.issue(Zeroizing::new("real-token".to_string()), test_grants());
+        let arg = format!("Authorization: Bearer {}", nonce);
+        // allow=true promotes
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), true),
+            "Authorization: Bearer real-token"
+        );
+        // allow=false leaves verbatim — same string, including the nonce
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), false),
+            arg
+        );
     }
 
     #[test]
@@ -3105,6 +3156,372 @@ mod tests {
         assert!(
             resp.stdout.contains("hello"),
             "expected echo output, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Per-arg promotion filter (promote_in.args)
+    //
+    // These tests use /bin/echo as the real binary so the streamed stdout
+    // shows exactly which argv slots the filter promoted (real token) vs
+    // left literal (`nono_<hex>`).
+    // ------------------------------------------------------------------
+
+    /// Builds an echo-backed ResolvedCommand whose single matching rule
+    /// carries the given `promote_filter`. The grant is permissive across
+    /// the consumer contexts we exercise so the grant gate is not the
+    /// bottleneck — only the filter.
+    fn echo_cmd_with_filter(
+        promote_filter: Option<crate::mediation::promote::ResolvedPromoteFilter>,
+    ) -> ResolvedCommand {
+        ResolvedCommand {
+            name: "echo".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+            intercepts: vec![ResolvedIntercept {
+                id: Some("filtered".to_string()),
+                matcher: crate::mediation::matcher::ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Run { script: None },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+                promote_filter,
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Run { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+        }
+    }
+
+    fn echo_grants() -> GrantSet {
+        GrantSet::Allow(vec![GrantDescriptor {
+            command: "echo".to_string(),
+            intercept_id: "filtered".to_string(),
+        }])
+    }
+
+    fn compile(filter_json: serde_json::Value) -> crate::mediation::promote::ResolvedPromoteFilter {
+        let p: crate::mediation::PromoteFilter =
+            serde_json::from_value(filter_json).expect("parse");
+        crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile")
+    }
+
+    /// Test 1: separate-arg `["-H", "Authorization: Bearer nono_X"]` with
+    /// `preceded_by_arg: ^-H$` promotes the value slot.
+    #[tokio::test]
+    async fn promote_args_separate_form_promotes_value_slot() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "preceded_by_arg": "^-H$" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![
+                "-H".to_string(),
+                format!("Authorization: Bearer {}", nonce),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        assert!(
+            resp.stdout.contains("real-tok"),
+            "value slot must contain promoted token, got: {:?}",
+            resp.stdout
+        );
+        assert!(
+            !resp.stdout.contains("nono_"),
+            "no nonce should remain literal, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 2: attached form `["-Hnono_X"]` with `self_matches: ^-H`
+    /// promotes the single slot.
+    #[tokio::test]
+    async fn promote_args_attached_form_promotes_self_slot() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("attached-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "self_matches": "^-H" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![format!("-H{}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        assert!(
+            resp.stdout.contains("attached-tok"),
+            "attached -H slot must promote, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 3: long-equals form `["--header=Authorization: Bearer nono_X"]`
+    /// with `self_matches: ^--header=` promotes.
+    #[tokio::test]
+    async fn promote_args_long_equals_form_promotes() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("eq-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "self_matches": "^--header=" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![format!("--header=Authorization: Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        assert!(
+            resp.stdout.contains("eq-tok"),
+            "long-equals slot must promote, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 4: a `--data-binary` body slot must NOT promote when the filter
+    /// only admits `-H` predecessors.
+    #[tokio::test]
+    async fn promote_args_body_slot_stays_literal() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("body-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "preceded_by_arg": "^-H$" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![
+                "--data-binary".to_string(),
+                format!("X: {}", nonce),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        // The body slot predecessor is "--data-binary", not "-H" → filter
+        // rejects. Nonce stays literal in the streamed output.
+        assert!(
+            !resp.stdout.contains("body-tok"),
+            "body slot must NOT promote, got: {:?}",
+            resp.stdout
+        );
+        assert!(
+            resp.stdout.contains("nono_"),
+            "literal nonce must remain, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 5: upload-file `["-T", "/tmp/nono_X.bin"]` keeps the path
+    /// literal under a header-only filter.
+    #[tokio::test]
+    async fn promote_args_upload_path_stays_literal() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("upload-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "preceded_by_arg": "^-H$" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["-T".to_string(), format!("/tmp/{}.bin", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        assert!(
+            !resp.stdout.contains("upload-tok"),
+            "upload-file path must NOT promote, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 6: `any_of` combinator admits both attached and separate forms.
+    #[tokio::test]
+    async fn promote_args_any_of_covers_both_header_forms() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce_a = broker.issue(Zeroizing::new("AAA".to_string()), echo_grants());
+        let nonce_b = broker.issue(Zeroizing::new("BBB".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": {
+                "any_of": [
+                    { "preceded_by_arg": "^(-H|--header)$" },
+                    { "self_matches":    "^(-H|--header=)" }
+                ]
+            }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![
+                "-H".to_string(),
+                format!("Bearer {}", nonce_a),
+                format!("--header=X-Other: {}", nonce_b),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        assert!(resp.stdout.contains("AAA"));
+        assert!(resp.stdout.contains("BBB"));
+    }
+
+    /// Test 7: `not` combinator that inverts a body-slot rule promotes
+    /// everywhere except after body flags.
+    #[tokio::test]
+    async fn promote_args_not_body_inverts_correctly() {
+        let broker = Arc::new(TokenBroker::new());
+        let body_nonce = broker.issue(Zeroizing::new("REAL-BODY-X".to_string()), echo_grants());
+        let header_nonce = broker.issue(Zeroizing::new("REAL-HDR-Y".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": {
+                "not": {
+                    "preceded_by_arg": "^(-d|--data-binary)$"
+                }
+            }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![
+                "--data-binary".to_string(),
+                body_nonce,
+                "-H".to_string(),
+                format!("Bearer {}", header_nonce),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        // Body slot promoted? No — `not(preceded_by_arg=^(-d|--data-binary)$)`
+        // evaluates false there, so the nonce stays literal.
+        assert!(
+            !resp.stdout.contains("REAL-BODY-X"),
+            "body slot must stay literal, got: {:?}",
+            resp.stdout
+        );
+        // Header slot promotes — predecessor is `-H`, not a body flag.
+        assert!(
+            resp.stdout.contains("REAL-HDR-Y"),
+            "header slot must promote, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 8: secure default — a rule with no `promote_in` field gets no
+    /// argv promotion at all, even when a valid nonce is present.
+    /// Documents the breaking change.
+    #[tokio::test]
+    async fn promote_args_secure_default_no_filter_no_promotion() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("would-be-real".to_string()), echo_grants());
+        // No filter on the rule.
+        let cmd = echo_cmd_with_filter(None);
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["-H".to_string(), format!("Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        assert!(
+            !resp.stdout.contains("would-be-real"),
+            "no promotion expected with secure default, got: {:?}",
+            resp.stdout
+        );
+        assert!(
+            resp.stdout.contains("nono_"),
+            "literal nonce must survive, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 9: an `env`-only filter (no `args` sub-field) still gets the
+    /// secure-default argv behaviour — no argv slot promotes.
+    #[tokio::test]
+    async fn promote_args_env_only_filter_no_argv_promotion() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "env": { "name_matches": "^AUTH_HEADER$" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["-H".to_string(), format!("Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        assert!(
+            !resp.stdout.contains("real-tok"),
+            "env-only filter must NOT enable argv promotion, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 10: empty `any_of: []` never promotes — defensive lock test.
+    #[tokio::test]
+    async fn promote_args_empty_any_of_never_promotes() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("lock".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "any_of": [] }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["-H".to_string(), format!("Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        assert!(!resp.stdout.contains("lock"));
+    }
+
+    /// Test 11: filter × grant interaction — if the grant rejects the
+    /// consumer, the filter is irrelevant. Grant gate stays primary.
+    #[tokio::test]
+    async fn promote_args_grant_rejection_overrides_admitting_filter() {
+        let broker = Arc::new(TokenBroker::new());
+        // Issue a nonce whose grant excludes the echo.filtered consumer.
+        let other_grants = GrantSet::Allow(vec![GrantDescriptor {
+            command: "other".to_string(),
+            intercept_id: "default".to_string(),
+        }]);
+        let nonce = broker.issue(Zeroizing::new("never-leak".to_string()), other_grants);
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "self_matches": ".*" } // admit every slot
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![format!("Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "run");
+        // Filter admits, but grant denies → nonce stays literal.
+        assert!(
+            !resp.stdout.contains("never-leak"),
+            "grant must reject regardless of filter, got: {:?}",
+            resp.stdout
+        );
+        assert!(
+            resp.stdout.contains("nono_"),
+            "literal nonce must survive, got: {:?}",
             resp.stdout
         );
     }
