@@ -299,7 +299,16 @@ pub async fn apply(
                         intercept_id: rule.id.as_deref().unwrap_or(""),
                     };
                     let result = match script {
-                        Some(sh) => exec_script(sh, &request.env, &broker, &capture_consumer).await,
+                        Some(sh) => {
+                            exec_script(
+                                sh,
+                                &request.env,
+                                &broker,
+                                &capture_consumer,
+                                rule.promote_filter.as_ref(),
+                            )
+                            .await
+                        }
                         None => {
                             // No per-command sandbox during capture — the real binary needs
                             // full access to system resources (e.g. Keychain) to fetch the credential.
@@ -360,7 +369,14 @@ pub async fn apply(
                         drop(stdout_fd);
                         drop(stderr_fd);
                         return (
-                            exec_script(script_str, &request.env, &broker, &run_consumer).await,
+                            exec_script(
+                                script_str,
+                                &request.env,
+                                &broker,
+                                &run_consumer,
+                                rule.promote_filter.as_ref(),
+                            )
+                            .await,
                             "run",
                         );
                     }
@@ -421,7 +437,14 @@ pub async fn apply(
                 drop(stdout_fd);
                 drop(stderr_fd);
                 return (
-                    exec_script(script_str, &request.env, &broker, &default_consumer).await,
+                    exec_script(
+                        script_str,
+                        &request.env,
+                        &broker,
+                        &default_consumer,
+                        default_entry.promote_filter.as_ref(),
+                    )
+                    .await,
                     "run",
                 );
             }
@@ -566,8 +589,9 @@ async fn exec_script(
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
     consumer: &ConsumerContext<'_>,
+    promote_filter: Option<&super::promote::ResolvedPromoteFilter>,
 ) -> ShimResponse {
-    let env = build_exec_env(sandbox_env, broker, consumer);
+    let env = build_exec_env(sandbox_env, broker, consumer, promote_filter);
     let script = script.to_string();
 
     let result = tokio::task::spawn_blocking(move || -> Result<ShimResponse> {
@@ -657,7 +681,7 @@ async fn exec_passthrough(
         command: &cmd.name,
         intercept_id: consumer_intercept_id,
     };
-    let mut env = build_exec_env(sandbox_env, broker, &consumer);
+    let mut env = build_exec_env(sandbox_env, broker, &consumer, promote_filter);
 
     // Build the effective shim directory and PATH.
     // When allow_commands is set, create a filtered shim dir that excludes allowed
@@ -1222,10 +1246,19 @@ fn add_sandbox_file(
 ///
 /// Starts from the trusted parent env, then promotes nonce-bearing sandbox vars.
 /// Non-nonce sandbox vars and dangerous var names are silently discarded.
+///
+/// `promote_filter` scopes which env vars are admitted for nonce promotion.
+/// When absent (or its `env` sub-predicate is absent), the built-in safe-
+/// shape name allowlist
+/// ([`super::promote::PROMOTE_ENV_DEFAULT_NAMES`]) decides — credential-shaped
+/// names like `AUTHORIZATION`, `*_TOKEN`, `*_HEADER`, etc. flow promotion;
+/// anything else stays literal. Profiles widen this by setting an explicit
+/// `EnvPredicate` that unions the default regex with extra names.
 fn build_exec_env(
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
     consumer: &ConsumerContext,
+    promote_filter: Option<&super::promote::ResolvedPromoteFilter>,
 ) -> HashMap<String, String> {
     // Start from parent (trusted) env
     let mut env: HashMap<String, String> = std::env::vars().collect();
@@ -1243,11 +1276,19 @@ fn build_exec_env(
             warn!("mediation: blocked dangerous var {} from sandbox env", key);
             continue;
         }
-        // Env-key scoping is wired in a subsequent commit. Pass `true` here so
-        // current behaviour is unchanged.
+        // Per-var scoping: allow promotion only for env keys the filter
+        // admits (or that match the built-in safe-shape allowlist when no
+        // explicit env predicate is set). Non-admitted vars still flow
+        // through with their literal value — only the nonce promotion is
+        // suppressed.
+        let allow = super::promote::ResolvedPromoteFilter::allows_env(
+            promote_filter,
+            key,
+            value,
+        );
         env.insert(
             key.clone(),
-            promote_nonces_in_str(value, broker, consumer, true),
+            promote_nonces_in_str(value, broker, consumer, allow),
         );
     }
 
@@ -2072,7 +2113,7 @@ mod tests {
             "context_value".to_string(),
         );
 
-        let env = build_exec_env(&sandbox_env, &broker, &test_consumer());
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
 
         // Dangerous vars must not be injected from sandbox.
         assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil"));
@@ -2092,7 +2133,7 @@ mod tests {
         let mut sandbox_env = HashMap::new();
         sandbox_env.insert("GH_TOKEN".to_string(), nonce.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker, &test_consumer());
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         assert_eq!(
             env.get("GH_TOKEN").map(|s| s.as_str()),
             Some("real_credential")
@@ -2108,7 +2149,7 @@ mod tests {
         sandbox_env.insert("PATH".to_string(), nonce.clone());
         sandbox_env.insert("LD_PRELOAD".to_string(), nonce.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker, &test_consumer());
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         // PATH from sandbox must not be the injected value (parent PATH is used instead)
         assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil/path"));
         // LD_PRELOAD should not have been injected
@@ -2127,7 +2168,7 @@ mod tests {
             "nono_0000000000000000000000000000000000000000000000000000000000000000".to_string();
         sandbox_env.insert("MY_TOKEN".to_string(), unknown.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker, &test_consumer());
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         // Substring promotion: unknown nonces are passed through verbatim
         // rather than discarded. The sandbox can probe shape but cannot recover
         // any issued nonce this way.
@@ -3099,7 +3140,7 @@ mod tests {
             "AUTH_HEADER".to_string(),
             format!("Authorization: Bearer {}", nonce),
         );
-        let env = build_exec_env(&sandbox_env, &broker, &test_consumer());
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         assert_eq!(
             env.get("AUTH_HEADER").map(String::as_str),
             Some("Authorization: Bearer jwt-body"),
@@ -3112,10 +3153,177 @@ mod tests {
         let nonce = broker.issue(Zeroizing::new("evil".to_string()), test_grants());
         let mut sandbox_env = HashMap::new();
         sandbox_env.insert("LD_PRELOAD".to_string(), nonce.clone());
-        sandbox_env.insert("SAFE".to_string(), nonce);
-        let env = build_exec_env(&sandbox_env, &broker, &test_consumer());
+        // SAFE matches no safe-shape pattern in the built-in default, so
+        // it stays literal — the nonce flows through verbatim, the var
+        // still flows through (only the promotion is suppressed).
+        sandbox_env.insert("SAFE".to_string(), nonce.clone());
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         assert!(!env.contains_key("LD_PRELOAD"));
-        assert_eq!(env.get("SAFE").map(String::as_str), Some("evil"));
+        // SAFE flows through but the nonce stays literal.
+        assert_eq!(env.get("SAFE").map(String::as_str), Some(nonce.as_str()));
+    }
+
+    /// Built-in env default: any *_HEADER name flows promotion when no
+    /// filter is set. AUTH_HEADER matches the `.+_header` pattern.
+    #[test]
+    fn build_exec_env_default_admits_safe_shape_names() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("jwt".to_string()), test_grants());
+        let mut env_in = HashMap::new();
+        env_in.insert(
+            "AUTH_HEADER".to_string(),
+            format!("Bearer {}", nonce),
+        );
+        env_in.insert("X_TOKEN".to_string(), nonce.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), None);
+        assert_eq!(env.get("AUTH_HEADER").map(String::as_str), Some("Bearer jwt"));
+        assert_eq!(env.get("X_TOKEN").map(String::as_str), Some("jwt"));
+    }
+
+    /// Built-in env default: random names like MY_VAR are NOT admitted —
+    /// nonce stays literal.
+    #[test]
+    fn build_exec_env_default_rejects_random_names() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real".to_string()), test_grants());
+        let mut env_in = HashMap::new();
+        env_in.insert("MY_VAR".to_string(), nonce.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), None);
+        assert_eq!(env.get("MY_VAR").map(String::as_str), Some(nonce.as_str()));
+    }
+
+    /// Built-in env default is case-insensitive — lowercase
+    /// `authorization` admits.
+    #[test]
+    fn build_exec_env_default_is_case_insensitive() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real".to_string()), test_grants());
+        let mut env_in = HashMap::new();
+        env_in.insert("authorization".to_string(), format!("Bearer {}", nonce));
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), None);
+        assert_eq!(
+            env.get("authorization").map(String::as_str),
+            Some("Bearer real")
+        );
+    }
+
+    /// Explicit env predicate REPLACES the built-in default — when set,
+    /// only the predicate decides. AUTH_HEADER is no longer in play.
+    #[test]
+    fn build_exec_env_explicit_predicate_replaces_default() {
+        use crate::mediation::PromoteFilter;
+        let broker = Arc::new(TokenBroker::new());
+        let nonce_a = broker.issue(Zeroizing::new("AAA".to_string()), test_grants());
+        let nonce_b = broker.issue(Zeroizing::new("BBB".to_string()), test_grants());
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "env": { "name_matches": "^MY_VAR$" }
+        }))
+        .unwrap();
+        let filter =
+            crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile");
+
+        let mut env_in = HashMap::new();
+        env_in.insert(
+            "AUTH_HEADER".to_string(),
+            format!("Bearer {}", nonce_a),
+        );
+        env_in.insert("MY_VAR".to_string(), nonce_b.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), Some(&filter));
+        // AUTH_HEADER no longer auto-promotes — the explicit predicate replaced
+        // the default and only admits MY_VAR.
+        assert_eq!(
+            env.get("AUTH_HEADER").map(String::as_str),
+            Some(format!("Bearer {}", nonce_a).as_str()),
+        );
+        assert_eq!(env.get("MY_VAR").map(String::as_str), Some("BBB"));
+    }
+
+    /// Documented widening pattern: union the default regex with a custom
+    /// name to keep the safe-shape allowlist AND admit a bespoke env var.
+    #[test]
+    fn build_exec_env_explicit_predicate_can_union_default() {
+        use crate::mediation::{PromoteFilter, promote::PROMOTE_ENV_DEFAULT_NAMES};
+        let broker = Arc::new(TokenBroker::new());
+        let nonce_a = broker.issue(Zeroizing::new("AAA".to_string()), test_grants());
+        let nonce_b = broker.issue(Zeroizing::new("BBB".to_string()), test_grants());
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "env": {
+                "any_of": [
+                    { "name_matches": PROMOTE_ENV_DEFAULT_NAMES },
+                    { "name_matches": "^MY_CUSTOM_NONCE_VAR$" }
+                ]
+            }
+        }))
+        .unwrap();
+        let filter =
+            crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile");
+
+        let mut env_in = HashMap::new();
+        env_in.insert(
+            "AUTH_HEADER".to_string(),
+            format!("Bearer {}", nonce_a),
+        );
+        env_in.insert("MY_CUSTOM_NONCE_VAR".to_string(), nonce_b);
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), Some(&filter));
+        assert_eq!(env.get("AUTH_HEADER").map(String::as_str), Some("Bearer AAA"));
+        assert_eq!(
+            env.get("MY_CUSTOM_NONCE_VAR").map(String::as_str),
+            Some("BBB")
+        );
+    }
+
+    /// `not` env predicate inverts: promotes everywhere except the named
+    /// one.
+    #[test]
+    fn build_exec_env_not_env_predicate_inverts() {
+        use crate::mediation::PromoteFilter;
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real".to_string()), test_grants());
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "env": { "not": { "name_matches": "^DD_API_KEY$" } }
+        }))
+        .unwrap();
+        let filter =
+            crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile");
+
+        let mut env_in = HashMap::new();
+        env_in.insert("DD_API_KEY".to_string(), nonce.clone());
+        env_in.insert("ANY".to_string(), nonce.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), Some(&filter));
+        // DD_API_KEY: not(name=DD_API_KEY) → false → no promotion.
+        assert_eq!(
+            env.get("DD_API_KEY").map(String::as_str),
+            Some(nonce.as_str()),
+        );
+        // ANY: not(name=DD_API_KEY) → true → promote.
+        assert_eq!(env.get("ANY").map(String::as_str), Some("real"));
+    }
+
+    /// args-only filter still uses the built-in env default — the env
+    /// scope is independent of the args scope.
+    #[test]
+    fn build_exec_env_args_only_filter_still_uses_default() {
+        use crate::mediation::PromoteFilter;
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real".to_string()), test_grants());
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "args": { "self_matches": "^-H" }
+        }))
+        .unwrap();
+        let filter =
+            crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile");
+
+        let mut env_in = HashMap::new();
+        env_in.insert(
+            "AUTH_HEADER".to_string(),
+            format!("Bearer {}", nonce),
+        );
+        env_in.insert("MY_VAR".to_string(), nonce.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), Some(&filter));
+        // AUTH_HEADER still promotes via the built-in default.
+        assert_eq!(env.get("AUTH_HEADER").map(String::as_str), Some("Bearer real"));
+        // MY_VAR doesn't.
+        assert_eq!(env.get("MY_VAR").map(String::as_str), Some(nonce.as_str()));
     }
 
     /// A `Run` intercept runs the real binary the same way the
