@@ -20,6 +20,7 @@ pub mod control;
 pub mod matcher;
 pub mod merge;
 pub mod policy;
+pub mod promote;
 pub mod server;
 pub mod session;
 
