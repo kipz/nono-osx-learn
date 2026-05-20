@@ -634,6 +634,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
                     id: "default".to_string(),
                     action: crate::mediation::InterceptAction::Run { script: None },
                     sandbox: None,
+                    promote_in: None,
                 },
                 intercept: vec![],
                 sandbox: Some(crate::mediation::CommandSandbox {

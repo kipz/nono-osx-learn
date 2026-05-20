@@ -806,6 +806,7 @@ mod tests {
                 id: "default".to_string(),
                 action: InterceptAction::Run { script: None },
                 sandbox: None,
+                promote_in: None,
             },
             intercept: vec![InterceptRule {
                 id: Some("default".to_string()),
@@ -817,6 +818,7 @@ mod tests {
                     exit_code: 0,
                 },
                 sandbox: crate::mediation::SandboxBinding::InheritFromDefault,
+                promote_in: None,
             }],
             sandbox: None,
             caller_policy: CallerPolicy::default(),

@@ -179,6 +179,7 @@ mod tests {
                 id: "default".to_string(),
                 action: InterceptAction::Run { script: None },
                 sandbox: None,
+                promote_in: None,
             },
             intercept: Vec::new(),
             sandbox: None,
@@ -213,6 +214,7 @@ mod tests {
                 exit_code: 0,
             },
             sandbox: crate::mediation::SandboxBinding::InheritFromDefault,
+            promote_in: None,
         }
     }
 
