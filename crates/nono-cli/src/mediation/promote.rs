@@ -21,13 +21,16 @@ use std::sync::OnceLock;
 /// Built-in safe-shape env var name allowlist used when `PromoteFilter::env`
 /// is absent.
 ///
-/// Case-insensitive. Matches the canonical credential-shaped names that flow
-/// across the tools we mediate today: `AUTHORIZATION`, `*_TOKEN`, `*_HEADER`,
-/// `*_KEY`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIALS`, `*_AUTH`. Profiles
-/// that need a wider window declare a custom `EnvPredicate` that unions
-/// this regex with their additional names.
+/// Case-insensitive (ASCII). The `(?i-u)` flag turns on case-insensitive
+/// matching with Unicode mode disabled — nono builds its `regex` crate
+/// without the `unicode-case` feature, and these names are ASCII
+/// conventions anyway (`AUTHORIZATION`, `*_TOKEN`, etc.). The prefix
+/// class is restricted to `[A-Za-z0-9_]+` so the regex engine does not
+/// see a wildcard that could match invalid UTF-8 bytes in non-Unicode
+/// mode. Profiles that need a wider window declare a custom
+/// `EnvPredicate` that unions this regex with their additional names.
 pub const PROMOTE_ENV_DEFAULT_NAMES: &str =
-    r"(?i)^(authorization|.+_token|.+_header|.+_key|.+_secret|.+_password|.+_credentials|.+_auth)$";
+    r"(?i-u)^(authorization|[A-Za-z0-9_]+_(token|header|key|secret|password|credentials|auth))$";
 
 /// Compiled `ArgPredicate`. Each `Regex` is built once at session start.
 #[derive(Clone, Debug)]

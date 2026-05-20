@@ -445,7 +445,7 @@ When an explicit `env` predicate is set, it **replaces** the built-in default. T
 "promote_in": {
   "env": {
     "any_of": [
-      { "name_matches": "(?i)^(authorization|.+_token|.+_header|.+_key|.+_secret|.+_password|.+_credentials|.+_auth)$" },
+      { "name_matches": "(?i-u)^(authorization|[A-Za-z0-9_]+_(token|header|key|secret|password|credentials|auth))$" },
       { "name_matches": "^MY_CUSTOM_NONCE_VAR$" }
     ]
   }
