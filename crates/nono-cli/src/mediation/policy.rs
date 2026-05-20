@@ -196,11 +196,19 @@ pub async fn apply(
     // If the request comes from within a per-command sandbox (via allow_commands),
     // skip intercepts — credentials flow between trusted sub-processes, not to the agent.
     // The sandbox context nonce is unforgeable (only the server can issue valid nonces).
+    //
+    // The parent's allow_commands list may live on the legacy `cmd.sandbox` field
+    // OR on the new-DSL `cmd.default.sandbox`. Check both so profiles that have
+    // migrated to the new DSL still get the allow_commands fast path.
     if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT")
         && let Some(parent_name) = broker.resolve(ctx_nonce, &sandbox_consumer)
         && let Some(parent_cmd) = commands.iter().find(|c| c.name == **parent_name)
-        && let Some(ref sb) = parent_cmd.sandbox
-        && sb.allow_commands.contains(&request.command)
+        && let Some(allow_list) = parent_cmd
+            .sandbox
+            .as_ref()
+            .map(|sb| &sb.allow_commands)
+            .or_else(|| parent_cmd.default.sandbox.as_ref().map(|sb| &sb.allow_commands))
+        && allow_list.contains(&request.command)
     {
         debug!(
             "mediation: skipping intercepts for '{}' (called from '{}' via allow_commands)",
@@ -1108,12 +1116,17 @@ fn build_filtered_shim_dir(
         let name_str = name.to_string_lossy();
 
         if allow_set.contains(name_str.as_ref()) {
-            // If the allowed command has its own mediation rules (intercepts or sandbox),
-            // keep the shim so it routes through the mediation server. Only exclude
-            // commands that have no mediation and should resolve to real binaries directly.
-            let has_mediation = all_commands
-                .iter()
-                .any(|c| c.name == name_str && (!c.intercepts.is_empty() || c.sandbox.is_some()));
+            // If the allowed command has its own mediation rules (intercepts or
+            // any per-command sandbox — legacy or new-DSL `default.sandbox`),
+            // keep the shim so it routes through the mediation server. Only
+            // exclude commands that have no mediation and should resolve to
+            // real binaries directly.
+            let has_mediation = all_commands.iter().any(|c| {
+                c.name == name_str
+                    && (!c.intercepts.is_empty()
+                        || c.sandbox.is_some()
+                        || c.default.sandbox.is_some())
+            });
             if has_mediation {
                 debug!(
                     "mediation: keeping shim for '{}' in filtered dir (has own mediation rules)",
@@ -2250,6 +2263,64 @@ mod tests {
             filtered_dir.join("kubectl").exists(),
             "kubectl should be in filtered shim dir"
         );
+    }
+
+    /// Regression: an allowed command whose mediation rules live on the
+    /// new-DSL `default.sandbox` (not the legacy top-level `sandbox` field)
+    /// must keep its shim in the filtered dir. Without this, routing such a
+    /// child through mediation is silently broken — the child resolves to
+    /// the real binary directly and inherits the parent's Seatbelt sandbox,
+    /// missing any access that the child's own per-command sandbox would
+    /// have granted (e.g. `~/.ssh/known_hosts` for ssh).
+    #[test]
+    fn test_filtered_shim_dir_keeps_new_dsl_default_sandbox() {
+        let session_dir = tempfile::tempdir().expect("create temp dir");
+        let shim_dir = session_dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        std::fs::write(shim_dir.join("ssh"), "fake-shim").expect("write shim");
+        std::fs::write(shim_dir.join("git"), "fake-shim").expect("write shim");
+
+        let commands = vec![
+            ResolvedCommand {
+                name: "ssh".to_string(),
+                real_path: PathBuf::from("/usr/bin/ssh"),
+                intercepts: vec![],
+                sandbox: None, // <-- legacy field absent
+                caller_policy: CallerPolicy::default(),
+                default: ResolvedDefault {
+                    action: ResolvedAction::Run { script: None },
+                    // ssh's mediation rules live HERE under the new DSL.
+                    sandbox: Some(crate::mediation::CommandSandbox {
+                        keychain_access: true,
+                        fs_read: vec!["~/.ssh".to_string()],
+                        ..Default::default()
+                    }),
+                    promote_filter: None,
+                },
+            },
+            ResolvedCommand {
+                name: "git".to_string(),
+                real_path: PathBuf::from("/opt/homebrew/bin/git"),
+                intercepts: vec![],
+                sandbox: None,
+                caller_policy: CallerPolicy::default(),
+                default: ResolvedDefault {
+                    action: ResolvedAction::Run { script: None },
+                    sandbox: None,
+                    promote_filter: None,
+                },
+            },
+        ];
+
+        let allow_commands = vec!["ssh".to_string()];
+        let (filtered_dir, _guard) =
+            build_filtered_shim_dir(&shim_dir, &allow_commands, &commands).expect("build");
+
+        assert!(
+            filtered_dir.join("ssh").exists(),
+            "ssh should keep its shim — has default.sandbox mediation rules"
+        );
+        assert!(filtered_dir.join("git").exists(), "git always kept");
     }
 
     #[test]
