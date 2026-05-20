@@ -56,6 +56,11 @@ pub struct ResolvedIntercept {
     /// `InheritFromDefault` → `cmd.default.sandbox` if set, else legacy
     /// `cmd.sandbox`.
     pub sandbox: ResolvedSandboxBinding,
+    /// Compiled per-rule nonce-promotion filter. `None` means the profile
+    /// did not declare `promote_in` for this rule — argv promotion is
+    /// suppressed and env promotion falls back to the built-in safe-shape
+    /// allowlist.
+    pub promote_filter: Option<crate::mediation::promote::ResolvedPromoteFilter>,
 }
 
 /// Resolved counterpart of `mediation::SandboxBinding`. The tri-state is
@@ -90,6 +95,10 @@ pub struct ResolvedCommand {
 pub struct ResolvedDefault {
     pub action: ResolvedAction,
     pub sandbox: Option<crate::mediation::CommandSandbox>,
+    /// Compiled per-default nonce-promotion filter. Same secure defaults
+    /// as `ResolvedIntercept::promote_filter`. Intercepts do NOT inherit
+    /// this — each rule's filter is independent.
+    pub promote_filter: Option<crate::mediation::promote::ResolvedPromoteFilter>,
 }
 
 /// Handle returned by `setup()`. Dropping this shuts down the runtime.
@@ -468,20 +477,36 @@ fn resolve_command(
                     ResolvedSandboxBinding::Explicit(sb.clone())
                 }
             };
+            let promote_filter = match &rule.promote_in {
+                Some(p) => Some(crate::mediation::promote::compile_promote_filter(
+                    p,
+                    &entry.name,
+                )?),
+                None => None,
+            };
             Ok(ResolvedIntercept {
                 id: rule.id.clone(),
                 matcher,
                 action,
                 admin: rule.admin,
                 sandbox,
+                promote_filter,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
     let default_action = resolve_intercept_action(&entry.default.action)?;
+    let default_promote_filter = match &entry.default.promote_in {
+        Some(p) => Some(crate::mediation::promote::compile_promote_filter(
+            p,
+            &entry.name,
+        )?),
+        None => None,
+    };
     let default = ResolvedDefault {
         action: default_action,
         sandbox: entry.default.sandbox.clone(),
+        promote_filter: default_promote_filter,
     };
 
     Ok(Some(ResolvedCommand {
@@ -835,6 +860,108 @@ mod tests {
         );
     }
 
+    /// A bad `promote_in` regex on an intercept rule surfaces at profile
+    /// load with a `SandboxInit` error keyed by command name. Validates the
+    /// resolve-time compile path.
+    #[test]
+    fn intercept_promote_in_regex_error_surfaces_at_profile_load() {
+        use crate::mediation::{
+            ArgPredicate, ArgsMatcher, CommandEntry, DefaultEntry, InterceptAction, InterceptRule,
+            PromoteFilter,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().into_owned()),
+            default: DefaultEntry {
+                id: "default".to_string(),
+                action: InterceptAction::Run { script: None },
+                sandbox: None,
+                promote_in: None,
+            },
+            intercept: vec![InterceptRule {
+                id: Some("bad-rule".to_string()),
+                matcher: ArgsMatcher::All { all: vec![] },
+                admin: false,
+                action: InterceptAction::Run { script: None },
+                sandbox: crate::mediation::SandboxBinding::InheritFromDefault,
+                promote_in: Some(PromoteFilter {
+                    args: Some(ArgPredicate::SelfMatches {
+                        self_matches: "(unclosed".to_string(),
+                    }),
+                    env: None,
+                }),
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let err = match resolve_command(&entry, &shim_dir, &fake_shim_binary, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("bad regex must fail profile load"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("fake-cmd"), "msg should name command: {msg}");
+        assert!(
+            msg.contains("promote_in"),
+            "msg should mention promote_in: {msg}"
+        );
+        assert!(
+            msg.contains("(unclosed"),
+            "msg should include the bad pattern: {msg}"
+        );
+    }
+
+    /// Same regex-error surfacing applies to the default entry's
+    /// `promote_in` field.
+    #[test]
+    fn default_promote_in_regex_error_surfaces_at_profile_load() {
+        use crate::mediation::{
+            CommandEntry, DefaultEntry, EnvPredicate, InterceptAction, PromoteFilter,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().into_owned()),
+            default: DefaultEntry {
+                id: "default".to_string(),
+                action: InterceptAction::Run { script: None },
+                sandbox: None,
+                promote_in: Some(PromoteFilter {
+                    args: None,
+                    env: Some(EnvPredicate::NameMatches {
+                        name_matches: "(*)".to_string(),
+                    }),
+                }),
+            },
+            intercept: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let err = match resolve_command(&entry, &shim_dir, &fake_shim_binary, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("bad regex on default must fail profile load"),
+        };
+        assert!(err.to_string().contains("fake-cmd"));
+    }
+
     /// Build a minimal `ResolvedCommand` for the validation unit tests.
     /// `validate_grant_to_references` only inspects names, intercept ids,
     /// and actions — it does not touch the filesystem or sandbox fields.
@@ -853,6 +980,7 @@ mod tests {
                 action: ResolvedAction::Run { script: None },
                 admin: false,
                 sandbox: ResolvedSandboxBinding::InheritFromDefault,
+                promote_filter: None,
             })
             .collect();
         for (id, grants) in capture_rules {
@@ -865,6 +993,7 @@ mod tests {
                 },
                 admin: false,
                 sandbox: ResolvedSandboxBinding::InheritFromDefault,
+                promote_filter: None,
             });
         }
         ResolvedCommand {
@@ -876,6 +1005,7 @@ mod tests {
             default: ResolvedDefault {
                 action: default_action,
                 sandbox: None,
+                promote_filter: None,
             },
         }
     }

@@ -1339,6 +1339,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         }
     }
@@ -1482,6 +1483,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
         // Default caller_policy from make_cmd.
         assert!(cmd.caller_policy.agent_allowed);
@@ -1543,6 +1545,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
         cmd.caller_policy = CallerPolicy {
             agent_allowed: false,
@@ -1644,6 +1647,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
         // Confirm default state.
         assert!(cmd.caller_policy.allowed_parents.is_none());
@@ -1683,6 +1687,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1726,6 +1731,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1766,6 +1772,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1806,6 +1813,7 @@ mod tests {
             },
             admin: true,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1846,6 +1854,7 @@ mod tests {
             },
             admin: true,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1886,6 +1895,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1927,6 +1937,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
         // Use a command that outputs something: `echo hello` → "hello"
         let cmd = ResolvedCommand {
@@ -1982,6 +1993,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -2118,6 +2130,7 @@ mod tests {
                 default: ResolvedDefault {
                     action: ResolvedAction::Run { script: None },
                     sandbox: None,
+                    promote_filter: None,
                 },
             },
             ResolvedCommand {
@@ -2129,6 +2142,7 @@ mod tests {
                 default: ResolvedDefault {
                     action: ResolvedAction::Run { script: None },
                     sandbox: None,
+                    promote_filter: None,
                 },
             },
             ResolvedCommand {
@@ -2140,6 +2154,7 @@ mod tests {
                 default: ResolvedDefault {
                     action: ResolvedAction::Run { script: None },
                     sandbox: None,
+                    promote_filter: None,
                 },
             },
         ];
@@ -2226,6 +2241,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -2239,6 +2255,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -2327,6 +2344,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -2395,6 +2413,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -2450,6 +2469,7 @@ mod tests {
                 action: ResolvedAction::Run { script: None },
                 admin: false,
                 sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+                promote_filter: None,
             }],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2467,6 +2487,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -2535,6 +2556,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -2598,6 +2620,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -2662,6 +2685,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -2716,6 +2740,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -2808,6 +2833,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let (child_in, _test_in) = UnixStream::pair().expect("pair stdin");
@@ -2874,6 +2900,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -3054,12 +3081,14 @@ mod tests {
                 action: ResolvedAction::Run { script: None },
                 admin: false,
                 sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+                promote_filter: None,
             }],
             sandbox: None,
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -3109,12 +3138,14 @@ mod tests {
                 action: ResolvedAction::Run { script: None },
                 admin: false,
                 sandbox: ResolvedSandboxBinding::Explicit(tight.clone()),
+                promote_filter: None,
             }],
             sandbox: Some(CommandSandbox::default()), // permissive
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -3164,12 +3195,14 @@ mod tests {
                 action: ResolvedAction::Run { script: None },
                 admin: false,
                 sandbox: ResolvedSandboxBinding::Explicit(intercept_sandbox),
+                promote_filter: None,
             }],
             sandbox: None,
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -3262,6 +3295,7 @@ mod tests {
                     action: ResolvedAction::Run { script: None },
                     admin: false,
                     sandbox: ResolvedSandboxBinding::Explicit(sandbox_a),
+                    promote_filter: None,
                 },
                 ResolvedIntercept {
                     id: None,
@@ -3269,6 +3303,7 @@ mod tests {
                     action: ResolvedAction::Run { script: None },
                     admin: false,
                     sandbox: ResolvedSandboxBinding::Explicit(sandbox_b),
+                    promote_filter: None,
                 },
             ],
             sandbox: None,
@@ -3276,6 +3311,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
 
@@ -3349,12 +3385,14 @@ mod tests {
                 action: ResolvedAction::Run { script: None },
                 admin: false,
                 sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+                promote_filter: None,
             }],
             sandbox: None,
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
         let req = ShimRequest {
@@ -3383,6 +3421,7 @@ mod tests {
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
         let req = ShimRequest {
@@ -3418,6 +3457,7 @@ mod tests {
                     exit_code: 126,
                 },
                 sandbox: None,
+                promote_filter: None,
             },
         };
         let req = ShimRequest {
@@ -3456,6 +3496,7 @@ mod tests {
             },
             admin: false,
             sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
         let req = ShimRequest {
             command: "testcmd".to_string(),
@@ -3500,12 +3541,14 @@ mod tests {
                 admin: false,
                 id: Some("test".to_string()),
                 sandbox: ResolvedSandboxBinding::Explicit(tight.clone()),
+                promote_filter: None,
             }],
             sandbox: Some(CommandSandbox::default()), // permissive command-level
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: None,
+                promote_filter: None,
             },
         };
         let req = ShimRequest {
@@ -3536,12 +3579,14 @@ mod tests {
                 admin: false,
                 id: Some("test".to_string()),
                 sandbox: ResolvedSandboxBinding::InheritFromDefault,
+                promote_filter: None,
             }],
             sandbox: None,
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
                 action: ResolvedAction::Run { script: None },
                 sandbox: Some(default_sb.clone()),
+                promote_filter: None,
             },
         };
         let req = ShimRequest {
