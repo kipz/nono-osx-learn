@@ -272,10 +272,11 @@ Per-command interception of agent invocations. The mediation server runs in the 
 
 Every command needs a `default` block. It dispatches when no intercept matches and is referenced by capture grants as `<command>.default`.
 
-| Field     | Type            | Required | Description |
-|-----------|-----------------|----------|-------------|
-| `action`  | InterceptAction | yes      | One of `respond`, `run`, or `capture`. |
-| `sandbox` | CommandSandbox  | no       | Fallback sandbox. Intercept rules with no own `sandbox` inherit this. |
+| Field        | Type            | Required | Description |
+|--------------|-----------------|----------|-------------|
+| `action`     | InterceptAction | yes      | One of `respond`, `run`, or `capture`. |
+| `sandbox`    | CommandSandbox  | no       | Fallback sandbox. Intercept rules with no own `sandbox` inherit this. |
+| `promote_in` | PromoteFilter   | no       | Per-default scoping of nonce promotion. See "Promotion scoping" below. |
 
 Minimal default — let the call through unchanged:
 
@@ -314,13 +315,14 @@ Default with a sandbox that scopes every fall-through run:
 }
 ```
 
-| Field     | Type            | Required | Description |
-|-----------|-----------------|----------|-------------|
-| `id`      | string          | conditional | Identifier within the command's intercept list. Required when any `Capture.grant_to` references this rule as `<command>.<id>`. The id `"default"` is reserved for the default entry. |
-| `match`   | ArgsMatcher     | yes      | Predicate tree against argv. See "Argv matchers" below. |
-| `admin`   | boolean         | no       | Require user authentication before the action runs. Default: false. |
-| `action`  | InterceptAction | yes      | One of `respond`, `run`, or `capture`. |
-| `sandbox` | tri-state       | no       | Per-invocation sandbox binding. See "Sandbox inheritance" below. |
+| Field        | Type            | Required | Description |
+|--------------|-----------------|----------|-------------|
+| `id`         | string          | conditional | Identifier within the command's intercept list. Required when any `Capture.grant_to` references this rule as `<command>.<id>`. The id `"default"` is reserved for the default entry. |
+| `match`      | ArgsMatcher     | yes      | Predicate tree against argv. See "Argv matchers" below. |
+| `admin`      | boolean         | no       | Require user authentication before the action runs. Default: false. |
+| `action`     | InterceptAction | yes      | One of `respond`, `run`, or `capture`. |
+| `sandbox`    | tri-state       | no       | Per-invocation sandbox binding. See "Sandbox inheritance" below. |
+| `promote_in` | PromoteFilter   | no       | Per-rule scoping of nonce promotion. See "Promotion scoping" below. |
 
 #### Argv matchers
 
@@ -397,6 +399,88 @@ Only `run` rules honour this field. `capture` ignores it (always unsandboxed in 
 | `allowed_parents` | array of string  | `null`  | Restrict mediated-parent callers. Field absent = any mediated parent. Empty array = no mediated parent. Listed = only the named parents. |
 
 Caller policy is evaluated before any intercept or sandbox logic.
+
+#### Promotion scoping (`promote_in`)
+
+When a mediated command exec'd via a `run` intercept (or via the command's `default` action) receives nonces in its argv or env, the broker substitutes those `nono_<hex>` substrings with real credentials at exec time. `promote_in` declares which slots are admissible — defence-in-depth alongside the matcher's `not`-clauses and capture-side `grant_to`.
+
+```jsonc
+"promote_in": {
+  "args": { /* ArgPredicate */ },
+  "env":  { /* EnvPredicate  */ }
+}
+```
+
+Both sub-fields are independently optional. **Defaults are secure**:
+
+- `args` absent ⇒ **no argv slot promotes**. The redemption site must declare which positional slots may receive a credential. Closes the "credential lands in an unexpected argv slot" attack surface as a default posture.
+- `env` absent ⇒ promotion uses the built-in safe-shape allowlist (case-insensitive): `AUTHORIZATION`, `*_TOKEN`, `*_HEADER`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIALS`, `*_AUTH`. Env names outside this set stay literal.
+
+##### ArgPredicate (positional)
+
+Evaluated per argv slot — each leaf answers "may this slot receive promotion?".
+
+| Form                                  | Meaning |
+|---------------------------------------|---------|
+| `{ "self_matches": "<re>" }`           | argv[i] matches. Use for attached forms like `-Hnono_<hex>` or `--header=...`. |
+| `{ "preceded_by_arg": "<re>" }`        | argv[i-1] matches. Use for separate-arg forms like `["-H", "Authorization: ..."]`. argv[0] always misses (no left neighbour). |
+| `{ "at_index": <n> }`                  | Exact 0-based positional pin. |
+| `{ "all_of": [ ... ] }`                | Conjunction. Empty list = always promote (vacuous). |
+| `{ "any_of": [ ... ] }`                | Disjunction. Empty list = never promote (defensive lock). |
+| `{ "not": <predicate> }`               | Logical NOT. |
+
+##### EnvPredicate (name + value)
+
+Env vars are stored as a name→value map; predicates key off var name and (rarely) value.
+
+| Form                                  | Meaning |
+|---------------------------------------|---------|
+| `{ "name_matches": "<re>" }`           | The env var's name matches. |
+| `{ "value_matches": "<re>" }`          | The env var's value matches. |
+| `{ "all_of": [ ... ] }` / `{ "any_of": [ ... ] }` / `{ "not": <predicate> }` | Combinators with the same semantics as `ArgPredicate`. |
+
+When an explicit `env` predicate is set, it **replaces** the built-in default. To keep the safe-shape allowlist and admit one extra name, union the default regex into a custom `any_of`:
+
+```jsonc
+"promote_in": {
+  "env": {
+    "any_of": [
+      { "name_matches": "(?i)^(authorization|.+_token|.+_header|.+_key|.+_secret|.+_password|.+_credentials|.+_auth)$" },
+      { "name_matches": "^MY_CUSTOM_NONCE_VAR$" }
+    ]
+  }
+}
+```
+
+##### Worked example — `curl.gitlab`
+
+A redemption-site intercept that handles `curl` to `gitlab.ddbuild.io`. Captured GitLab nonces are carried only in `-H "PRIVATE-TOKEN: nono_<hex>"` headers, so the filter admits exactly those slots:
+
+```jsonc
+{
+  "id": "gitlab",
+  "match": { "all": [
+    { "any_arg_matches": "^https?://(gitlab\\.ddbuild\\.io)(:[0-9]+)?(/|$)" }
+    /* plus any file-shape `not`-clauses */
+  ]},
+  "action": { "type": "run" },
+  "sandbox": { "network": { "allowed_hosts": ["gitlab.ddbuild.io"] } },
+  "promote_in": {
+    "args": {
+      "any_of": [
+        { "preceded_by_arg": "^(-H|--header)$" },
+        { "self_matches":    "^(-H|--header=)" }
+      ]
+    }
+  }
+}
+```
+
+Effect: a `nono_<hex>` substring anywhere outside the header slots — body (`--data*`/`-d`), upload-file target (`-T`), multipart (`-F`, `=@`), config file (`-K`), cookie (`-b`) — stays literal even if the matcher's `not`-clauses ever miss a new variant. The upstream sees an unauthenticated request rather than a leaked credential.
+
+##### Inheritance
+
+Intercepts do **not** inherit `promote_in` from the command's `default`. Each rule's filter is independent, matching the per-rule scoping of `grant_to` and avoiding action-at-a-distance.
 
 #### env
 
