@@ -17,8 +17,10 @@ pub mod admin;
 pub mod approval;
 pub mod broker;
 pub mod control;
+pub mod matcher;
 pub mod merge;
 pub mod policy;
+pub mod promote;
 pub mod server;
 pub mod session;
 
@@ -53,6 +55,10 @@ pub struct CommandEntry {
     /// Useful when the system `which` resolves to a wrapper that should not be exec'd.
     #[serde(default)]
     pub binary_path: Option<String>,
+    /// Required default. Dispatched when no intercept rule matches the
+    /// invocation's argv. The legacy implicit fall-through is gone:
+    /// profiles must spell out what to do for unmatched calls.
+    pub default: DefaultEntry,
     /// Arg-prefix intercept rules. Checked in order; first match wins.
     #[serde(default)]
     pub intercept: Vec<InterceptRule>,
@@ -63,6 +69,35 @@ pub struct CommandEntry {
     /// (agent or any mediated parent) — backward compatible.
     #[serde(default)]
     pub caller_policy: CallerPolicy,
+}
+
+/// Default action for a command. Dispatched when no intercept matches.
+/// Grants reference this entry as `<command>.default`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DefaultEntry {
+    /// Always "default". Skipped on serialise; defaulted on deserialise.
+    #[serde(default = "default_id_value", skip_serializing)]
+    pub id: String,
+
+    /// Required action.
+    pub action: InterceptAction,
+
+    /// Optional fallback sandbox. Intercepts that omit their own `sandbox`
+    /// inherit this when running.
+    #[serde(default)]
+    pub sandbox: Option<CommandSandbox>,
+
+    /// Optional per-default scoping of nonce promotion. Same semantics as
+    /// `InterceptRule::promote_in` — declares which argv slots and env vars
+    /// may receive promoted credentials when this default action dispatches.
+    /// Intercepts do NOT inherit this from the default; each rule's
+    /// `promote_in` is independent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promote_in: Option<PromoteFilter>,
+}
+
+fn default_id_value() -> String {
+    "default".to_string()
 }
 
 /// Caller-policy gate for a mediated command.
@@ -102,20 +137,152 @@ fn default_true() -> bool {
     true
 }
 
-/// An intercept rule: if `args_prefix` matches the invocation's positional args,
-/// perform the configured action without (or with) calling the real binary.
+/// Boolean predicate tree against an invocation's argv.
+///
+/// Profiles author intercept matchers as a recursive JSON shape: combinators
+/// (`all` / `any` / `not`) compose leaves (`any_arg_matches`, `nth_arg_matches`,
+/// `all_args_match`). The matcher is evaluated only against the argv passed to
+/// the mediated command — it does not see env, cwd, or stdin. Regex leaves
+/// use the `regex` crate (linear-time, no catastrophic backtracking; inline
+/// flags `(?i)`, `(?m)` etc. supported).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ArgsMatcher {
+    /// Conjunction. Empty list = vacuously true (matches anything).
+    All {
+        all: Vec<ArgsMatcher>,
+    },
+    /// Disjunction. Empty list = vacuously false.
+    Any {
+        any: Vec<ArgsMatcher>,
+    },
+    /// Logical NOT.
+    Not {
+        not: Box<ArgsMatcher>,
+    },
+    /// At least one argv element matches `any_arg_matches` as a regex.
+    AnyArgMatches {
+        any_arg_matches: String,
+    },
+    /// Every argv element matches `all_args_match` (or argv is empty).
+    AllArgsMatch {
+        all_args_match: String,
+    },
+    /// argv element at `index` (0-based, counts flags) matches `regex`.
+    NthArgMatches {
+        nth_arg_matches: usize,
+        regex: String,
+    },
+}
+
+/// An intercept rule. Fires when its matcher accepts the invocation's argv.
+///
+/// Authors specify the matcher via the required `match` field as a predicate
+/// tree (see `ArgsMatcher`). An empty `all: []` matcher matches everything.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InterceptRule {
-    /// The leading positional args that must match (flags are ignored during matching).
-    /// E.g. `["auth", "github", "token"]` matches `ddtool --debug auth github token`.
-    pub args_prefix: Vec<String>,
-    /// If true, the user must authenticate via a native macOS biometric/password dialog
-    /// before the action is executed. Requires `nono-approve` to be installed alongside nono.
-    /// Defaults to false.
+    /// Optional identifier within the command's intercept list. Used by
+    /// `Capture.grant_to` references in the form `<command>.<id>`. The id
+    /// `"default"` is reserved for the command's default entry; setting it
+    /// on an intercept is a profile-load error.
+    #[serde(default)]
+    pub id: Option<String>,
+
+    /// Predicate-tree matcher against argv. Required: profile load fails if
+    /// a rule omits `match`.
+    #[serde(rename = "match")]
+    pub matcher: ArgsMatcher,
+
+    /// Require user authentication before the action runs.
     #[serde(default)]
     pub admin: bool,
-    /// What to do when this rule matches.
+
+    /// What to do on match.
     pub action: InterceptAction,
+
+    /// Tri-state per-invocation sandbox binding. See `SandboxBinding` for
+    /// JSON encoding (absent vs `null` vs object). When set on a `Run` rule,
+    /// an `Explicit` binding replaces the command-level sandbox for that
+    /// single invocation; an `ExplicitlyUnsandboxed` binding disables any
+    /// per-command sandbox; `InheritFromDefault` (absent) falls back to
+    /// `cmd.default.sandbox`. `Capture` ignores this field — it runs the
+    /// real binary in the broker parent (unsandboxed) so credential helpers
+    /// can reach the Keychain, OAuth flows, etc. `Respond` ignores it too
+    /// (no exec happens).
+    #[serde(default)]
+    pub sandbox: SandboxBinding,
+
+    /// Optional per-intercept scoping of nonce promotion. See `PromoteFilter`
+    /// for semantics: when absent, argv promotion is suppressed entirely and
+    /// env promotion falls back to the built-in safe-shape allowlist; when
+    /// present, the contained predicates declare which argv slots and env
+    /// vars are admissible for promotion at this redemption site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promote_in: Option<PromoteFilter>,
+}
+
+/// Per-intercept scoping of nonce promotion.
+///
+/// Each sub-predicate is independently optional. Defaults are secure:
+/// `args == None` ⇒ no argv slot promotes (the redemption site must declare
+/// which positional slots may receive a credential). `env == None` ⇒ the
+/// built-in safe-shape env name allowlist (`PROMOTE_ENV_DEFAULT_NAMES` in
+/// `mediation::promote`) decides. To widen env promotion explicitly, set a
+/// custom `EnvPredicate` that unions the default regex with whatever extra
+/// names the rule needs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromoteFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<ArgPredicate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<EnvPredicate>,
+}
+
+/// Argv-slot predicate for `PromoteFilter`.
+///
+/// Evaluated per-arg (not per-argv): each leaf answers "may *this* slot
+/// receive promotion?". Combinators mirror `ArgsMatcher`. Empty `any_of: []`
+/// never promotes (defensive lock); empty `all_of: []` always promotes
+/// (vacuous).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ArgPredicate {
+    /// Conjunction. Empty list = vacuously true.
+    AllOf { all_of: Vec<ArgPredicate> },
+    /// Disjunction. Empty list = vacuously false.
+    AnyOf { any_of: Vec<ArgPredicate> },
+    /// Logical NOT.
+    Not { not: Box<ArgPredicate> },
+    /// argv[i] matches `self_matches` as a regex. Handles attached
+    /// `-Hnono_<hex>` and `--header=Authorization: Bearer nono_<hex>` forms.
+    SelfMatches { self_matches: String },
+    /// argv[i-1] matches `preceded_by_arg` as a regex. argv[0] always misses
+    /// (no left neighbour). Handles separate-arg `["-H", "Authorization:
+    /// Bearer nono_<hex>"]` form.
+    PrecededByArg { preceded_by_arg: String },
+    /// argv[i] is exactly at position `at_index` (0-based).
+    AtIndex { at_index: usize },
+}
+
+/// Env-var predicate for `PromoteFilter`.
+///
+/// Env values are stored in a `HashMap<String, String>` with no positional
+/// context; the predicates accordingly key off var name and (optionally) value
+/// rather than position. Combinators mirror `ArgPredicate`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum EnvPredicate {
+    /// Conjunction. Empty list = vacuously true.
+    AllOf { all_of: Vec<EnvPredicate> },
+    /// Disjunction. Empty list = vacuously false.
+    AnyOf { any_of: Vec<EnvPredicate> },
+    /// Logical NOT.
+    Not { not: Box<EnvPredicate> },
+    /// The env var's name matches `name_matches` as a regex.
+    NameMatches { name_matches: String },
+    /// The env var's value matches `value_matches` as a regex. Belt-and-
+    /// braces; rarely needed alongside `name_matches`.
+    ValueMatches { value_matches: String },
 }
 
 /// The action to take when an intercept rule fires.
@@ -126,6 +293,8 @@ pub enum InterceptAction {
     Respond {
         #[serde(default)]
         stdout: String,
+        #[serde(default)]
+        stderr: String,
         #[serde(default)]
         exit_code: i32,
     },
@@ -139,21 +308,65 @@ pub enum InterceptAction {
         /// Runs via `sh -c` in the unsandboxed parent. Stdout is the credential.
         #[serde(default)]
         script: Option<String>,
+
+        /// Consumers authorised to redeem nonces minted by this capture.
+        /// Each entry is `<command>.<intercept-id>` (or `<command>.default`
+        /// for the command's default action). Empty list = never redeemable
+        /// (defensive captures whose nonces have no legitimate consumer).
+        /// Required: profile load fails if the field is missing.
+        grant_to: Vec<String>,
     },
-    /// Run the real binary and return its actual output (no nonce wrapping).
-    ///
-    /// Useful with `admin: true` to gate sensitive-but-non-secret commands
-    /// behind an approval step while still showing the real output.
-    /// No per-command sandbox is applied — the binary needs unrestricted
-    /// access to system resources (e.g. macOS Keychain via securityd).
-    /// Protection comes from the profile author's choice of which commands
-    /// and subcommands receive `approve` actions.
-    /// If `script` is set, runs `sh -c "<script>"` instead of the real binary.
-    Approve {
-        /// Optional shell script to run instead of the real binary.
+    /// Run the real binary, stream stdio directly. Optionally substitute via
+    /// `script` (`sh -c "<script>"`). The effective sandbox is the matched
+    /// rule's `sandbox` field if set, falling back to `cmd.default.sandbox`
+    /// (A.5 wires this fallback chain more precisely), then `cmd.sandbox`,
+    /// then no sandbox.
+    Run {
+        /// Optional shell-script substitution. When set, runs `sh -c "<script>"`
+        /// instead of the real binary. Same semantics as `Capture.script`.
         #[serde(default)]
         script: Option<String>,
     },
+}
+
+/// Tri-state sandbox binding on an intercept rule.
+///
+/// - JSON field absent → `InheritFromDefault` — at exec time, falls back
+///   to `cmd.default.sandbox` if set, then the legacy command-level
+///   `cmd.sandbox`, then no sandbox.
+/// - JSON `"sandbox": null` → `ExplicitlyUnsandboxed` — opts out of
+///   inheritance entirely; the rule runs without any per-command sandbox.
+/// - JSON `"sandbox": { ... }` → `Explicit(CommandSandbox)` — use this
+///   exact sandbox for the matched call.
+#[derive(Debug, Clone, Default)]
+pub enum SandboxBinding {
+    #[default]
+    InheritFromDefault,
+    ExplicitlyUnsandboxed,
+    Explicit(CommandSandbox),
+}
+
+impl<'de> Deserialize<'de> for SandboxBinding {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        // serde calls this only when the field IS present (because of
+        // #[serde(default)] on the field itself returning InheritFromDefault
+        // when absent). So None here means "null"; Some means "object".
+        let v: Option<CommandSandbox> = Option::deserialize(de)?;
+        Ok(match v {
+            None => SandboxBinding::ExplicitlyUnsandboxed,
+            Some(sb) => SandboxBinding::Explicit(sb),
+        })
+    }
+}
+
+impl serde::Serialize for SandboxBinding {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            SandboxBinding::InheritFromDefault => s.serialize_none(),
+            SandboxBinding::ExplicitlyUnsandboxed => s.serialize_none(),
+            SandboxBinding::Explicit(sb) => sb.serialize(s),
+        }
+    }
 }
 
 /// Sandbox profile applied when exec-ing the real binary for a passthrough command.
@@ -194,6 +407,17 @@ pub struct CommandSandbox {
     /// Default: false. macOS only; ignored on other platforms.
     #[serde(default)]
     pub keychain_access: bool,
+    /// If true, block the command from spawning subprocesses (macOS only).
+    ///
+    /// Omits `(allow process-exec*)` and `(allow process-fork)` from the
+    /// per-command Seatbelt profile, leaving `(deny default)` to cover them.
+    /// Use for commands that must not spawn children that would inherit the
+    /// sandbox's filesystem grants (e.g. ssh, to prevent ProxyCommand from
+    /// reading private keys).
+    ///
+    /// Default: false.
+    #[serde(default)]
+    pub block_exec_spawn: bool,
 }
 
 /// Simple network config for per-command sandbox profiles.
@@ -393,7 +617,10 @@ mod tests {
 
     #[test]
     fn test_caller_policy_omitted_in_json_uses_default() {
-        let json = r#"{ "name": "git" }"#;
+        let json = r#"{
+            "name": "git",
+            "default": { "action": { "type": "run" } }
+        }"#;
         let entry: CommandEntry = serde_json::from_str(json).expect("deserialize");
         assert!(entry.caller_policy.agent_allowed);
         assert!(entry.caller_policy.allowed_parents.is_none());
@@ -429,5 +656,348 @@ mod tests {
             policy.allowed_parents.as_deref(),
             Some(&["git".to_string()][..])
         );
+    }
+
+    #[test]
+    fn args_matcher_round_trip_each_variant() {
+        use serde_json::json;
+
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("any_arg_matches", json!({ "any_arg_matches": "^foo" })),
+            ("all_args_match", json!({ "all_args_match": "^-" })),
+            (
+                "nth_arg_matches",
+                json!({ "nth_arg_matches": 2, "regex": "^https://" }),
+            ),
+            (
+                "not",
+                json!({ "not": { "any_arg_matches": "--insecure" } }),
+            ),
+            (
+                "all",
+                json!({
+                    "all": [
+                        { "any_arg_matches": "^https://gitlab\\.ddbuild\\.io" },
+                        { "not": { "any_arg_matches": "^-k$" } },
+                    ]
+                }),
+            ),
+            (
+                "any",
+                json!({
+                    "any": [
+                        { "any_arg_matches": "^a$" },
+                        { "any_arg_matches": "^b$" },
+                    ]
+                }),
+            ),
+        ];
+
+        for (label, value) in cases {
+            let m: ArgsMatcher = serde_json::from_value(value.clone())
+                .unwrap_or_else(|e| panic!("{}: deserialize failed: {}", label, e));
+            let back = serde_json::to_value(&m)
+                .unwrap_or_else(|e| panic!("{}: serialize failed: {}", label, e));
+            assert_eq!(back, *value, "{}: round-trip mismatch", label);
+        }
+    }
+
+    #[test]
+    fn args_matcher_rejects_unknown_keys() {
+        let bad = serde_json::json!({ "any_arg_matches": "x", "garbage": true });
+        let r: Result<ArgsMatcher, _> = serde_json::from_value(bad);
+        assert!(r.is_err(), "deny_unknown_fields should reject extras");
+    }
+
+    #[test]
+    fn args_matcher_rejects_ambiguous_shapes() {
+        // An untagged enum will pick the first variant that matches. Verify the
+        // serde layout doesn't silently accept two variants in one object.
+        let ambiguous = serde_json::json!({
+            "all": [],
+            "any_arg_matches": "x"
+        });
+        let r: Result<ArgsMatcher, _> = serde_json::from_value(ambiguous);
+        assert!(r.is_err(), "object with two variant keys must not parse");
+    }
+
+    #[test]
+    fn intercept_rule_round_trips_id_field() {
+        use serde_json::json;
+        let v = json!({
+            "id": "my-rule",
+            "match": { "any_arg_matches": "x" },
+            "action": { "type": "respond", "stdout": "hi", "exit_code": 0 }
+        });
+        let r: InterceptRule = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(r.id.as_deref(), Some("my-rule"));
+        let back = serde_json::to_value(&r).unwrap();
+        assert_eq!(back["id"], "my-rule");
+    }
+
+    #[test]
+    fn intercept_rule_id_optional() {
+        use serde_json::json;
+        let v = json!({
+            "match": { "any_arg_matches": "x" },
+            "action": { "type": "respond", "stdout": "hi", "exit_code": 0 }
+        });
+        let r: InterceptRule = serde_json::from_value(v).unwrap();
+        assert_eq!(r.id, None);
+    }
+
+    #[test]
+    fn command_entry_round_trips_default_entry() {
+        use serde_json::json;
+        let v = json!({
+            "name": "gh",
+            "default": {
+                "action": { "type": "respond", "stdout": "", "exit_code": 0 },
+                "sandbox": { "network": { "allowed_hosts": ["github.com"] } }
+            }
+        });
+        let c: CommandEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(c.default.id, "default");
+        assert!(c.default.sandbox.is_some());
+    }
+
+    #[test]
+    fn command_entry_rejects_missing_default() {
+        use serde_json::json;
+        let v = json!({ "name": "no-default" });
+        let r: Result<CommandEntry, _> = serde_json::from_value(v);
+        assert!(
+            r.is_err(),
+            "command entry without 'default' must fail to deserialize"
+        );
+    }
+
+    #[test]
+    fn default_entry_id_defaults_to_default() {
+        use serde_json::json;
+        let v = json!({ "action": { "type": "respond", "stdout": "x", "exit_code": 0 } });
+        let d: DefaultEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(d.id, "default");
+    }
+
+    #[test]
+    fn default_entry_id_field_is_not_serialised() {
+        let d = DefaultEntry {
+            id: "default".to_string(),
+            action: InterceptAction::Respond {
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+            sandbox: None,
+            promote_in: None,
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(v.get("id").is_none(), "id should be skipped on serialise");
+    }
+
+    // ------------------------------------------------------------------
+    // PromoteFilter / ArgPredicate / EnvPredicate (input shape only)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn arg_predicate_round_trips_each_variant() {
+        use serde_json::json;
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("self_matches", json!({ "self_matches": "^-H" })),
+            (
+                "preceded_by_arg",
+                json!({ "preceded_by_arg": "^(-H|--header)$" }),
+            ),
+            ("at_index", json!({ "at_index": 3 })),
+            (
+                "not",
+                json!({ "not": { "self_matches": "^--data" } }),
+            ),
+            (
+                "any_of",
+                json!({
+                    "any_of": [
+                        { "self_matches": "^-H" },
+                        { "preceded_by_arg": "^-H$" }
+                    ]
+                }),
+            ),
+            (
+                "all_of",
+                json!({
+                    "all_of": [
+                        { "self_matches": "^Authorization:" },
+                        { "preceded_by_arg": "^-H$" }
+                    ]
+                }),
+            ),
+        ];
+        for (label, value) in cases {
+            let p: ArgPredicate = serde_json::from_value(value.clone())
+                .unwrap_or_else(|e| panic!("{}: deserialize failed: {}", label, e));
+            let back = serde_json::to_value(&p)
+                .unwrap_or_else(|e| panic!("{}: serialize failed: {}", label, e));
+            assert_eq!(back, *value, "{}: round-trip mismatch", label);
+        }
+    }
+
+    #[test]
+    fn arg_predicate_rejects_unknown_keys() {
+        let bad = serde_json::json!({ "self_matches": "x", "garbage": true });
+        let r: Result<ArgPredicate, _> = serde_json::from_value(bad);
+        assert!(r.is_err(), "deny_unknown_fields should reject extras");
+    }
+
+    #[test]
+    fn arg_predicate_rejects_typo() {
+        // Intentional misspelling: the user-facing field is `preceded_by_arg`.
+        let bad = serde_json::json!({ "prededed_by_arg": "^-H$" });
+        let r: Result<ArgPredicate, _> = serde_json::from_value(bad);
+        assert!(r.is_err(), "typo'd field name must not deserialise");
+    }
+
+    #[test]
+    fn env_predicate_round_trips_each_variant() {
+        use serde_json::json;
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("name_matches", json!({ "name_matches": "(?i)^auth" })),
+            ("value_matches", json!({ "value_matches": "^Bearer " })),
+            (
+                "not",
+                json!({ "not": { "name_matches": "^DD_API_KEY$" } }),
+            ),
+            (
+                "any_of",
+                json!({
+                    "any_of": [
+                        { "name_matches": "^AUTHORIZATION$" },
+                        { "name_matches": ".+_TOKEN$" }
+                    ]
+                }),
+            ),
+            (
+                "all_of",
+                json!({
+                    "all_of": [
+                        { "name_matches": "^AUTH_HEADER$" },
+                        { "value_matches": "^Bearer " }
+                    ]
+                }),
+            ),
+        ];
+        for (label, value) in cases {
+            let p: EnvPredicate = serde_json::from_value(value.clone())
+                .unwrap_or_else(|e| panic!("{}: deserialize failed: {}", label, e));
+            let back = serde_json::to_value(&p)
+                .unwrap_or_else(|e| panic!("{}: serialize failed: {}", label, e));
+            assert_eq!(back, *value, "{}: round-trip mismatch", label);
+        }
+    }
+
+    #[test]
+    fn env_predicate_rejects_unknown_keys() {
+        let bad = serde_json::json!({ "name_matches": "x", "matches": "y" });
+        let r: Result<EnvPredicate, _> = serde_json::from_value(bad);
+        assert!(r.is_err(), "deny_unknown_fields should reject extras");
+    }
+
+    #[test]
+    fn promote_filter_round_trips_with_both_subfields() {
+        use serde_json::json;
+        let v = json!({
+            "args": {
+                "any_of": [
+                    { "preceded_by_arg": "^(-H|--header)$" },
+                    { "self_matches":    "^(-H|--header=)" }
+                ]
+            },
+            "env": {
+                "name_matches": "^AUTH_HEADER$"
+            }
+        });
+        let p: PromoteFilter = serde_json::from_value(v.clone()).expect("deserialize");
+        assert!(p.args.is_some());
+        assert!(p.env.is_some());
+        let back = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn promote_filter_subfields_independently_optional() {
+        // args only
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "args": { "self_matches": "^-H" }
+        }))
+        .expect("deserialize args-only");
+        assert!(p.args.is_some());
+        assert!(p.env.is_none());
+
+        // env only
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "env": { "name_matches": "^X$" }
+        }))
+        .expect("deserialize env-only");
+        assert!(p.args.is_none());
+        assert!(p.env.is_some());
+
+        // neither (empty object). Valid: the field on InterceptRule itself is
+        // Option<PromoteFilter>, but if specified `{}` it parses to a
+        // filter whose both subfields are None.
+        let p: PromoteFilter =
+            serde_json::from_value(serde_json::json!({})).expect("deserialize empty");
+        assert!(p.args.is_none());
+        assert!(p.env.is_none());
+    }
+
+    #[test]
+    fn intercept_rule_round_trips_promote_in_field() {
+        use serde_json::json;
+        let v = json!({
+            "id": "gitlab",
+            "match": { "any_arg_matches": "^https://gitlab" },
+            "action": { "type": "run" },
+            "promote_in": {
+                "args": {
+                    "any_of": [
+                        { "preceded_by_arg": "^(-H|--header)$" },
+                        { "self_matches":    "^(-H|--header=)" }
+                    ]
+                }
+            }
+        });
+        let r: InterceptRule = serde_json::from_value(v.clone()).expect("deserialize");
+        assert!(
+            r.promote_in.is_some(),
+            "promote_in should round-trip when present"
+        );
+        let back = serde_json::to_value(&r).expect("serialize");
+        assert_eq!(back["promote_in"], v["promote_in"]);
+    }
+
+    #[test]
+    fn intercept_rule_promote_in_is_optional() {
+        use serde_json::json;
+        let v = json!({
+            "match": { "any_arg_matches": "x" },
+            "action": { "type": "run" }
+        });
+        let r: InterceptRule = serde_json::from_value(v).expect("deserialize");
+        assert!(r.promote_in.is_none());
+    }
+
+    #[test]
+    fn default_entry_round_trips_promote_in_field() {
+        use serde_json::json;
+        let v = json!({
+            "action": { "type": "run" },
+            "promote_in": {
+                "env": { "name_matches": "(?i)^authorization$" }
+            }
+        });
+        let d: DefaultEntry = serde_json::from_value(v.clone()).expect("deserialize");
+        assert!(d.promote_in.is_some());
+        let back = serde_json::to_value(&d).expect("serialize");
+        assert_eq!(back["promote_in"], v["promote_in"]);
     }
 }

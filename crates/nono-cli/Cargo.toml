@@ -68,6 +68,7 @@ subtle = "2"
 hex = "0.4"
 
 ureq = { version = "3", features = ["platform-verifier"] }
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 semver = "1"
 
 zeroize.workspace = true

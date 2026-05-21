@@ -630,6 +630,12 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .push(crate::mediation::CommandEntry {
                 name: "git".to_string(),
                 binary_path: None,
+                default: crate::mediation::DefaultEntry {
+                    id: "default".to_string(),
+                    action: crate::mediation::InterceptAction::Run { script: None },
+                    sandbox: None,
+                    promote_in: None,
+                },
                 intercept: vec![],
                 sandbox: Some(crate::mediation::CommandSandbox {
                     fs_read_file: vec!["@git:config-paths".to_string()],
