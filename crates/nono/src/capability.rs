@@ -905,6 +905,12 @@ pub struct CapabilitySet {
     /// When set, the generated Seatbelt profile emits `(debug deny)` so
     /// sandboxd records denial events in the unified log.
     seatbelt_debug_deny: bool,
+    /// Block process-exec and process-fork in the Seatbelt profile.
+    /// When set, `(allow process-exec*)` and `(allow process-fork)` are omitted,
+    /// leaving `(deny default)` to cover them. Use for commands whose per-command
+    /// sandbox must not spawn child processes (e.g. ssh, to prevent ProxyCommand
+    /// from inheriting the sandbox's filesystem grants).
+    block_process_exec: bool,
 }
 
 impl CapabilitySet {
@@ -998,6 +1004,17 @@ impl CapabilitySet {
     #[must_use]
     pub fn block_network(mut self) -> Self {
         self.network_mode = NetworkMode::Blocked;
+        self
+    }
+
+    /// Block process spawning in the per-command Seatbelt profile (macOS only).
+    ///
+    /// When set, `(allow process-exec*)` and `(allow process-fork)` are omitted so
+    /// `(deny default)` covers them. Prevents a per-command sandbox from spawning
+    /// subprocesses that would inherit the sandbox's filesystem grants.
+    #[must_use]
+    pub fn block_exec_spawn(mut self) -> Self {
+        self.block_process_exec = true;
         self
     }
 
@@ -1416,6 +1433,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn seatbelt_debug_deny(&self) -> bool {
         self.seatbelt_debug_deny
+    }
+
+    /// Check whether process spawning is blocked in the per-command Seatbelt profile.
+    #[must_use]
+    pub fn block_exec_spawn_enabled(&self) -> bool {
+        self.block_process_exec
     }
 
     /// Get allowed commands

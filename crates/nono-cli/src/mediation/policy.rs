@@ -998,6 +998,10 @@ async fn exec_passthrough(
                 caps = add_sandbox_file(caps, &metadata, nono::AccessMode::Read, &cmd_name)?;
             }
 
+            if sb.block_exec_spawn {
+                caps = caps.block_exec_spawn();
+            }
+
             if sb.network.block {
                 caps = caps.block_network();
             } else if let Some(port) = proxy_port {
@@ -2379,6 +2383,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec!["ddtool".to_string()],
                 keychain_access: false,
+                block_exec_spawn: false,
             }),
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
@@ -2482,6 +2487,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                block_exec_spawn: false,
             }),
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
@@ -2551,6 +2557,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                block_exec_spawn: false,
             }),
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
@@ -2625,6 +2632,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                block_exec_spawn: false,
             }),
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
@@ -2694,6 +2702,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: true,
+                block_exec_spawn: false,
             }),
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
@@ -2758,6 +2767,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                block_exec_spawn: false,
             }),
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {
@@ -2823,6 +2833,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: true,
+                block_exec_spawn: false,
             }),
             caller_policy: CallerPolicy::default(),
             default: ResolvedDefault {

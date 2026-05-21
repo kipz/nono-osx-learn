@@ -477,9 +477,13 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(debug deny)\n");
     }
 
-    // Allow specific process operations needed for execution
-    profile.push_str("(allow process-exec*)\n");
-    profile.push_str("(allow process-fork)\n");
+    // Allow process spawning unless the caller has opted in to blocking it.
+    // Omitting these leaves (deny default) to cover process-exec* and process-fork,
+    // preventing subprocesses from inheriting the sandbox's filesystem grants.
+    if !caps.block_exec_spawn_enabled() {
+        profile.push_str("(allow process-exec*)\n");
+        profile.push_str("(allow process-fork)\n");
+    }
 
     // Process info: allow self-inspection and same-sandbox inspection for both
     // Isolated and AllowSameSandbox, matching Linux behaviour where Landlock
@@ -1872,5 +1876,22 @@ mod tests {
 
         assert!(!profile.contains("(deny network*)"));
         assert!(!profile.contains("mDNSResponder"));
+    }
+
+    #[test]
+    fn test_generate_profile_block_exec_spawn_omits_process_allows() {
+        // By default, process-exec* and process-fork are allowed.
+        let default_caps = CapabilitySet::new();
+        let default_profile = generate_profile(&default_caps).unwrap();
+        assert!(default_profile.contains("(allow process-exec*)"));
+        assert!(default_profile.contains("(allow process-fork)"));
+
+        // With block_exec_spawn, the allows are omitted so (deny default) covers them.
+        let blocked_caps = CapabilitySet::new().block_exec_spawn();
+        let blocked_profile = generate_profile(&blocked_caps).unwrap();
+        assert!(!blocked_profile.contains("(allow process-exec*)"));
+        assert!(!blocked_profile.contains("(allow process-fork)"));
+        // The deny default must still be present to cover the omitted allows.
+        assert!(blocked_profile.contains("(deny default)"));
     }
 }

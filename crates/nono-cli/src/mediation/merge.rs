@@ -132,6 +132,7 @@ fn merge_command_sandbox(base: CommandSandbox, child: CommandSandbox) -> Command
         fs_write_file: dedup_append(&base.fs_write_file, &child.fs_write_file),
         allow_commands: dedup_append(&base.allow_commands, &child.allow_commands),
         keychain_access: base.keychain_access || child.keychain_access,
+        block_exec_spawn: base.block_exec_spawn || child.block_exec_spawn,
     }
 }
 

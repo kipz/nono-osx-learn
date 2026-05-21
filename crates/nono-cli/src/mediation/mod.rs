@@ -407,6 +407,17 @@ pub struct CommandSandbox {
     /// Default: false. macOS only; ignored on other platforms.
     #[serde(default)]
     pub keychain_access: bool,
+    /// If true, block the command from spawning subprocesses (macOS only).
+    ///
+    /// Omits `(allow process-exec*)` and `(allow process-fork)` from the
+    /// per-command Seatbelt profile, leaving `(deny default)` to cover them.
+    /// Use for commands that must not spawn children that would inherit the
+    /// sandbox's filesystem grants (e.g. ssh, to prevent ProxyCommand from
+    /// reading private keys).
+    ///
+    /// Default: false.
+    #[serde(default)]
+    pub block_exec_spawn: bool,
 }
 
 /// Simple network config for per-command sandbox profiles.
